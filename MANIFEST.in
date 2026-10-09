@@ -1,0 +1,12 @@
+include README.md
+include THIRD_PARTY_NOTICES.md
+recursive-include docs *.md
+recursive-include tests *.py
+recursive-include packaging *.py
+recursive-include potplayer *.as *.ico *.cmd
+global-exclude __pycache__ *.py[cod]
+prune build
+prune dist
+prune docs/plans
+prune docs/research
+prune docs/validation
