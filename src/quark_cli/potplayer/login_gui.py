@@ -90,7 +90,12 @@ def _widgets(root: Any) -> list[Any]:
 
 
 class QrLoginWindow:
-    """A modal QR window: Tk on the calling thread, network on a worker thread."""
+    """A modal QR window: Tk on the calling thread, network on a worker thread.
+
+    ``root_factory`` may return a ``Tk`` root (the CLI and the plugin's login
+    thread) or a ``Toplevel`` of a window that already runs its own loop (the
+    downloader window); :meth:`run` picks the matching event loop for either.
+    """
 
     def __init__(
         self,
@@ -156,7 +161,10 @@ class QrLoginWindow:
             self._runner.start()
 
             self._pump()
-            root.mainloop()
+            # A window that already finished — a scan confirmed before the first
+            # poll — destroyed itself in ``_handle``; there is no loop to run.
+            if self._root is not None and self._outcome is None:
+                self._run_loop(self._root, tk)
         finally:
             # Drop the Tk locals of this frame *before* an exception can carry the
             # traceback (and these widgets) into another thread's garbage.
@@ -167,6 +175,22 @@ class QrLoginWindow:
         if self._failure is not None:
             raise self._failure
         raise LoginCancelled("登录已取消")
+
+    @staticmethod
+    def _run_loop(root: Any, tk: Any) -> None:
+        """Serve Tk events until this window is destroyed.
+
+        A standalone ``Tk`` root owns the process event loop, so ``mainloop`` is
+        the loop to run. An embedded ``Toplevel`` — the downloader window opens
+        this panel as a modal child — must run a *nested* loop instead:
+        ``mainloop`` on a ``Toplevel`` serves the whole interpreter and returns
+        only once the **parent** window is destroyed, so the caller would never
+        get control back while its own window is still open.
+        """
+        if isinstance(root, tk.Tk):
+            root.mainloop()
+        else:
+            root.wait_window(root)
 
     def close(self) -> None:
         """Cancel the in-flight poll and tear the window down (Tk thread only)."""

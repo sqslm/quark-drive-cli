@@ -494,6 +494,39 @@ class WindowCase(unittest.TestCase):
         with self.assertRaisesRegex(RemoteError, "上游连接失败"):
             window.run()
 
+    def test_a_child_window_ends_its_own_loop_not_the_parent_loop(self):
+        import tkinter
+
+        try:
+            parent = tkinter.Tk()
+        except tkinter.TclError:
+            # This Anaconda build intermittently refuses a second Tcl
+            # interpreter in one process; that is not a behaviour to assert.
+            self.skipTest("Tkinter cannot create an interpreter here")
+        children: list = []
+
+        def make_root():
+            widget = tkinter.Toplevel(parent)
+            children.append(widget)
+            return widget
+
+        window = QrLoginWindow(login_factory=lambda cancel: _BlockingLogin(cancel), root_factory=make_root)
+        parent.after(200, window.close)
+        # Only a way out if the child window runs the parent's loop: the
+        # regression keeps ``run`` blocked here until the parent is destroyed.
+        parent.after(6000, parent.destroy)
+        started = time.monotonic()
+        try:
+            with self.assertRaises(LoginCancelled):
+                window.run()
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 5.0)
+            self.assertEqual(len(children), 1)
+            self.assertFalse(children[0].winfo_exists())
+            self.assertTrue(parent.winfo_exists())
+        finally:
+            parent.destroy()
+
     def test_default_qrlogin_cancels_before_saving(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

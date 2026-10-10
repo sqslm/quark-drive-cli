@@ -435,6 +435,29 @@ The bridge shares the CLI's local request guard, so a rate-limited or restricted
 
 User guide: [docs/PotPlayer使用指南.md](docs/PotPlayer使用指南.md).
 
+## Downloader window (夸克网盘下载器)
+
+Windows 10/11 x64. `QuarkDriveDownloader.exe` is a single-file, windowed GUI for one job: sign in, browse **your own** drive, select one file or one folder, choose a local output folder, and download it. Shared links, saving shares, queues, automatic overwrite, pause/resume and account management are out of scope. The EXE needs no Python installation and no source tree.
+
+The window uses the **same Cookie as the `quark` CLI**. Its `扫码登录` button opens the same QR window as the plugin and stores `auth.credential_path()` — there is no second credential file, and `quark auth login` (or an exported `QUARK_COOKIE`/`QUARK_COOKIE_FILE`) is accepted as-is. Browsing and downloading go through the existing library calls, so the request guard, the signed-URL rules, the existing-file refusal and the atomic publish are exactly the CLI's.
+
+Run it from a checkout:
+
+```sh
+python -m quark_cli.downloader
+```
+
+Build the standalone EXE (PyInstaller must be installed for the chosen interpreter):
+
+```sh
+python packaging/downloader/build.py
+python packaging/downloader/build.py --python PATH --dist-dir dist
+```
+
+The build prints the path, its SHA-256 and its size; the product is `dist/QuarkDriveDownloader.exe`.
+
+Behavior notes: network work runs on one background thread and updates the window through a queue, so listing and downloading keep the window responsive; only one download runs at a time, navigation (including entering a folder by double-click) is refused while it does, and a listing that arrives for a folder the window has already left is dropped instead of overwriting the current rows. Selecting a folder downloads into a **new** folder of the same name under the chosen output folder, preserving the tree. An existing target is never replaced: the library refuses it and the window shows the conflict line. The status area shows the current phase, byte progress and rate, and every failure (authentication, network, local path, name or conflict) as one readable line; no Cookie or signed URL is ever displayed or logged. Closing the window while a download runs is refused with a hint to wait: downloads are not cancellable, the process must not exit under a transfer, and the window closes normally once the transfer finishes. The library publishes files atomically, so an incomplete target is never left behind; if the process is killed anyway (task manager, logoff), only the library's temporary `part` file can remain next to the target.
+
 ## Offline checks
 
 From an installed checkout (including a virtual environment created above), install the package and the QR decoder used by the PNG regression test:
@@ -470,6 +493,8 @@ PYTHONPATH=src python -m quark_cli --help
 ```
 
 The tests use `httpx.MockTransport` and a local QR decoder. They do not contact or modify a real Quark account.
+
+`tests/test_downloader_core.py`, `tests/test_downloader_worker.py` and `tests/test_downloader_window.py` cover the download window without a network or an account: listing rows and their ordering, folder navigation, the local target and name of a file/folder download, progress text and its fraction, the error line, the worker's serialization and bounded shutdown, and the window's state machine driven with stand-in widgets. They also run the real library through the window's backend — one file installed under its remote name, and one folder tree through the real recursive downloader — plus, where a display is available, building the real window and browsing the root.
 
 `tests/test_potplayer_extensions.py` covers the PotPlayer plugin without a real player: it tokenises both AngelScript files (terminated literals, balanced delimiters, no undefined calls, and no C-style array declaration such as `string roots[2];`), checks every native `Host*` call against the `api.txt` shipped with the installed player, checks the exported signatures and logic-link shape, asserts the search/favorites/recent entries keep their native row shapes (`type=search`, idempotent favorite action tokens, no media URL on action rows), and drives the real loopback bridge to assert the JSON payloads the scripts parse — including the `/v1/search`, `/v1/favorites` and `/v1/recent` shapes. PotPlayer ships no standalone AngelScript toolchain, so the scripts are not compiled here. Real QR scanning, in-player playback/seeking/next-episode, the new entry screens and AngelScript compilation require a real player for manual verification.
 
