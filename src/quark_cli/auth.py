@@ -15,8 +15,24 @@ from urllib.parse import urlencode, urljoin, urlparse
 
 import httpx
 
-from .client import DEFAULT_HEADERS, DEFAULT_PARAMS, QuarkClient
-from .errors import AuthenticationError, LocalIOError, NetworkError, QuarkError, RemoteError
+from .client import DEFAULT_HEADERS, DEFAULT_PARAMS, QuarkClient, default_guard, explicit_rejection_reason
+from .errors import (
+    AccessRestrictedError,
+    AuthenticationError,
+    LocalIOError,
+    NetworkError,
+    QuarkError,
+    RateLimitError,
+    RemoteError,
+)
+from .request_guard import (
+    DEFAULT_COOLDOWN_SECONDS,
+    DEFAULT_RESTRICTION_COOLDOWN_SECONDS,
+    REASON_ACCESS_RESTRICTED,
+    REASON_RATE_LIMITED,
+    RequestGuard,
+    retry_after_seconds,
+)
 from .state import config_directory, private_path, restrict_windows_acl, secure_directory
 
 
@@ -28,6 +44,7 @@ DRIVE_SORT_URL = "https://drive-pc.quark.cn/1/clouddrive/file/sort"
 DRIVE_MEMBER_URL = "https://drive.quark.cn/1/clouddrive/member"
 QR_BASE_URL = "https://su.quark.cn/4_eMHBJ"
 _TERMINAL_QR_STATUSES = {50004002, 50004003, 50004004}
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 _MAX_REDIRECTS = 5
 
 
@@ -283,9 +300,61 @@ def _json_response(response: httpx.Response) -> dict[str, object]:
     return payload
 
 
-def _require_http_success(response: httpx.Response, *, operation: str) -> None:
-    if response.status_code in (401, 403):
+def _explicit_qr_rejection(payload: dict[str, object], guard: RequestGuard) -> None:
+    """Raise a typed cooldown for an explicit upstream QR restriction/throttle.
+
+    Handle explicit restriction wording in non-success QR payloads, including
+    payloads carried by HTTP 200. Success and neutral pending responses retain
+    their existing flow. Upstream messages, tokens and tickets are never echoed:
+    callers receive a fixed error, cooldown and official-client advice.
+    """
+    if payload.get("status") == 2000000:
+        return
+    message = payload.get("message")
+    if not isinstance(message, str):
+        message = payload.get("msg")
+    if not isinstance(message, str):
+        return
+    reason = explicit_rejection_reason(message)
+    if reason is None:
+        return
+    if reason == REASON_RATE_LIMITED:
+        cooldown = guard.record_cooldown(DEFAULT_COOLDOWN_SECONDS, REASON_RATE_LIMITED)
+        remaining = max(0.0, cooldown.until - guard.now())
+        raise RateLimitError(
+            f"夸克扫码登录请求过于频繁，已暂停后续请求，约 {max(0, int(remaining + 0.999))} 秒后再试；"
+            "请在官方客户端确认账号状态后重试",
+            retry_after=remaining,
+        )
+    cooldown = guard.record_cooldown(DEFAULT_RESTRICTION_COOLDOWN_SECONDS, REASON_ACCESS_RESTRICTED)
+    remaining = max(0.0, cooldown.until - guard.now())
+    raise AccessRestrictedError(
+        f"夸克扫码登录被拒绝访问，已暂停后续请求且未清除凭据，约 {max(0, int(remaining + 0.999))} 秒后再试；"
+        "请在官方客户端确认账号状态后重试",
+        retry_after=remaining,
+    )
+
+
+def _require_http_success(response: httpx.Response, *, operation: str, guard: RequestGuard | None = None) -> None:
+    if response.status_code == 401:
         raise AuthenticationError("扫码登录会话无效，请重新执行 quark auth login")
+    if response.status_code == 403:
+        # A raw 403 is an access restriction, never proof the QR session is stale.
+        if guard is not None:
+            # A longer server Retry-After is honored on top of the 600s floor,
+            # exactly like the API path, using the shared parser.
+            delay = retry_after_seconds(response.headers.get("retry-after"), guard.now())
+            cooldown = guard.record_cooldown(
+                max(DEFAULT_RESTRICTION_COOLDOWN_SECONDS, delay if delay is not None else 0.0),
+                REASON_ACCESS_RESTRICTED,
+            )
+            remaining = max(0.0, cooldown.until - guard.now())
+            raise AccessRestrictedError(
+                f"夸克{operation}被拒绝访问（HTTP 403），已暂停后续请求且未清除凭据，约 {max(0, int(remaining + 0.999))} 秒后再试；"
+                "请在官方客户端确认账号状态后重试",
+                retry_after=remaining,
+            )
+        raise AccessRestrictedError(f"夸克{operation}被拒绝访问（HTTP 403）")
     if not 200 <= response.status_code < 300:
         raise RemoteError(f"夸克{operation}请求失败（HTTP {response.status_code}）")
 
@@ -298,19 +367,36 @@ def _get_without_redirects(
     headers: Mapping[str, str] | None = None,
     allowed_host: str,
     operation: str,
+    guard: RequestGuard | None = None,
 ) -> httpx.Response:
     current_url = url
     current_params = params
     for redirect_count in range(_MAX_REDIRECTS + 1):
-        try:
-            response = session.get(current_url, params=current_params, headers=headers)
-        except httpx.TimeoutException:
-            raise NetworkError(f"夸克{operation}请求超时") from None
-        except httpx.RequestError:
-            raise NetworkError(f"无法连接夸克{operation}服务") from None
+        if guard is None:
+            try:
+                response = session.get(current_url, params=current_params, headers=headers)
+            except httpx.TimeoutException:
+                raise NetworkError(f"夸克{operation}请求超时") from None
+            except httpx.RequestError:
+                raise NetworkError(f"无法连接夸克{operation}服务") from None
+        else:
+            try:
+                # Every hop is a new request: honor pacing and an active cooldown.
+                with guard.request():
+                    response = session.get(current_url, params=current_params, headers=headers)
+                    guard.observe_transfer_response(response)
+                    if response.status_code not in _REDIRECT_STATUSES:
+                        # Classify a rejected hop while still holding the guard,
+                        # so its cooldown is persisted before the slot releases.
+                        _require_http_success(response, operation=operation, guard=guard)
+            except httpx.TimeoutException:
+                raise NetworkError(f"夸克{operation}请求超时") from None
+            except httpx.RequestError:
+                raise NetworkError(f"无法连接夸克{operation}服务") from None
         current_params = None
-        if response.status_code not in (301, 302, 303, 307, 308):
-            _require_http_success(response, operation=operation)
+        if response.status_code not in _REDIRECT_STATUSES:
+            if guard is None:
+                _require_http_success(response, operation=operation, guard=None)
             return response
         if redirect_count >= _MAX_REDIRECTS:
             raise RemoteError(f"夸克{operation}重定向次数过多")
@@ -355,6 +441,7 @@ class QRLogin:
         monotonic: Callable[[], float] = time.monotonic,
         cookie_path: Path | None = None,
         cancelled: Callable[[], bool] | None = None,
+        guard: RequestGuard | None = None,
     ) -> None:
         if timeout < 1 or timeout > 300:
             raise AuthenticationError("扫码等待时间必须在 1 到 300 秒之间")
@@ -365,19 +452,25 @@ class QRLogin:
         self._monotonic = monotonic
         self._cookie_path = cookie_path
         self._cancelled = cancelled
+        # One guard covers token, poll, exchange, Cookie supplementation and the
+        # final read-only authentication check, so a throttled login stops
+        # instead of looping past the upstream limit.
+        self._guard = guard if guard is not None else default_guard(transport, None)
 
     def _check_cancelled(self) -> None:
         if self._cancelled is not None and self._cancelled():
             raise LoginCancelled("登录已取消")
 
     def _request(self, session: httpx.Client, url: str, *, params: Mapping[str, str]) -> httpx.Response:
-        try:
-            response = session.get(url, params=params)
-        except httpx.TimeoutException:
-            raise NetworkError("夸克扫码登录请求超时") from None
-        except httpx.RequestError:
-            raise NetworkError("无法连接夸克扫码登录服务") from None
-        _require_http_success(response, operation="扫码登录")
+        with self._guard.request():
+            try:
+                response = session.get(url, params=params)
+            except httpx.TimeoutException:
+                raise NetworkError("夸克扫码登录请求超时") from None
+            except httpx.RequestError:
+                raise NetworkError("无法连接夸克扫码登录服务") from None
+            self._guard.observe_transfer_response(response)
+            _require_http_success(response, operation="扫码登录", guard=self._guard)
         return response
 
     def _get_qr_token(self, session: httpx.Client) -> str:
@@ -388,6 +481,7 @@ class QRLogin:
                 params={"client_id": "532", "v": "1.2", "request_id": str(uuid.uuid4())},
             )
         )
+        _explicit_qr_rejection(payload, self._guard)
         data = payload.get("data")
         members = data.get("members") if isinstance(data, dict) else None
         token = members.get("token") if isinstance(members, dict) else None
@@ -406,6 +500,7 @@ class QRLogin:
                     params={"client_id": "532", "v": "1.2", "token": token, "request_id": str(uuid.uuid4())},
                 )
             )
+            _explicit_qr_rejection(payload, self._guard)
             status = payload.get("status")
             if status == 2000000:
                 data = payload.get("data")
@@ -429,6 +524,7 @@ class QRLogin:
             params={"st": ticket, "lw": "scan"},
             allowed_host="pan.quark.cn",
             operation="账号验证",
+            guard=self._guard,
         )
 
     @staticmethod
@@ -473,7 +569,12 @@ class QRLogin:
                     headers={"cookie": cookie} if cookie else None,
                     allowed_host=host,
                     operation="Cookie 补全",
+                    guard=self._guard,
                 )
+            except (RateLimitError, AccessRestrictedError):
+                # An explicit throttle/restriction must stop the whole login
+                # sequence, not fall through to another read-only host.
+                raise
             except (AuthenticationError, NetworkError, RemoteError):
                 # Later read-only hosts may still provide __puus. Final API
                 # validation below remains mandatory.
@@ -482,7 +583,7 @@ class QRLogin:
     def _validate_session(self, session: httpx.Client, cookie: str) -> str:
         # Reuse the login session so Set-Cookie returned by the real read-only
         # auth check is merged into the same cookie jar before persistence.
-        with QuarkClient(cookie, transport=self._transport, api_client=session) as client:
+        with QuarkClient(cookie, transport=self._transport, api_client=session, guard=self._guard) as client:
             client.auth_status()
         refreshed_cookie = _cookie_from_jar(session)
         if not self._has_puus(refreshed_cookie):

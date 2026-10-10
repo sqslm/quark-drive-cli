@@ -25,7 +25,7 @@ from urllib.parse import quote, urlencode, urljoin, urlsplit
 import httpx
 
 from .client import QUARK_DESKTOP_USER_AGENT, QuarkClient
-from .errors import AuthenticationError, LocalIOError, QuarkError, RemoteError, UsageError
+from .errors import AuthenticationError, LocalIOError, QuarkError, RemoteError, UsageError, contextual_error
 from .files import Files
 from .paths import RemotePaths, Scope, is_directory, valid_fid, validate_name
 from .state import private_path
@@ -43,7 +43,7 @@ PARALLEL_DOWNLOAD_MIN_SIZE = 8 * 1024 * 1024
 PARALLEL_DOWNLOAD_MIN_CHUNK = 4 * 1024 * 1024
 PARALLEL_DOWNLOAD_MAX_CHUNK = 64 * 1024 * 1024
 MAX_DOWNLOAD_CONNECTIONS = 16
-DEFAULT_DOWNLOAD_CONNECTIONS = 16
+DEFAULT_DOWNLOAD_CONNECTIONS = 4
 OSS_USER_AGENT = "aliyun-sdk-js/1.0.0 Chrome Mobile 139.0.0.0 on Google Nexus 5 (Android 6.0)"
 OSS_COMPLETE_USER_AGENT = "aliyun-sdk-js/1.0.0 Chrome 139.0.0.0 on OS X 10.15.7 64-bit"
 UPLOAD_READBACK_ATTEMPTS = 6
@@ -231,8 +231,8 @@ class Transfer:
             return self.client.post(endpoint, body=body)
         except AuthenticationError:
             raise AuthenticationError(f"{label}未获授权；已保留传输状态") from None
-        except QuarkError:
-            raise RemoteError(f"{label}失败；已保留传输状态且未自动重试") from None
+        except QuarkError as original:
+            raise contextual_error(original, f"{label}失败；已保留传输状态且未自动重试") from None
 
     def _upload_auth(self, *, task_id: str, auth_info: str, bucket: str, obj_key: str, upload_id: str,
                      mime_type: str, part_number: int | None = None, hash_context: str | None = None,
@@ -275,14 +275,19 @@ class Transfer:
         return target, headers
 
     def _storage_request(self, method: str, url: str, **options: Any) -> httpx.Response:
+        # Only a cooldown check gates each new storage request: there is no
+        # per-request or per-byte pacing on uploads/downloads.
+        self.client.check_request_cooldown()
         storage = self.client.transfer_client()
         storage.cookies.clear()
         try:
-            return storage.request(method, url, **options)
+            response = storage.request(method, url, **options)
         except (httpx.TimeoutException, httpx.RequestError):
             raise RemoteError("对象存储请求中断；已保留传输状态") from None
         finally:
             storage.cookies.clear()
+        self.client.observe_transfer_response(response)
+        return response
 
     def _scope(self, fid: str, scope: Scope | None, saved: str | None = None, *, write: bool = False) -> None:
         paths = RemotePaths(Files(self.client))
@@ -687,6 +692,9 @@ class Transfer:
         current = url
         try:
             for index in range(6):
+                # Check the shared cooldown before every new storage request or
+                # redirect hop; no byte or request-start pacing is added here.
+                self.client.check_request_cooldown()
                 current = trusted_url(current)
                 host = (urlsplit(current).hostname or "").lower().rstrip(".")
                 request_headers = dict(headers)
@@ -702,6 +710,7 @@ class Transfer:
                 storage.cookies.clear()
                 try:
                     with storage.stream("GET", current, headers=request_headers) as response:
+                        self.client.observe_transfer_response(response)
                         if response.status_code in (301, 302, 303, 307, 308):
                             location = response.headers.get("location")
                             if not location or index == 5:

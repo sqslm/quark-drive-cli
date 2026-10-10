@@ -77,7 +77,7 @@ class FilesTests(unittest.TestCase):
                 if label == "network":
                     raise httpx.ReadError("mock connection ended", request=request)
                 if label == "auth":
-                    return httpx.Response(403, request=request)
+                    return httpx.Response(401, request=request)
                 return httpx.Response(200, json=ok(response), request=request)
             with self.subTest(label=label), patch("quark_cli.files.time.sleep") as sleep:
                 with QuarkClient("sid=mock", transport=httpx.MockTransport(handler)) as client:

@@ -17,12 +17,16 @@ from urllib.parse import urlsplit
 import httpx
 
 from ..client import QuarkClient
-from ..errors import RemoteError
+from ..errors import AccessRestrictedError, RemoteError
 from ..files import Files
+from ..request_guard import REASON_ACCESS_RESTRICTED
 from ..transfer import download_address, successor_url, trusted_url
 
 MAX_SESSIONS = 128
 REDIRECT_LIMIT = 6
+# A repeated denial after one fresh signed-URL refetch pauses new media
+# requests briefly so the player cannot hammer the same failing URL.
+DENIED_COOLDOWN_SECONDS = 60.0
 
 
 class RangeNotSatisfiable(Exception):
@@ -192,12 +196,16 @@ class _Upstream:
         try:
             current = self._url
             for _ in range(REDIRECT_LIMIT):
+                # No byte pacing: only refuse to open a new storage request or
+                # follow a redirect while a shared cooldown is active.
+                self._client.check_request_cooldown()
                 current = trusted_url(current)
                 headers = dict(self._headers)
                 cookie = self._client.transfer_cookie_header(urlsplit(current).hostname or "")
                 if cookie is not None:
                     headers["Cookie"] = cookie
                 response = stack.enter_context(storage.stream("GET", current, headers=headers))
+                self._client.observe_transfer_response(response)
                 if response.status_code in (301, 302, 303, 307, 308):
                     location = response.headers.get("location")
                     if not location:
@@ -242,4 +250,13 @@ def open_content(
                 refetch()
                 continue
             break
-    raise RemoteError("取链失效且重新获取后仍无法播放")
+    # A fresh signed URL was refused too: pause new media requests briefly so a
+    # player cannot hammer the same failing range/URL, then stop with a
+    # sanitized, non-credential error. The Cookie is deliberately preserved.
+    cooldown = client.guard.record_cooldown(DENIED_COOLDOWN_SECONDS, REASON_ACCESS_RESTRICTED)
+    remaining = max(0.0, cooldown.until - client.guard.now())
+    raise AccessRestrictedError(
+        f"取链失效且重新获取后仍无法播放，已暂停 {max(0, int(remaining + 0.999))} 秒的新播放请求；"
+        "请在官方客户端确认账号状态后重试",
+        retry_after=remaining,
+    )

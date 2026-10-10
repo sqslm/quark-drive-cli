@@ -11,7 +11,15 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .client import QuarkClient
-from .errors import AuthenticationError, QuarkError, RemoteError, UsageError
+from .errors import (
+    AccessRestrictedError,
+    AuthenticationError,
+    QuarkError,
+    RateLimitError,
+    RemoteError,
+    UsageError,
+    contextual_error,
+)
 from .files import Files
 from .paths import RemotePaths, Scope, is_directory, valid_fid, validate_name
 from .shares import ShareLink, ShareSaver
@@ -209,7 +217,12 @@ class ShareManager:
         try:
             return getattr(self.client, method)(endpoint, **options)
         except Exception as original:
-            error = AuthenticationError("分享管理读取或操作未获授权") if isinstance(original, AuthenticationError) else RemoteError("分享管理读取或操作失败")
+            if isinstance(original, AuthenticationError):
+                error: QuarkError = AuthenticationError("分享管理读取或操作未获授权")
+            else:
+                # contextual_error keeps RateLimitError/AccessRestrictedError (with
+                # their retry_after) instead of hiding the cooldown in a generic error.
+                error = contextual_error(original, "分享管理读取或操作失败")
             if getattr(original, "api_rejected", False) is True:
                 error.api_rejected = True
             raise error from None
@@ -339,8 +352,8 @@ class ShareManager:
             return self._identity(self.files.info(fid))
         except AuthenticationError:
             raise AuthenticationError("账户来源核验未获授权") from None
-        except QuarkError:
-            raise RemoteError("账户来源身份无法核验") from None
+        except QuarkError as original:
+            raise contextual_error(original, "账户来源身份无法核验") from None
 
     def _check_account(self, expected: Mapping[str, Any], scope: Scope | None) -> None:
         # Compare the exact parent before following any ancestry. A moved item
@@ -353,8 +366,8 @@ class ShareManager:
                 scope.check(expected["fid"])
         except AuthenticationError:
             raise AuthenticationError("账户来源范围核验未获授权") from None
-        except QuarkError:
-            raise RemoteError("账户来源父关系或范围无法核验") from None
+        except QuarkError as original:
+            raise contextual_error(original, "账户来源父关系或范围无法核验") from None
 
     def _account_snapshot(self, root: str, scope: Scope | None) -> dict[str, dict[str, Any]]:
         root_identity = self._identity(self.paths.root().item) if root == "0" else self._exact(root)
@@ -372,8 +385,8 @@ class ShareManager:
                     children = self.paths.children(fid)
                 except AuthenticationError:
                     raise AuthenticationError("账户子树读取未获授权") from None
-                except QuarkError:
-                    raise RemoteError("账户子树无法完整读取") from None
+                except QuarkError as original:
+                    raise contextual_error(original, "账户子树无法完整读取") from None
                 for child in reversed(children):
                     child_identity = self._identity(child)
                     if child_identity["fid"] == "0" or child_identity["pdir_fid"] != fid:
@@ -583,6 +596,11 @@ class ShareManager:
             self._prove_created(password, obj.fid, snapshot, scope)
         except AuthenticationError:
             raise _operation_error("分享创建或读回未获授权，结果未确认；未重新提交", evidence, authentication=True) from None
+        except (RateLimitError, AccessRestrictedError) as error:
+            # A cooldown is not a rejected write: keep its type and delay, and
+            # attach the operation evidence the CLI already understands.
+            error.share_evidence = safe_operation_result(evidence)
+            raise
         except QuarkError as error:
             preserved = getattr(error, "share_evidence", None)
             if preserved is not None:
@@ -611,6 +629,17 @@ class ShareManager:
             if getattr(error, "api_rejected", False) is True:
                 evidence["result"] = "failed"
             raise _operation_error("取消分享未获授权；未重新提交", evidence, authentication=True) from None
+        except (RateLimitError, AccessRestrictedError) as error:
+            # An explicit business rejection (``api_rejected``) is a definite
+            # refusal, so record it as failed. An ambiguous transport 429/403
+            # carries no such marker and stays unknown. A restriction can follow
+            # a submitted write, so the typed error and its delay are preserved,
+            # the operation evidence is attached, and the write is never closed
+            # out, replayed or read back while the cooldown is active.
+            if getattr(error, "api_rejected", False) is True:
+                evidence["result"] = "failed"
+            error.share_evidence = safe_operation_result(evidence)
+            raise
         except RemoteError as error:
             if getattr(error, "api_rejected", False) is True:
                 raise _operation_error("服务器明确拒绝取消分享；未重新提交", {**evidence, "result": "failed"}) from None
@@ -626,6 +655,9 @@ class ShareManager:
                     time.sleep(0.5)
         except AuthenticationError:
             raise _operation_error("取消分享后的本人目录读取未获授权，结果未确认；未重新提交", evidence, authentication=True) from None
+        except (RateLimitError, AccessRestrictedError) as error:
+            error.share_evidence = safe_operation_result(evidence)
+            raise
         except QuarkError:
             raise _operation_error("取消分享后的本人目录无法完整读取，结果未知；未重新提交", evidence) from None
         raise _operation_error("取消分享未在完整本人目录中确认，结果未知；未重新提交", evidence)

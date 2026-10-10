@@ -10,7 +10,23 @@ from typing import Any
 
 import httpx
 
-from .errors import AuthenticationError, NetworkError, RemoteError
+from .errors import (
+    AccessRestrictedError,
+    AuthenticationError,
+    NetworkError,
+    QuarkError,
+    RateLimitError,
+    RemoteError,
+)
+from .request_guard import (
+    DEFAULT_COOLDOWN_SECONDS,
+    DEFAULT_RESTRICTION_COOLDOWN_SECONDS,
+    REASON_ACCESS_RESTRICTED,
+    REASON_RATE_LIMITED,
+    REASON_SERVICE_UNAVAILABLE,
+    RequestGuard,
+    retry_after_seconds,
+)
 
 
 API_BASE = "https://drive-pc.quark.cn/1/clouddrive"
@@ -32,6 +48,60 @@ QUARK_DESKTOP_USER_AGENT = (
     "Electron/18.3.5.12-a038f7b798 Safari/537.36 Channel/pckk_other_ch"
 )
 
+# Explicit upstream restriction, restriction-challenge and throttling wording.
+# These take precedence over broad authentication keywords so a restricted
+# account is not mistaken for a stale Cookie. No undocumented numeric risk codes
+# are invented here.
+_RATE_LIMIT_PHRASES = (
+    "访问频繁",
+    "操作频繁",
+    "请求过于频繁",
+    "操作过于频繁",
+    "请求频繁",
+    "rate limit",
+    "too many requests",
+)
+_RESTRICTION_PHRASES = (
+    "访问受限",
+    "访问被限制",
+    "限制访问",
+    "账号受限",
+    "账户受限",
+    "账号封禁",
+    "账户封禁",
+    "验证码",
+    "人机验证",
+    "风控",
+    "access restricted",
+    "access denied",
+)
+
+
+def explicit_rejection_reason(text: str) -> str | None:
+    """Classify explicit upstream wording as a restriction or a throttle.
+
+    Returns ``REASON_ACCESS_RESTRICTED``, ``REASON_RATE_LIMITED`` or ``None``.
+    A verification/account-restriction phrase wins over a bare throttling
+    phrase: a restricted account must not be retried as if it were merely rate
+    limited. Only documented neutral wording is matched; upstream text is never
+    echoed back to the caller.
+    """
+    lowered = text.lower()
+    if any(phrase in lowered for phrase in _RESTRICTION_PHRASES):
+        return REASON_ACCESS_RESTRICTED
+    if any(phrase in lowered for phrase in _RATE_LIMIT_PHRASES):
+        return REASON_RATE_LIMITED
+    return None
+
+
+def default_guard(transport: httpx.BaseTransport | None, api_client: httpx.Client | None) -> RequestGuard:
+    """Keep mocked transports isolated; real transports share durable state."""
+    if isinstance(transport, httpx.MockTransport) or isinstance(
+        getattr(api_client, "_transport", None), httpx.MockTransport
+    ):
+        return RequestGuard.memory()
+    return RequestGuard.durable()
+
 
 class QuarkClient:
     """Owns separate authenticated API and unauthenticated transfer sessions.
@@ -49,6 +119,7 @@ class QuarkClient:
         transport: httpx.BaseTransport | None = None,
         timeout: float = 60.0,
         api_client: httpx.Client | None = None,
+        guard: RequestGuard | None = None,
     ) -> None:
         if not cookie or not cookie.strip():
             raise AuthenticationError("请设置 QUARK_COOKIE 或 QUARK_COOKIE_FILE")
@@ -59,6 +130,7 @@ class QuarkClient:
             if separator and value:
                 self._cookie_secrets.add((name, value))
         self._transport = transport
+        self._guard = guard if guard is not None else default_guard(transport, api_client)
         self._worker_transfers: list[httpx.Client] = []
         self._worker_transfers_lock = threading.Lock()
         self._owns_api = api_client is None
@@ -91,15 +163,19 @@ class QuarkClient:
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.close()
 
-    def _safe(self, message: str) -> str:
-        # Do not echo credentials even if an upstream error message includes
-        # an original or refreshed Cookie value.
+    def _redact(self, message: str) -> str:
+        """Mask the account Cookie and any refreshed credential value."""
         if self._cookie:
             message = message.replace(self._cookie, "[redacted]")
         for name, value in sorted(self._cookie_secrets, key=lambda pair: len(pair[1]), reverse=True):
             message = message.replace(f"{name}={value}", f"{name}=[redacted]")
             if len(value) >= 4:
                 message = message.replace(value, "[redacted]")
+        return message
+
+    def _safe(self, message: str) -> str:
+        """Expose only a masked, truncated message; never echo credentials or URLs."""
+        message = self._redact(message)
         message = re.sub(r"https?://\S+", "[redacted URL]", message, flags=re.IGNORECASE)
         message = re.sub(r"(?i)(authorization|auth_key|access_token|signature|sig)\s*[:=]\s*\S+", r"\1=[redacted]", message)
         return message[:240]
@@ -143,69 +219,145 @@ class QuarkClient:
         query = dict(DEFAULT_PARAMS)
         if params:
             query.update(params)
-        headers = {"cookie": self._cookie, "content-type": "application/json"}
-        if user_agent is not None:
-            headers["user-agent"] = user_agent
-        try:
-            response = self._api.request(
-                method,
-                url,
-                params=query,
-                json=dict(body) if body is not None else None,
-                headers=headers,
-            )
-        except httpx.TimeoutException:
-            raise NetworkError("夸克 API 请求超时") from None
-        except httpx.RequestError:
-            raise NetworkError("无法连接夸克 API") from None
+        with self._guard.request():
+            # Build the Cookie header only after the guard is held: a queued
+            # request must use the newest __puus another request just refreshed.
+            headers = {"cookie": self._cookie, "content-type": "application/json"}
+            if user_agent is not None:
+                headers["user-agent"] = user_agent
+            try:
+                response = self._api.request(
+                    method,
+                    url,
+                    params=query,
+                    json=dict(body) if body is not None else None,
+                    headers=headers,
+                )
+            except httpx.TimeoutException:
+                raise NetworkError("夸克 API 请求超时") from None
+            except httpx.RequestError:
+                raise NetworkError("无法连接夸克 API") from None
 
-        self._refresh_puus(response)
-        if response.status_code in (401, 403):
-            raise AuthenticationError("Cookie 已失效或无权访问，请重新获取网页端 Cookie")
-        if response.status_code < 200 or response.status_code >= 300:
-            raise RemoteError(f"夸克 API 返回 HTTP {response.status_code}")
-        try:
-            payload = response.json()
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            raise RemoteError("夸克 API 返回了非 JSON 响应") from None
-        if not isinstance(payload, dict):
-            raise RemoteError("夸克 API 响应格式无效")
+            self._refresh_puus(response)
+            self._raise_for_http_status(response)
+            try:
+                payload = response.json()
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise RemoteError("夸克 API 返回了非 JSON 响应") from None
+            if not isinstance(payload, dict):
+                raise RemoteError("夸克 API 响应格式无效")
 
-        status = payload.get("status")
-        code = payload.get("code")
-        if status is None and code is None:
-            raise RemoteError("夸克 API 响应缺少明确的成功状态")
-        # Opt-in partial-result protocols can retain the original task receipt.
-        # This is never enabled by ordinary file/transfer/save callers.
-        numeric_code = self._numeric_code(code)
-        numeric_status = self._numeric_code(status)
-        if (numeric_code in accepted_business_codes and numeric_status is not None
-                and 100 <= numeric_status < 500 and isinstance(payload.get("data"), dict)):
+            status = payload.get("status")
+            code = payload.get("code")
+            if status is None and code is None:
+                raise RemoteError("夸克 API 响应缺少明确的成功状态")
+            # Opt-in partial-result protocols can retain the original task receipt.
+            # This is never enabled by ordinary file/transfer/save callers.
+            numeric_code = self._numeric_code(code)
+            numeric_status = self._numeric_code(status)
+            if (numeric_code in accepted_business_codes and numeric_status is not None
+                    and 100 <= numeric_status < 500 and isinstance(payload.get("data"), dict)):
+                return payload
+            if isinstance(status, bool):
+                self._raise_api_error(payload)
+            if status is not None and not isinstance(status, (int, str)):
+                self._raise_api_error(payload)
+            if isinstance(status, int) and not isinstance(status, bool) and status != 200:
+                self._raise_api_error(payload)
+            if isinstance(status, str) and status.lower() not in ("success", "ok", "200"):
+                self._raise_api_error(payload)
+            if code not in (None, 0, "0"):
+                self._raise_api_error(payload)
             return payload
-        if isinstance(status, bool):
-            self._raise_api_error(payload)
-        if status is not None and not isinstance(status, (int, str)):
-            self._raise_api_error(payload)
-        if isinstance(status, int) and not isinstance(status, bool) and status != 200:
-            self._raise_api_error(payload)
-        if isinstance(status, str) and status.lower() not in ("success", "ok", "200"):
-            self._raise_api_error(payload)
-        if code not in (None, 0, "0"):
-            self._raise_api_error(payload)
-        return payload
+
+    def _raise_for_http_status(self, response: httpx.Response) -> None:
+        """Classify transport status codes; record cooldown before raising."""
+        status = response.status_code
+        if status == 401:
+            # 401 is the only status that proves the Cookie itself is stale.
+            raise AuthenticationError("Cookie 已失效或无权访问，请重新获取网页端 Cookie")
+        if status == 403:
+            # A raw 403 means access is restricted, not that the Cookie is stale.
+            delay = self._retry_after_seconds(response)
+            cooldown = max(DEFAULT_RESTRICTION_COOLDOWN_SECONDS, delay if delay is not None else 0.0)
+            recorded = self._guard.record_cooldown(cooldown, REASON_ACCESS_RESTRICTED)
+            remaining = max(0.0, recorded.until - self._guard.now())
+            raise AccessRestrictedError(
+                f"夸克 API 拒绝访问（HTTP 403），已暂停后续请求且未清除凭据，约 {max(0, int(remaining + 0.999))} 秒后再试；"
+                "请在官方客户端确认账号状态后重试",
+                retry_after=remaining,
+            )
+        if status == 429:
+            delay = self._retry_after_seconds(response)
+            cooldown = max(DEFAULT_COOLDOWN_SECONDS, delay if delay is not None else 0.0)
+            recorded = self._guard.record_cooldown(cooldown, REASON_RATE_LIMITED)
+            remaining = max(0.0, recorded.until - self._guard.now())
+            raise RateLimitError(
+                f"夸克 API 请求过于频繁（HTTP 429），已暂停后续请求，约 {max(0, int(remaining + 0.999))} 秒后再试；"
+                "请在官方客户端确认账号状态后重试",
+                retry_after=remaining,
+            )
+        if status == 503:
+            delay = self._retry_after_seconds(response)
+            if delay is not None:
+                recorded = self._guard.record_cooldown(delay, REASON_SERVICE_UNAVAILABLE)
+                remaining = max(0.0, recorded.until - self._guard.now())
+                raise RateLimitError(
+                    f"夸克 API 暂时不可用（HTTP 503），已暂停后续请求，约 {max(0, int(remaining + 0.999))} 秒后再试；"
+                    "请在官方客户端确认账号状态后重试",
+                    retry_after=remaining,
+                )
+        if status < 200 or status >= 300:
+            raise RemoteError(f"夸克 API 返回 HTTP {status}")
+
+    def _retry_after_seconds(self, response: httpx.Response) -> float | None:
+        """Parse Retry-After (delay-seconds or HTTP-date); None when absent/invalid."""
+        return retry_after_seconds(response.headers.get("retry-after"), self._guard.now())
 
     def _raise_api_error(self, payload: Mapping[str, Any]) -> None:
-        message = self._safe(str(payload.get("message") or payload.get("msg") or "夸克 API 操作失败"))
-        lowered = message.lower()
-        code = str(payload.get("code", "")).lower()
-        if any(word in lowered for word in ("login", "cookie", "auth", "登录", "认证")) or any(
-            marker in code for marker in ("401", "403", "token_expired")
+        # Classify the full, untruncated message with only credentials masked, so
+        # a restriction/verification phrase cannot be lost to truncation or to
+        # an echoed Cookie value. Only the sanitized form is ever exposed.
+        raw = str(payload.get("message") or payload.get("msg") or "夸克 API 操作失败")
+        detection = self._redact(raw)
+        message = self._safe(raw)
+        lowered = detection.lower()
+        code = payload.get("code")
+        numeric_code = self._numeric_code(code)
+        numeric_status = self._numeric_code(payload.get("status"))
+        reason = explicit_rejection_reason(detection)
+        restricted = reason == REASON_ACCESS_RESTRICTED or numeric_code == 403 or numeric_status == 403
+        throttled = reason == REASON_RATE_LIMITED or numeric_code == 429 or numeric_status == 429
+        if restricted:
+            # An explicit restriction/verification phrase or an exact business
+            # 403 wins over broad authentication keywords: neither is evidence
+            # of a stale Cookie. A substring "403" elsewhere never is.
+            cooldown = self._guard.record_cooldown(DEFAULT_RESTRICTION_COOLDOWN_SECONDS, REASON_ACCESS_RESTRICTED)
+            remaining = max(0.0, cooldown.until - self._guard.now())
+            error: QuarkError = AccessRestrictedError(
+                f"{message}；已暂停 {max(0, int(remaining + 0.999))} 秒内的后续请求，"
+                "请在官方客户端确认账号状态后重试",
+                retry_after=remaining,
+            )
+        elif throttled:
+            # Only an exact 429 code/status is throttling; a "429" substring in
+            # a message or a longer code such as 14290 never is.
+            cooldown = self._guard.record_cooldown(DEFAULT_COOLDOWN_SECONDS, REASON_RATE_LIMITED)
+            remaining = max(0.0, cooldown.until - self._guard.now())
+            error = RateLimitError(
+                f"{message}；已暂停 {max(0, int(remaining + 0.999))} 秒内的后续请求，"
+                "请在官方客户端确认账号状态后重试",
+                retry_after=remaining,
+            )
+        elif (
+            numeric_code == 401
+            or numeric_status == 401
+            or str(code).lower() == "token_expired"
+            or any(word in lowered for word in ("login", "cookie", "auth", "登录", "认证"))
         ):
             error = AuthenticationError(message)
         else:
             error = RemoteError(message)
-        numeric_code = self._numeric_code(payload.get("code"))
-        numeric_status = self._numeric_code(payload.get("status"))
         if (numeric_code is not None and numeric_code != 0 and numeric_code != 41060
                 and (payload.get("status") is None or (isinstance(payload.get("status"), str) and payload["status"].lower() in ("success", "ok"))
                      or (numeric_status is not None and 100 <= numeric_status < 500))
@@ -257,6 +409,22 @@ class QuarkClient:
     def transfer_client(self) -> httpx.Client:
         """Return the isolated session used for signed transfer URLs."""
         return self._transfer
+
+    def check_request_cooldown(self) -> None:
+        """Refuse to open a new storage/origin request while a cooldown is active."""
+        self._guard.check_active_cooldown()
+
+    @property
+    def guard(self) -> RequestGuard:
+        """The shared pacing/cooldown guard; use only its public methods."""
+        return self._guard
+
+    def observe_transfer_response(self, response: httpx.Response) -> None:
+        """Apply the shared cooldown for 429 / 503+Retry-After transfer responses.
+
+        Storage-level 401/403 never reach a credential-clearing decision here.
+        """
+        self._guard.observe_transfer_response(response)
 
     def new_transfer_client(self) -> httpx.Client:
         """Create an isolated signed-URL session for one download worker."""

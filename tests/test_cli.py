@@ -355,7 +355,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(set(json.loads(output.getvalue())), {"uploaded", "recursive", "files", "directories", "size", "destination_fid"})
         with patch("quark_cli.cli.RecursiveTransfer.download_tree", return_value={"downloaded": True, "recursive": True, "fid": "target", "path": "output", "files": 0, "directories": 1, "size": 0}) as download, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(main(["download", "/范围/目标", "--output", "output", "--recursive", "--overwrite", "--resume", "--json"], transport=drive.transport()), 0)
-        download.assert_called_once_with("target", "output", overwrite=True, resume=True, connections=16)
+        download.assert_called_once_with("target", "output", overwrite=True, resume=True, connections=4)
 
     def test_recursive_upload_preview_real_scan_zero_writes_and_no_state(self):
         drive = DriveFixture()
@@ -610,7 +610,7 @@ class CliTests(unittest.TestCase):
         with patch("quark_cli.cli.Transfer.download", return_value={"fid": "file", "path": "local.pdf", "size": 4}) as download:
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(main(["download", "/范围/中文 空格/报告.PDF", "--output", "local.pdf"], transport=drive.transport()), 0)
-            download.assert_called_once_with("file", "local.pdf", overwrite=False, connections=16)
+            download.assert_called_once_with("file", "local.pdf", overwrite=False, connections=4)
 
     def test_mkdir_complete_path_rejects_parent_option_and_existing_directory(self):
         for args in (["mkdir", "/范围/新目录", "--parent", "0"], ["mkdir", "/范围"], ["mkdir", "/缺失/中间/末级"]):

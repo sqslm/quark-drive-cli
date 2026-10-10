@@ -100,6 +100,7 @@ class QrLoginWindow:
         timeout: int = 300,
         login_factory: Callable[[threading.Event], Any] | None = None,
         root_factory: Callable[[], Any] | None = None,
+        guard: Any = None,
     ) -> None:
         self._new_login = login_factory or (
             lambda cancel: QRLogin(
@@ -107,6 +108,7 @@ class QrLoginWindow:
                 timeout=timeout,
                 cookie_path=cookie_path,
                 cancelled=cancel.is_set,
+                guard=guard,
             )
         )
         self._root_factory = root_factory

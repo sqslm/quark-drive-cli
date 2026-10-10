@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from quark_cli.client import QuarkClient
-from quark_cli.errors import AuthenticationError, QuarkError, RemoteError, UsageError
+from quark_cli.errors import AuthenticationError, QuarkError, RateLimitError, RemoteError, UsageError
 from quark_cli.files import Files
 from quark_cli.paths import RemotePaths, Scope
 from quark_cli.share_management import ShareManager
@@ -573,7 +573,7 @@ class ManagementTests(unittest.TestCase):
         def handler(request):
             if request.url.path.endswith("/share/delete"):
                 self.drive.calls.append(request)
-                return httpx.Response(200, json={"status": 400, "code": 40301, "message": "refused-secret"}, request=request)
+                return httpx.Response(200, json={"status": 400, "code": 401, "message": "refused-secret"}, request=request)
             return original(request)
         self.client.close()
         with QuarkClient("sid=offline", transport=httpx.MockTransport(handler)) as client, self.assertRaises(AuthenticationError) as caught:
@@ -582,6 +582,61 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(caught.exception.share_evidence["result"], "failed")
         self.assertEqual(len(self.drive.writes), 1)
         self.assertNotIn("secret", str(caught.exception))
+
+    def test_unknown_business_40301_is_not_treated_as_auth(self):
+        import httpx
+        self.drive.add_share()
+        original = self.drive.handler
+        def handler(request):
+            if request.url.path.endswith("/share/delete"):
+                self.drive.calls.append(request)
+                return httpx.Response(200, json={"status": 400, "code": 40301, "message": "refused-secret"}, request=request)
+            return original(request)
+        self.client.close()
+        with QuarkClient("sid=offline", transport=httpx.MockTransport(handler)) as client, self.assertRaises(RemoteError) as caught:
+            ShareManager(client).revoke("own-share")
+        self.assertNotIsInstance(caught.exception, AuthenticationError)
+        self.assertEqual(caught.exception.exit_code, 4)
+        self.assertEqual(caught.exception.share_evidence["result"], "failed")
+        self.assertEqual(len(self.drive.writes), 1)
+        self.assertNotIn("secret", str(caught.exception))
+
+    def test_revoke_rejection_classification_follows_receipt_evidence(self):
+        import httpx
+        cases = (
+            ("exact_business_403_no_receipt",
+             {"status_code": 200, "json": {"status": 400, "code": 403, "message": "refused-secret"}},
+             RemoteError, "failed"),
+            ("ambiguous_http_429",
+             {"status_code": 429, "headers": {"Retry-After": "60"}},
+             RateLimitError, "unknown"),
+            ("business_403_with_receipt",
+             {"status_code": 200, "json": {"status": 400, "code": 403, "message": "refused-secret",
+                                           "data": {"task_id": "accepted"}}},
+             RemoteError, "unknown"),
+        )
+        for label, reply, expected_error, expected_result in cases:
+            with self.subTest(label=label):
+                drive = ManagementFixture()
+                drive.add_share()
+                original = drive.handler
+                def handler(request, reply=reply):
+                    if request.url.path.endswith("/share/delete"):
+                        drive.calls.append(request)
+                        return httpx.Response(request=request, **reply)
+                    return original(request)
+                with QuarkClient("sid=offline", transport=httpx.MockTransport(handler)) as client, \
+                        self.assertRaises(expected_error) as caught:
+                    ShareManager(client).revoke("own-share")
+                self.assertNotIsInstance(caught.exception, AuthenticationError)
+                self.assertEqual(caught.exception.share_evidence["result"], expected_result)
+                self.assertEqual(len(drive.writes), 1)
+                # A refusal or an active cooldown never replays the write or
+                # reads the catalog back: only the pre-submit catalog read runs.
+                reads = sum(request.url.path.endswith("/share/mypage/detail") for request in drive.calls)
+                self.assertEqual(reads, 1)
+                if label == "ambiguous_http_429":
+                    self.assertGreaterEqual(caught.exception.retry_after, 1)
 
     def test_partial_business_code_without_task_receipt_is_unknown(self):
         import httpx

@@ -262,8 +262,22 @@ class BridgeCase(_ServerCase):
         self.fixture.origin_failures = 4
         self.fixture.origin_epoch += 1
         response = self.stream(payload["url"])
-        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["type"], "access_restricted")
+        self.assertGreaterEqual(int(response.headers["retry-after"]), 1)
         self.assertEqual(self.fixture.download_calls, 2)
+        # The credential is preserved: the bridge still reports it signed in.
+        self.assertTrue(self.api("GET", "/v1/auth").json()["authenticated"])
+        requests, origins = len(self.fixture.requests), len(self.fixture.origin_requests())
+        # The recorded cooldown refuses the next media and control calls locally,
+        # so neither the origin nor the account API is touched again.
+        follow = self.stream(payload["url"])
+        self.assertEqual(follow.status_code, 403)
+        self.assertEqual(follow.json()["error"]["type"], "access_restricted")
+        self.assertGreaterEqual(int(follow.headers["retry-after"]), 1)
+        self.assertEqual(self.api("GET", "/v1/files").status_code, 403)
+        self.assertEqual(len(self.fixture.requests), requests)
+        self.assertEqual(len(self.fixture.origin_requests()), origins)
 
     def test_changed_size_on_refetch_aborts_and_forgets_the_session(self):
         payload = self.play("v2")
@@ -382,9 +396,17 @@ class BridgeCase(_ServerCase):
         payload = self.play("v2")
         self.fixture.origin_failures = 4
         self.fixture.origin_epoch += 1
-        self.assertEqual(self.stream(payload["url"]).status_code, 502)
+        response = self.stream(payload["url"])
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["type"], "access_restricted")
+        self.assertGreaterEqual(int(response.headers["retry-after"]), 1)
+        # Not an account failure: the plugin credential is kept and still valid.
         self.assertTrue(self.api("GET", "/v1/auth").json()["authenticated"])
-        self.assertEqual(self.api("GET", "/v1/files").status_code, 200)
+        requests, origins = len(self.fixture.requests), len(self.fixture.origin_requests())
+        self.assertEqual(self.stream(payload["url"]).status_code, 403)
+        self.assertEqual(self.api("GET", "/v1/files").status_code, 403)
+        self.assertEqual(len(self.fixture.requests), requests)
+        self.assertEqual(len(self.fixture.origin_requests()), origins)
 
     # -- keep-alive body handling ----------------------------------------
 

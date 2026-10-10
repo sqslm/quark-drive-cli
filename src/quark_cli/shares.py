@@ -12,7 +12,15 @@ from collections.abc import Mapping
 from typing import Any
 
 from .client import QuarkClient
-from .errors import AuthenticationError, QuarkError, RemoteError, UsageError
+from .errors import (
+    AccessRestrictedError,
+    AuthenticationError,
+    QuarkError,
+    RateLimitError,
+    RemoteError,
+    UsageError,
+    contextual_error,
+)
 from .files import Files
 from .paths import DirectoryTarget, RemotePaths, Scope, is_directory, path_components, valid_fid, validate_name
 
@@ -138,8 +146,8 @@ class ShareSaver:
             )
         except AuthenticationError:
             raise AuthenticationError("获取分享令牌未获授权") from None
-        except Exception:
-            raise RemoteError("获取分享令牌失败") from None
+        except Exception as original:
+            raise contextual_error(original, "获取分享令牌失败") from None
         data = payload.get("data")
         token = data.get("stoken") if isinstance(data, dict) else None
         if not isinstance(token, str) or not token.strip():
@@ -171,8 +179,8 @@ class ShareSaver:
                 )
             except AuthenticationError:
                 raise AuthenticationError("读取分享详情未获授权，已停止转存") from None
-            except Exception:
-                raise RemoteError("读取分享详情失败，已停止转存") from None
+            except Exception as original:
+                raise contextual_error(original, "读取分享详情失败，已停止转存") from None
 
             data = payload.get("data")
             if not isinstance(data, dict) or not isinstance(data.get("list"), list):
@@ -306,6 +314,9 @@ class ShareSaver:
                 time.sleep(_CREATE_READBACK_INTERVAL)
             try:
                 children = self._list_children(parent_fid)
+            except (RateLimitError, AccessRestrictedError):
+                # A throttle/restriction must stop the readback, not retry it.
+                raise
             except AuthenticationError:
                 raise AuthenticationError("新建目标目录读回未获授权；未提交转存") from None
             except Exception:
@@ -342,8 +353,8 @@ class ShareSaver:
             result = self.files.mkdir(target.name, target.parent_fid)
         except AuthenticationError:
             raise AuthenticationError("创建目标末级目录未获授权；未提交转存") from None
-        except Exception:
-            raise RemoteError("创建目标末级目录失败；未提交转存") from None
+        except Exception as original:
+            raise contextual_error(original, "创建目标末级目录失败；未提交转存") from None
         new_fid = self._confirm_created_directory(target.parent_fid, target.name, _optional_created_fid(result))
         if scope:
             scope.check(new_fid, write=True)
@@ -367,9 +378,9 @@ class ShareSaver:
         except AuthenticationError:
             note = "；目标目录已创建" if created else ""
             raise AuthenticationError(f"提交转存未获授权，受理状态无法确认且未自动重试{note}") from None
-        except Exception:
+        except Exception as original:
             note = "；目标目录已创建" if created else ""
-            raise RemoteError(f"提交转存失败，受理状态无法确认且未自动重试{note}") from None
+            raise contextual_error(original, f"提交转存失败，受理状态无法确认且未自动重试{note}") from None
         data = submit.get("data")
         task_id = data.get("task_id") if isinstance(data, dict) else None
         if not isinstance(task_id, (str, int)) or isinstance(task_id, bool) or not str(task_id).strip():
@@ -399,8 +410,8 @@ class ShareSaver:
                 after_items = self._list_children(target_fid)
             except AuthenticationError:
                 raise AuthenticationError(f"转存任务 {task_id} 已完成，但查询目标目录未获授权") from None
-            except Exception:
-                raise RemoteError(f"转存任务 {task_id} 已完成，但无法确认目标目录内容") from None
+            except Exception as original:
+                raise contextual_error(original, f"转存任务 {task_id} 已完成，但无法确认目标目录内容") from None
             matches = {name: [item for item in after_items if item.get("file_name") == name] for name in expected}
             if any(len(items) > 1 for items in matches.values()):
                 raise RemoteError(f"转存任务 {task_id} 已完成，但目标目录同名项目无法唯一确认")
@@ -504,8 +515,8 @@ class ShareSaver:
                 payload = self.client.get("task", params={"task_id": task_id, "retry_index": retry_index})
             except AuthenticationError:
                 raise AuthenticationError(f"查询转存任务未获授权，状态无法确认（task_id={task_id}）；未重新提交") from None
-            except Exception:
-                raise RemoteError(f"查询转存任务失败，状态无法确认（task_id={task_id}）；未重新提交") from None
+            except Exception as original:
+                raise contextual_error(original, f"查询转存任务失败，状态无法确认（task_id={task_id}）；未重新提交") from None
             data = payload.get("data")
             if not isinstance(data, dict):
                 raise RemoteError(f"转存任务响应缺少 data（task_id={task_id}）；未重新提交")

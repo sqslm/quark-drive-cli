@@ -17,9 +17,10 @@ from urllib.parse import urlsplit
 import httpx
 
 from ..client import QuarkClient
-from ..errors import RemoteError, UsageError
+from ..errors import AccessRestrictedError, RemoteError, UsageError
 from ..files import Files
 from ..paths import is_directory, valid_fid
+from ..request_guard import REASON_ACCESS_RESTRICTED
 from ..transfer import download_address, successor_url, trusted_url
 from .library import require_fid
 from .naming import extension, is_video, order_key
@@ -33,6 +34,7 @@ REDIRECT_LIMIT = 6
 CHUNK_SIZE = 64 * 1024
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 _AUTH_STATUSES = (401, 403)
+DENIED_COOLDOWN_SECONDS = 60.0
 
 
 class UnknownSession(Exception):
@@ -208,12 +210,16 @@ def _fetch(client: QuarkClient, url: str, fid: str) -> bytes:
             current = url
             response = None
             for _ in range(REDIRECT_LIMIT):
+                # No byte pacing: only refuse a new storage request/redirect
+                # while a shared cooldown is active.
+                client.check_request_cooldown()
                 current = trusted_url(current)
                 headers = {"Accept-Encoding": "identity"}
                 cookie = client.transfer_cookie_header(urlsplit(current).hostname or "")
                 if cookie is not None:
                     headers["Cookie"] = cookie
                 response = stack.enter_context(storage.stream("GET", current, headers=headers))
+                client.observe_transfer_response(response)
                 if response.status_code in _REDIRECT_STATUSES:
                     location = response.headers.get("location")
                     if not location:
@@ -227,7 +233,15 @@ def _fetch(client: QuarkClient, url: str, fid: str) -> bytes:
                 if attempt == 0:
                     url = download_address(client, fid).url
                     continue
-                raise RemoteError("字幕取链失效且重新获取后仍无法下载")
+                # The refetched signed URL was refused too: pause briefly and
+                # stop without touching the saved credential.
+                cooldown = client.guard.record_cooldown(DENIED_COOLDOWN_SECONDS, REASON_ACCESS_RESTRICTED)
+                remaining = max(0.0, cooldown.until - client.guard.now())
+                raise AccessRestrictedError(
+                    f"字幕取链失效且重新获取后仍无法下载，已暂停 {max(0, int(remaining + 0.999))} 秒的新请求；"
+                    "请在官方客户端确认账号状态后重试",
+                    retry_after=remaining,
+                )
             if response.status_code != 200:
                 raise RemoteError(f"下载源返回了异常状态 {response.status_code}")
             encoding = response.headers.get("content-encoding")

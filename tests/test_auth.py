@@ -12,7 +12,8 @@ import httpx
 
 from quark_cli import auth
 from quark_cli.auth import QRLogin, get_cookie, logout, render_terminal_qr, save_cookie, write_qr_png
-from quark_cli.errors import AuthenticationError, LocalIOError, RemoteError
+from quark_cli.errors import AccessRestrictedError, AuthenticationError, LocalIOError, RateLimitError, RemoteError
+from quark_cli.request_guard import REASON_ACCESS_RESTRICTED, REASON_RATE_LIMITED, RequestGuard
 
 
 def api_ok(data):
@@ -371,6 +372,182 @@ class AuthTests(unittest.TestCase):
                     save_cookie("sid=must-not-be-written", cookie_path)
             acl.assert_called_once()
             self.assertFalse(cookie_path.exists())
+
+
+    def test_explicit_qr_rejection_ignores_success_and_neutral_pending_payloads(self):
+        guard = RequestGuard.memory()
+        for payload in ({"status": 2000000, "message": "请求过于频繁时请稍后再试"},
+                        {"status": 50004001, "data": {}},
+                        {"status": 50004001, "message": "等待扫码"}):
+            with self.subTest(payload=payload):
+                auth._explicit_qr_rejection(payload, guard)
+        self.assertIsNone(guard.active_cooldown())
+
+    def test_qr_token_explicit_restriction_is_rejected_before_image_creation(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(200, json={"status": 50004001, "message": "需要人机验证，请稍后再试"}, request=request)
+
+        guard = RequestGuard.memory()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            qr_path = Path(temp_dir) / "restricted.png"
+            cookie_path = Path(temp_dir) / "config" / "cookie"
+            with self.assertRaises(AccessRestrictedError) as caught:
+                QRLogin(transport=httpx.MockTransport(handler), timeout=2, guard=guard, cookie_path=cookie_path).run(qr_file=qr_path)
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn("人机验证", str(caught.exception))
+            self.assertFalse(qr_path.exists())
+            self.assertFalse(cookie_path.exists())
+            self.assertEqual(guard.active_cooldown().reason, REASON_ACCESS_RESTRICTED)
+
+    def test_qr_poll_throttle_stops_after_first_rejected_poll(self):
+        polls = []
+
+        def handler(request):
+            if request.url.path.endswith("getTokenForQrcodeLogin"):
+                return httpx.Response(200, json={"status": 2000000, "data": {"members": {"token": "qr-token-private"}}}, request=request)
+            if request.url.path.endswith("getServiceTicketByQrcodeToken"):
+                polls.append(request)
+                return httpx.Response(
+                    200,
+                    json={"status": 50004001, "message": "请求过于频繁 token=private-upstream-message"},
+                    request=request,
+                )
+            return httpx.Response(404, request=request)
+
+        guard = RequestGuard.memory()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            qr_path = root / "throttled.png"
+            cookie_path = root / "config" / "cookie"
+            with self.assertRaises(RateLimitError) as caught:
+                QRLogin(
+                    transport=httpx.MockTransport(handler),
+                    timeout=9,
+                    poll_interval=0,
+                    guard=guard,
+                    cookie_path=cookie_path,
+                ).run(qr_file=qr_path)
+            self.assertEqual(len(polls), 1)
+            self.assertAlmostEqual(caught.exception.retry_after, 60.0, delta=1.0)
+            self.assertEqual(guard.active_cooldown().reason, REASON_RATE_LIMITED)
+            self.assertFalse(qr_path.exists())
+            self.assertFalse(cookie_path.exists())
+            self.assertNotIn("private-upstream-message", str(caught.exception))
+            self.assertNotIn("qr-token-private", str(caught.exception))
+
+    def test_qr_poll_account_restriction_pauses_for_six_hundred_seconds(self):
+        polls = []
+
+        def handler(request):
+            if request.url.path.endswith("getTokenForQrcodeLogin"):
+                return httpx.Response(200, json={"status": 2000000, "data": {"members": {"token": "qr-token-private"}}}, request=request)
+            if request.url.path.endswith("getServiceTicketByQrcodeToken"):
+                polls.append(request)
+                return httpx.Response(200, json={"status": 50004001, "message": "账号受限，请稍后再试"}, request=request)
+            return httpx.Response(404, request=request)
+
+        guard = RequestGuard.memory()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            qr_path = root / "limited.png"
+            cookie_path = root / "config" / "cookie"
+            with self.assertRaises(AccessRestrictedError) as caught:
+                QRLogin(
+                    transport=httpx.MockTransport(handler),
+                    timeout=9,
+                    poll_interval=0,
+                    guard=guard,
+                    cookie_path=cookie_path,
+                ).run(qr_file=qr_path)
+            self.assertEqual(len(polls), 1)
+            self.assertAlmostEqual(caught.exception.retry_after, 600.0, delta=1.0)
+            self.assertEqual(guard.active_cooldown().reason, REASON_ACCESS_RESTRICTED)
+            self.assertFalse(qr_path.exists())
+            self.assertFalse(cookie_path.exists())
+
+    def test_qr_token_403_honors_longer_retry_after(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(403, headers={"retry-after": "900"}, request=request)
+
+        guard = RequestGuard.memory()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            qr_path = Path(temp_dir) / "denied.png"
+            cookie_path = Path(temp_dir) / "config" / "cookie"
+            with self.assertRaises(AccessRestrictedError) as caught:
+                QRLogin(
+                    transport=httpx.MockTransport(handler),
+                    timeout=2,
+                    guard=guard,
+                    cookie_path=cookie_path,
+                ).run(qr_file=qr_path)
+            self.assertEqual(len(calls), 1)
+            self.assertAlmostEqual(caught.exception.retry_after, 900.0, delta=1.0)
+            cooldown = guard.active_cooldown()
+            self.assertEqual(cooldown.reason, REASON_ACCESS_RESTRICTED)
+            self.assertGreaterEqual(cooldown.until - guard.now(), 899.0)
+            self.assertFalse(qr_path.exists())
+            self.assertFalse(cookie_path.exists())
+
+    def test_qr_token_403_with_short_retry_after_keeps_six_hundred_floor(self):
+        def handler(request):
+            return httpx.Response(403, headers={"retry-after": "30"}, request=request)
+
+        guard = RequestGuard.memory()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(AccessRestrictedError) as caught:
+                QRLogin(
+                    transport=httpx.MockTransport(handler),
+                    timeout=2,
+                    guard=guard,
+                    cookie_path=Path(temp_dir) / "cookie",
+                ).run(qr_file=Path(temp_dir) / "denied.png")
+            self.assertAlmostEqual(caught.exception.retry_after, 600.0, delta=1.0)
+
+    def test_qr_token_401_remains_authentication_error(self):
+        def handler(request):
+            return httpx.Response(401, request=request)
+
+        guard = RequestGuard.memory()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(AuthenticationError):
+                QRLogin(
+                    transport=httpx.MockTransport(handler),
+                    timeout=2,
+                    guard=guard,
+                    cookie_path=Path(temp_dir) / "cookie",
+                ).run(qr_file=Path(temp_dir) / "expired.png")
+        self.assertIsNone(guard.active_cooldown())
+
+    def test_read_only_hop_403_is_classified_inside_guard_before_releasing(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(403, headers={"retry-after": "900"}, request=request)
+
+        guard = RequestGuard.memory()
+        with httpx.Client(transport=httpx.MockTransport(handler)) as session:
+            with self.assertRaises(AccessRestrictedError) as caught:
+                auth._get_without_redirects(
+                    session,
+                    "https://pan.quark.cn/account/info",
+                    params={"st": "ticket-private", "lw": "scan"},
+                    allowed_host="pan.quark.cn",
+                    operation="账号验证",
+                    guard=guard,
+                )
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("ticket-private", str(caught.exception))
+        self.assertAlmostEqual(caught.exception.retry_after, 900.0, delta=1.0)
+        cooldown = guard.active_cooldown()
+        self.assertEqual(cooldown.reason, REASON_ACCESS_RESTRICTED)
+        self.assertGreaterEqual(cooldown.until - guard.now(), 899.0)
 
 
 if __name__ == "__main__":

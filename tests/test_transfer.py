@@ -10,7 +10,7 @@ from unittest.mock import patch
 import httpx
 
 from quark_cli.client import QUARK_DESKTOP_USER_AGENT, QuarkClient
-from quark_cli.errors import AuthenticationError, LocalIOError, RemoteError, UsageError
+from quark_cli.errors import AuthenticationError, LocalIOError, RateLimitError, RemoteError, UsageError
 from quark_cli.transfer import Transfer, UPLOAD_READBACK_ATTEMPTS, UPLOAD_READBACK_INTERVAL, _SHA1State
 from quark_cli.transfer_state import DownloadLedger, TransferLedger, UploadLedger
 from quark_cli.transfer_progress import RateLimiter
@@ -1101,6 +1101,45 @@ class TransferTests(unittest.TestCase):
                     Transfer(client).download("fid-1", output, overwrite=True, connections=4)
             self.assertEqual(output.read_bytes(), b"old")
             self.assertFalse(list(Path(directory).glob(".quark-download-*")))
+
+    def test_download_storage_429_keeps_typed_error_checkpoint_and_stops_requests(self):
+        body = b"resumable bytes" * 200
+        requests_seen = []
+
+        def handler(request):
+            requests_seen.append((request.method, request.url.host, request.url.path))
+            if request.url.host == "drive-pc.quark.cn" and request.url.path.endswith("/file/info"):
+                return httpx.Response(200, json=ok({
+                    "fid": "fid-1", "file_name": "remote.bin", "pdir_fid": "0", "file_type": 1, "size": len(body),
+                }), request=request)
+            if request.url.host == "drive-pc.quark.cn":
+                return httpx.Response(200, json=ok({"list": [{
+                    "fid": "fid-1", "file_name": "remote.bin", "size": len(body),
+                    "download_url": "https://dl-pc-sz.pds.quark.cn/object?signature=private",
+                }]}), request=request)
+            return httpx.Response(429, headers={"Retry-After": "45"}, text="slow down", request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "out.bin"
+            state = Path(directory) / "state"
+            with QuarkClient("sid=private-cookie; __puus=puus-private",
+                             transport=httpx.MockTransport(handler)) as client:
+                transfer = Transfer(client, state_dir=state)
+                with self.assertRaises(RateLimitError) as caught:
+                    transfer.download("fid-1", output, resume=True)
+                self.assertGreaterEqual(caught.exception.retry_after, 1)
+                self.assertFalse(output.exists())
+                self.assertFalse(list(Path(directory).glob(".quark-*.part")))
+                ledgers = list(state.glob("download-*.json"))
+                self.assertEqual(len(ledgers), 1)
+                checkpoint = json.loads(ledgers[0].read_text(encoding="utf-8"))
+                self.assertEqual((checkpoint["phase"], checkpoint["offset"]), ("prepared", 0))
+                before = len(requests_seen)
+                # The shared cooldown refuses the next attempt before any HTTP
+                # request leaves the process; the checkpoint is left untouched.
+                with self.assertRaises(RateLimitError):
+                    transfer.download("fid-1", output, resume=True)
+                self.assertEqual(len(requests_seen), before)
 
     def test_download_sends_only_puus_to_pds_where_anonymous_get_would_be_403(self):
         body = b"authenticated PDS download"

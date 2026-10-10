@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 import os
 import secrets
 import subprocess
@@ -24,17 +25,20 @@ from urllib.parse import parse_qs, quote, urlsplit
 import httpx
 
 from ..auth import LoginCancelled
-from ..client import QuarkClient
+from ..client import QuarkClient, default_guard
 from ..errors import (
+    AccessRestrictedError,
     AuthenticationError,
     LocalIOError,
     NetworkError,
     QuarkError,
+    RateLimitError,
     RemoteError,
     UsageError,
 )
 from ..files import Files
 from ..paths import is_directory
+from ..request_guard import RequestGuard
 from . import SERVICE_VERSION
 from .library import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, page, playlist, require_fid, search
 from .library_state import Library
@@ -89,6 +93,12 @@ def _failure(kind: str, message: str) -> dict[str, Any]:
 def _status_for(exc: BaseException) -> tuple[int, str]:
     if isinstance(exc, AuthenticationError):
         return 401, "login_required"
+    # Typed cooldown errors are never credential failures: the plugin must not
+    # clear its Cookie, library or login state for them.
+    if isinstance(exc, RateLimitError):
+        return 429, "rate_limited"
+    if isinstance(exc, AccessRestrictedError):
+        return 403, "access_restricted"
     if isinstance(exc, MediaChanged):
         return 409, "media_changed"
     if isinstance(exc, NetworkError):
@@ -176,6 +186,7 @@ class Service:
         cookie: str | None = None,
         login_factory: Callable[[], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        guard: RequestGuard | None = None,
     ) -> None:
         self.instance = secrets.token_hex(8)
         self.token = secrets.token_urlsafe(32)
@@ -185,8 +196,11 @@ class Service:
         self.library = Library()
         self._transport = transport
         self._cookie = cookie
+        # One guard is shared by the bridge, its Quark client and the QR login it
+        # starts, so a cooldown survives client rebuilds within this process.
+        self._guard = guard if guard is not None else default_guard(transport, None)
         self._login_factory = login_factory or (
-            lambda: QrLoginWindow(transport=transport, cookie_path=credential_path())
+            lambda: QrLoginWindow(transport=transport, cookie_path=credential_path(), guard=self._guard)
         )
         self._client: QuarkClient | None = None
         self._client_cookie: str | None = None
@@ -215,7 +229,7 @@ class Service:
             if self._client is None or self._client_cookie != cookie:
                 if self._client is not None:
                     self._client.close()
-                self._client = QuarkClient(cookie, transport=self._transport)
+                self._client = QuarkClient(cookie, transport=self._transport, guard=self._guard)
                 self._client_cookie = cookie
             return self._client
 
@@ -266,6 +280,9 @@ class Service:
 
     def start_login(self) -> dict[str, Any]:
         """Start one QR login; a repeated call while it runs reports the same state."""
+        # Refuse before any GUI is created: a shared cooldown means the account
+        # or upstream is currently rejecting requests, not that login is broken.
+        self._guard.check_active_cooldown()
         with self._login_lock:
             if self._login_thread is not None and self._login_thread.is_alive():
                 return self._login_payload_locked()
@@ -751,8 +768,12 @@ class _Handler(BaseHTTPRequestHandler):
             message = "插件未登录或登录已失效，请在播放器中重新扫码登录"
         else:
             message = str(exc) or "服务内部错误"
+        retry_after = getattr(exc, "retry_after", None)
+        extra = None
+        if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool) and retry_after > 0:
+            extra = {"Retry-After": str(math.ceil(retry_after))}
         try:
-            self._json(status, _failure(kind, message))
+            self._json(status, _failure(kind, message), extra=extra)
         except OSError:
             self.close_connection = True
 

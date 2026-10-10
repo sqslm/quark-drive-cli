@@ -230,10 +230,17 @@ class ReadCase(_BridgeCase):
         self.fixture.origin_failures = 4
         self.fixture.origin_epoch += 1
         response = self.api("GET", "/v1/subtitle?fid=sub1")
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.json()["error"]["type"], "remote_error")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["type"], "access_restricted")
+        self.assertGreaterEqual(int(response.headers["retry-after"]), 1)
+        self.assertEqual(self.fixture.download_calls, 2)
         self.assertTrue(self.api("GET", "/v1/auth").json()["authenticated"])
-        self.assertEqual(self.api("GET", "/v1/files").status_code, 200)
+        requests, origins = len(self.fixture.requests), len(self.fixture.origin_requests())
+        # The cooldown refuses the next subtitle and control calls locally.
+        self.assertEqual(self.api("GET", "/v1/subtitle?fid=sub1").status_code, 403)
+        self.assertEqual(self.api("GET", "/v1/files").status_code, 403)
+        self.assertEqual(len(self.fixture.requests), requests)
+        self.assertEqual(len(self.fixture.origin_requests()), origins)
 
     def test_bom_utf16_and_gb18030_text_is_decoded(self):
         cases = [
