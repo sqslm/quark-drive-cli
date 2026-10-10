@@ -183,10 +183,17 @@ class _Upstream:
     the account Cookie is never installed.
     """
 
-    def __init__(self, client: QuarkClient, url: str, headers: dict[str, str]) -> None:
+    def __init__(
+        self,
+        client: QuarkClient,
+        url: str,
+        headers: dict[str, str],
+        on_origin: Callable[[int, int], None] | None = None,
+    ) -> None:
         self._client = client
         self._url = url
         self._headers = headers
+        self._on_origin = on_origin
         self._stack: ExitStack | None = None
         self._storage: httpx.Client | None = None
 
@@ -204,7 +211,12 @@ class _Upstream:
                 cookie = self._client.transfer_cookie_header(urlsplit(current).hostname or "")
                 if cookie is not None:
                     headers["Cookie"] = cookie
+                started = time.monotonic()
                 response = stack.enter_context(storage.stream("GET", current, headers=headers))
+                # Report every real origin response (including a redirect or a
+                # 429/403) before the guard classifies it; no URL is involved.
+                if self._on_origin is not None:
+                    self._on_origin(response.status_code, max(0, int((time.monotonic() - started) * 1000)))
                 self._client.observe_transfer_response(response)
                 if response.status_code in (301, 302, 303, 307, 308):
                     location = response.headers.get("location")
@@ -236,13 +248,19 @@ def open_content(
     session: PlaySession,
     byte_range: tuple[int, int] | None,
     refetch: Callable[[], None],
+    *,
+    on_origin: Callable[[int, int], None] | None = None,
 ) -> Iterator[httpx.Response]:
-    """Stream one range, retrying once with a freshly signed URL after an auth failure."""
+    """Stream one range, retrying once with a freshly signed URL after an auth failure.
+
+    ``on_origin`` (optional) is called with ``(status, elapsed_ms)`` for every
+    real origin response, including redirects and statuses the guard rejects.
+    """
     headers = {"Accept-Encoding": "identity"}
     if byte_range is not None:
         headers["Range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
     for attempt in (0, 1):
-        with _Upstream(client, session.url, headers) as response:
+        with _Upstream(client, session.url, headers, on_origin) as response:
             if response.status_code not in (401, 403):
                 yield response
                 return

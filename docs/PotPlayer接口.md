@@ -15,6 +15,7 @@
 - `--serve`：在当前进程运行服务（供打包后的常驻组件使用）。
 - `--stop`：以记录的 token 请求 `/v1/shutdown`；实例不存在时视为已停止（`0`）。
 - `--login`：打开 Tkinter 扫码窗口，登录**插件自己的**凭证；不影响 `quark` CLI 的 Cookie。
+- `--player-pid`：扩展读取当前播放器 PID 的本地动作。启动器从自身父进程链定位真正拥有 `PotPlayer`/`PotPlayer64` 窗口的进程，在标准输出打印单行 JSON `{"player_pid": 整数}`（严格 JSON 整数，非字符串）；无法验证时为 `{"player_pid":0}`。该动作由启动器就地完成，**不启动桥接、不读取 Cookie、不访问网络**；协议版本保持 `1`，动作语义不变。扩展每次解析都调用一次，不缓存（多实例可能共享 INI）。
 
 单实例：插件目录下的文件锁；已有实例时 `--ensure-service` 直接复用而不启动第二个。运行信息（端口、token、pid）写入插件私有目录 `config_directory()/potplayer/runtime.json`，退出时仅当实例号匹配才清除。服务不注册 Windows 服务、不开机启动、不监听局域网。
 
@@ -94,13 +95,15 @@
 
 ### `POST /v1/play`
 
-请求体 `{"fid":"<视频 fid>"}`，返回：
+请求体 `{"fid":"<视频 fid>"}`，可选 `"player_pid":1234`（**严格 JSON 整数**，非字符串），返回：
 
 ```json
 {"url":"/v1/stream/<session>/<URL 编码文件名>","title":"第2集.mp4"}
 ```
 
 `url` 是本地相对地址，只含不可猜测的会话标识；**不含** Cookie、账号信息或夸克签名地址。目录 FID → `502`；`fid` 缺失/空 → `400`。
+
+带 `player_pid`（严格 JSON 整数，`1..4294967295`）时，服务把该播放器窗口进程与本次会话登记为绑定，用于按“PID + 完整逻辑 fid 地址”核对并恢复观看进度；扩展通过启动器本地动作 `--player-pid` 取得该整数，只有验证到拥有 PotPlayer 窗口的进程才发送，取不到时保持仅 `fid` 的旧请求体。省略或旧版调用仍然只在线播放、不绑定、不续播。响应结构不变；`player_pid` 不是该范围的整数（含字符串、布尔、浮点、`0`、负数）→ `400 bad_request`。
 
 ## 搜索、收藏与最近观看
 
@@ -142,7 +145,7 @@
 {"items":[{"fid":"...","name":"第2集.mp4","is_dir":false,"size":123,"played_at":1699999999}]}
 ```
 
-`played_at` 是本机 Unix 秒。条目只有位置信息，用于从该集开始同目录选集，不是秒级续播。
+`played_at` 是本机 Unix 秒。条目只有位置信息，用于从该集开始同目录选集。**该接口的返回结构保持不变**：续播位置（`position_ms`、`duration_ms`、`progress_at`）只写入本机 `library.json` 的版本 2 记录，不作为公共响应字段暴露。
 
 ### `POST /v1/recent/clear`
 
@@ -151,8 +154,8 @@
 ### 写入时机与数据边界
 
 - 最近记录在**首个非空媒体块成功转发之后**写入，不等整集传输结束：取链、`HEAD`、未转发任何媒体字节的失败 `GET` 不记录。已经开始传输后再关闭、拖动或遇到上游中断，已写入的记录仍保留；每个 HTTP 请求只记一次，不按分段或数据块重复写盘。
-- 收藏与最近观看存放在插件私有目录 `config_directory()/potplayer/library.json`（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。
-- 显式插件退出登录（`POST /v1/auth/logout`）会一并清空这两份列表；本地清理失败时返回 `500 local_io_error`，凭证仍已失效，不误报清理成功。登录过期只要求重新扫码，不清空。跨进程重启与升级保留。
+- 收藏与最近观看存放在插件私有目录 `config_directory()/potplayer/library.json`（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。文件版本 2 起，最近观看条目另含观看进度字段 `position_ms`、`duration_ms`、`progress_at`（本机时间）；版本 1 记录可正常读取，仅在下次写入该条目时才就地升级为版本 2，既有收藏/最近观看不受影响。
+- 显式插件退出登录（`POST /v1/auth/logout`）会一并清空这两份列表及其中的观看进度；本地清理失败时返回 `500 local_io_error`，凭证仍已失效，不误报清理成功。登录过期只要求重新扫码，不清空。跨进程重启与升级保留。
 
 ## 播放流
 
@@ -170,6 +173,68 @@
 - 未知/已失效会话 → `404`；`/v1/stream/` 缺会话 → `400`。
 - 客户端断开则关闭当前上游连接，并停止请求后续分段。
 - 每路播放使用独立传输会话，互不共享 Cookie jar；只向上游发送必要的 `__puus`，账号 Cookie 永不发往源站。
+
+## 播放进度与诊断
+
+### 播放进度（本机）
+
+- 播放期间组件按绑定核对当前播放器进度，并把位置写入 `library.json` 中该最近观看条目的版本 2 字段（`position_ms`、`duration_ms`、`progress_at`）。这些字段只存在于本机记录，**不**通过公共接口暴露（`/v1/recent` 的返回结构保持不变）。
+- 读取频率约每 2 秒一次，落盘约每 10 秒一次，并在暂停、切换集数与关闭时各写一次。保存位置不足 15 秒时不续播；剩余时长不足 `min(30 秒, 时长 2%)` 时不回跳（从 0 开始）；保存时的文件大小或时长与当前明显不符时不套用旧进度。
+- 首次读到播放器位置已超过约 5 秒（例如用户手动拖过）时，尊重播放器当前位置，组件**不**把它强行拉回保存点。
+- 绑定标识为播放器窗口进程 PID 与完整逻辑 fid 地址（`https://quark.invalid/{video,play}/<fid>`）；不使用文件名、窗口标题或下载字节比例推断归属。同一 fid 被多个实例同时打开时暂停该 fid 的进度写入，实例减少后恢复。
+- 续播依赖 Windows 原生进程读取能力；缺少该能力时组件仍可作为数据源正常播放，只是不记录/恢复进度。此限制只影响本机进度功能，不影响其它平台上的 CLI。
+
+### `GET /v1/diagnostics`
+
+需 Bearer（本地令牌）；**不需要**夸克登录，未登录/登录过期/冷却中均可访问。返回本机快照 `snapshot`：
+
+```json
+{
+  "account": {"credential_present": true, "validation": "saved_unverified", "last_success_at": null},
+  "transfer": {"totals": {"plays": 0, "active_plays": 0, "bytes": 0, "chunks": 0,
+                          "speed_bytes_per_second": 0, "origin_requests": 0,
+                          "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0}},
+               "plays": [{"name": "第2集.mp4", "bytes": 0, "chunks": 0, "seconds": 0,
+                          "speed_bytes_per_second": 0, "origin_requests": 0,
+                          "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
+                          "last_status": null, "last_elapsed_ms": null}]},
+  "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
+  "versions": {"release": "0.5.0", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
+  "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
+                "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
+}
+```
+
+- `account.validation` 取 `no_login` / `saved_unverified` / `recently_valid` / `expired`：前两者只表示“无凭证/凭证已保存但尚未验证”，`recently_valid` 只表示最近一次普通调用成功，不能证明账号当前未被限制；组件不会为此额外联网校验。
+- `transfer.totals`/`plays` 统计的是**实际转发的字节**，重复拖动同一区间会重复计入；`speed_bytes_per_second` 为最近 5 秒平均转发速率，`last_elapsed_ms` 为最近一次上游响应头耗时。均为被动统计，不发起探针、缓冲或码率估算。
+- `errors.events` 为固定（白名单）字段与固定中文 `message`，只保留最近 20 条，不含上游原文。`playback` 是本机绑定列表（含本机 `name`，仅本接口返回）；`protection` 反映与 CLI 共用的请求冷却，本地冷却状态不可读时 `available` 为 `false` 并给出固定 `instruction`。
+
+### `GET /v1/diagnostics/report`
+
+需 Bearer；返回一份严格白名单的 JSON 报告，**不写盘、不上传**（导出动作由状态窗口发起，见下）。顶层字段为：`schema_version`（`1`）、`generated_at`（真实墙钟 UTC ISO 时刻）、`release`、`protocol`、`python`、`os`、`account`、聚合后的 `transfer`、`cooldown`、`errors`。
+
+报告**不包含** Cookie、令牌、任何 URL/签名地址、FID、文件名、观看进度/历史或绝对主机路径。状态窗口的“导出诊断”把它按 UTF-8 JSON 另存到用户选择的路径，由用户决定是否对外提供。
+
+### `POST /v1/diagnostics/open`
+
+需 Bearer；异步打开独立的 Tk 状态窗口（标题“夸克网盘播放诊断”），返回 `202`。重复调用复用当前已打开的窗口；关闭该窗口不停止播放。窗口只访问本机回环服务，每秒 GET 一次 `/v1/diagnostics`。
+
+> 该接口的具体响应字段尚未最终固定，扩展只应依赖“HTTP `202` / 请求被接受”的能力语义，不应解析未约定的响应字段。
+
+### `POST /v1/playback/restart`
+
+需 Bearer；请求体 `{"player_pid":1234,"fid":"<视频 fid>"}`（`player_pid` 为**严格 JSON 整数** `1..4294967295`，`fid` 为字符串）。服务核对该 PID 当前确实绑定到同一 fid 的会话后，令播放器跳回 0 并把该 fid 的本机保存进度重置一次，**确认成功**才返回 `200 {"status":"restarted"}`（未确认的排队、超时或仅入队一律不算成功）。
+
+失败一律返回 `409 media_changed`（固定错误，绝不对任意 PID/文件生效）：
+
+- 该 PID 没有任何绑定，或绑定会话的 fid 与请求不符；
+- 会话当前未在传输、播放器不可达，或该 fid 的进度记录已暂停（同一 fid 被多实例打开）；
+- 本机进度写盘失败。
+
+使播放器跳回 0 但进度重置未完成同样按失败处理（`409`）。参数缺失或非法（`player_pid` 非上述范围的整数、`fid` 缺失/空）→ `400 bad_request`；方法不是 `POST` → `405 method_not_allowed`。失败时状态窗口显示固定中文提示（如“从头开始失败，请稍后重试”）。
+
+> 通用约定：本地令牌无效 → `401 unauthorized`；参数非法 → `400 bad_request`；方法不被支持 → `405 method_not_allowed`（与既有路由一致）。这些接口只要求本地 Bearer，不要求夸克登录，因此在未登录、登录过期或冷却中仍可用于查看状态与导出报告。
 
 ## 外挂字幕
 
@@ -236,7 +301,8 @@
 
 - 插件凭证：`config_directory()/potplayer/cookie`，由 `QRLogin` 单独保存；`quark` CLI 的 Cookie 从不读取、写入或删除。
 - 运行配置：同目录 `runtime.json`；单实例锁 `service.lock`。
-- 收藏与最近观看：同目录 `library.json`，只含 FID、名称、大小与本机时间；显式退出登录清空，过期不清、升级保留。
+- 收藏与最近观看：同目录 `library.json`，含 FID、名称、大小与本机时间，版本 2 起另含观看进度（`position_ms`/`duration_ms`/`progress_at`）；显式退出登录清空，过期不清、升级保留。
 - 视频不落盘：无分片、无磁盘缓存、无转码；仅内存转发请求的字节范围。
 - 内嵌字幕/音轨由播放器原生解码、显示与切换，本插件不替换、不自动选中外挂轨；同目录外挂字幕经原生“字幕搜索”手动选择，只从本桥接读取内存文本——桥接自身不写字幕或视频文件，播放器是否把所选字幕保存到磁盘由 PotPlayer 自身行为决定。
-- 不含分享转存、海报库、转码、多账号；不含断点/秒级续播。
+- 本地凭证与诊断数据保持私有：`/v1/diagnostics/report` 只在用户显式导出时才写文件，且经白名单裁剪，不含 Cookie/令牌/URL/FID/文件名/观看进度/绝对路径。
+- 不含分享转存、海报库、转码、多账号。观看进度依赖 Windows 原生读取能力；其它平台的 CLI 不受影响。

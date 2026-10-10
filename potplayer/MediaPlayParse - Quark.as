@@ -36,12 +36,45 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "1";
+	return "0.5.0";
 }
 
 string GetDesc()
 {
 	return "https://pan.quark.cn/";
+}
+
+// -- 本机播放器进程 ---------------------------------------------------------
+
+// 当前播放器（PotPlayer）的 PID；桥接用它把播放器与播放地址绑定以恢复进度。
+// 由随包启动器 quark-potplayer.exe 的新本地动作 --player-pid 提供：启动器从自身
+// 父进程链定位“真正拥有 PotPlayer 窗口”的进程并输出唯一 JSON 行；该动作不启动
+// 桥接、不读取 Cookie、不访问网络。取不到、输出不可解析或非正整数时返回 0，
+// PlayitemParse 据此省略字段，绝不猜测或回退到其他播放器。
+// 每次解析按需调用一次，不缓存（多实例可能共享 INI），也不在此处发起额外请求。
+int QuarkPlayerPid()
+{
+	string launcher = QuarkLauncher();
+
+	if (launcher.empty()) return 0;
+
+	string result = QuarkJsonObject(HostExecuteProgram(launcher, "--player-pid"));
+
+	if (result.empty()) return 0;
+
+	JsonReader reader;
+	JsonValue json;
+
+	if (!reader.parse(result, json) || !json.isObject()) return 0;
+
+	JsonValue pid = json["player_pid"];
+
+	if (!pid.isInt()) return 0;
+
+	int value = pid.asInt();
+
+	if (value <= 0) return 0;
+	return value;
 }
 
 // -- 本地服务 ---------------------------------------------------------------
@@ -414,7 +447,14 @@ string PlayitemParse(const string &in path, dictionary &MetaData, array<dictiona
 		return "";
 	}
 
-	string response = QuarkRequest("/v1/play", "{\"fid\":\"" + fid + "\"}");
+	// 附带当前播放器 PID，桥接据此把播放器与播放地址绑定以恢复进度；
+	// 取不到 PID（返回 0）时保持原来的仅 fid 请求体，不发送任何伪造字段。
+	string body = "{\"fid\":\"" + fid + "\"}";
+	int player_pid = QuarkPlayerPid();
+
+	if (player_pid > 0) body = "{\"fid\":\"" + fid + "\",\"player_pid\":" + formatInt(player_pid) + "}";
+
+	string response = QuarkRequest("/v1/play", body);
 	string message;
 
 	if (QuarkFailed(response, message))

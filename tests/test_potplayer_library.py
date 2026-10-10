@@ -137,6 +137,91 @@ class LibraryCase(unittest.TestCase):
         self.assertEqual({item["fid"] for item in library.favorites()}, {f"dir-{index}" for index in range(count)})
         self.assertEqual({item["fid"] for item in library.recent()}, {f"v{index}" for index in range(count)})
 
+    # -- progress (schema v2) --------------------------------------------
+
+    def test_v1_document_reads_without_rewrite_and_upgrades_on_next_write(self):
+        legacy = {
+            "version": 1,
+            "favorites": [{"fid": "dir-a", "name": "甲", "added_at": 7}],
+            "recent": [{"fid": "v1", "name": "a.mp4", "size": 5, "played_at": 9}],
+        }
+        write_json(self.path, legacy)
+        before = self.path.read_text(encoding="utf-8")
+        library = self.library()
+        self.assertEqual([item["fid"] for item in library.favorites()], ["dir-a"])
+        self.assertEqual([item["fid"] for item in library.recent()], ["v1"])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertEqual(library.progress("v1", 5), None)
+        library.add_favorite("dir-b", "乙")
+        stored = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["version"], 2)
+        self.assertEqual([entry["fid"] for entry in stored["favorites"]], ["dir-b", "dir-a"])
+        self.assertEqual([entry["fid"] for entry in stored["recent"]], ["v1"])
+        self.assertEqual(stored["recent"][0]["position_ms"], 0)
+        self.assertEqual(stored["recent"][0]["duration_ms"], 0)
+        self.assertEqual(stored["recent"][0]["progress_at"], 0)
+
+    def test_progress_round_trip_keeps_public_view_unchanged(self):
+        library = self.library()
+        library.record_recent("v1", "a.mp4", 5)
+        self.assertEqual(library.progress("v1", 5), None)
+        self.assertTrue(library.save_progress("v1", 5, 60_000, 1_800_000))
+        self.assertEqual(library.progress("v1", 5)["position_ms"], 60_000)
+        self.assertEqual(library.progress("v1", 5)["duration_ms"], 1_800_000)
+        self.assertEqual(set(library.recent()[0]), {"fid", "name", "is_dir", "size", "played_at"})
+        self.assertTrue(library.reset_progress("v1"))
+        self.assertIsNone(library.progress("v1", 5))
+        self.assertFalse(library.reset_progress("v-absent"))
+
+    def test_save_progress_never_creates_or_reorders(self):
+        library = self.library()
+        library.record_recent("v1", "a.mp4", 5)
+        library.record_recent("v2", "b.mp4", 6)
+        self.assertFalse(library.save_progress("v-absent", 1, 60_000, 90_000))
+        self.assertFalse(library.save_progress("v2", 7, 60_000, 90_000))
+        self.assertTrue(library.save_progress("v1", 5, 30_000, 90_000))
+        self.assertEqual([item["fid"] for item in library.recent()], ["v2", "v1"])
+        self.assertIsNone(library.progress("v2", 6))
+        self.assertEqual(library.progress("v1", 5)["position_ms"], 30_000)
+
+    def test_record_recent_preserves_progress_for_same_size_and_resets_on_change(self):
+        library = self.library()
+        library.record_recent("v1", "a.mp4", 5)
+        library.save_progress("v1", 5, 45_000, 90_000)
+        library.record_recent("v1", "a.mp4", 5)
+        self.assertEqual(library.progress("v1", 5)["position_ms"], 45_000)
+        library.record_recent("v1", "a.mp4", 6)
+        self.assertIsNone(library.progress("v1", 5))
+        self.assertIsNone(library.progress("v1", 6))
+
+    def test_clear_recent_and_clear_drop_progress(self):
+        library = self.library()
+        library.record_recent("v1", "a.mp4", 5)
+        library.save_progress("v1", 5, 45_000, 90_000)
+        library.clear_recent()
+        self.assertIsNone(library.progress("v1", 5))
+        library.record_recent("v1", "a.mp4", 5)
+        library.save_progress("v1", 5, 45_000, 90_000)
+        library.clear()
+        self.assertIsNone(library.progress("v1", 5))
+
+    def test_bad_progress_field_reports_clearly_and_keeps_the_file(self):
+        document = {
+            "version": 2,
+            "favorites": [],
+            "recent": [{
+                "fid": "v1", "name": "a.mp4", "size": 5, "played_at": 9,
+                "position_ms": -1, "duration_ms": 90_000, "progress_at": 0,
+            }],
+        }
+        write_json(self.path, document)
+        calls = (self.library().recent, lambda: self.library().progress("v1", 5))
+        for call in calls:
+            with self.subTest(call=call):
+                with self.assertRaises(LocalIOError):
+                    call()
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), document)
+
     # -- corruption ------------------------------------------------------
 
     def test_unreadable_document_reports_clearly_and_keeps_the_file(self):
@@ -167,7 +252,7 @@ class LibraryCase(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), document)
 
     def test_unknown_document_version_is_refused(self):
-        write_json(self.path, {"version": 2, "favorites": [], "recent": []})
+        write_json(self.path, {"version": 3, "favorites": [], "recent": []})
         with self.assertRaises(LocalIOError):
             self.library().favorites()
 

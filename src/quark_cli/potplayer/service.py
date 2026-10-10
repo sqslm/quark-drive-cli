@@ -40,8 +40,11 @@ from ..files import Files
 from ..paths import is_directory
 from ..request_guard import RequestGuard
 from . import SERVICE_VERSION
+from .diagnostics import Diagnostics
 from .library import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, page, playlist, require_fid, search
 from .library_state import Library
+from .native_player import NativePlayer
+from .playback import POLL_INTERVAL, PlaybackMonitor
 from .login_gui import QrLoginWindow
 from .naming import content_type
 from .plugin_state import (
@@ -76,6 +79,7 @@ MAX_PAGE_NUMBER = 1_000_000
 EXIT_OK = 0
 EXIT_ALREADY_RUNNING = 3
 EXIT_UNAVAILABLE = 5
+UINT32_MAX = 0xFFFFFFFF
 
 _CONTROL_ROUTES = frozenset({
     "/v1/auth", "/v1/auth/login", "/v1/auth/logout",
@@ -83,7 +87,75 @@ _CONTROL_ROUTES = frozenset({
     "/v1/search", "/v1/favorites", "/v1/favorites/remove",
     "/v1/recent", "/v1/recent/clear",
     "/v1/subtitles", "/v1/subtitle",
+    "/v1/diagnostics", "/v1/diagnostics/report", "/v1/diagnostics/open",
+    "/v1/playback/restart",
 })
+
+
+def _api_error_kind(exc: BaseException) -> str:
+    """Map a sanitized bridge exception to an allowlisted diagnostics kind."""
+    if isinstance(exc, AuthenticationError):
+        return "authentication_error"
+    if isinstance(exc, RateLimitError):
+        return "rate_limited"
+    if isinstance(exc, AccessRestrictedError):
+        return "access_restricted"
+    if isinstance(exc, NetworkError):
+        return "network_error"
+    if isinstance(exc, MediaChanged):
+        return "media_changed"
+    if isinstance(exc, RemoteError):
+        return "remote_error"
+    if isinstance(exc, UsageError):
+        return "usage_error"
+    if isinstance(exc, LocalIOError):
+        return "local_io_error"
+    return "internal_error"
+
+
+def _error_phase(kind: str) -> str:
+    """Fixed phase label for a failure kind; never derived from caller text."""
+    if kind in ("login_required", "authentication_error"):
+        return "credential"
+    if kind == "local_io_error":
+        return "local"
+    if kind == "bad_request":
+        return "request"
+    if kind in ("rate_limited", "access_restricted", "network_error", "remote_error", "media_changed"):
+        return "account"
+    return "unknown"
+
+
+def _parse_pid(value: Any, *, label: str) -> int:
+    """Validate one nonzero 32-bit player pid; booleans and floats are refused."""
+    if type(value) is not int or isinstance(value, bool) or not 1 <= value <= UINT32_MAX:
+        raise UsageError(f"{label} 必须是 1 到 {UINT32_MAX} 之间的整数")
+    return value
+
+
+class _ObservedClient(QuarkClient):
+    """Bridge-only observer: reports each ordinary API call's result, sends nothing extra.
+
+    The override wraps the single ``request`` funnel, so a successful management
+    call marks the account recently valid and an upstream authentication failure
+    marks it expired. Rate-limit/restriction errors carry no expiry signal, and a
+    missing local Cookie never reaches here (``Service.client`` raises first), so
+    it can never be mistaken for an upstream account failure.
+    """
+
+    def __init__(self, cookie: str, *, observer: Diagnostics, **kwargs: Any) -> None:
+        super().__init__(cookie, **kwargs)
+        self._observer = observer
+
+    def request(self, method: str, endpoint: str, **kwargs: Any) -> dict[str, Any]:
+        try:
+            payload = super().request(method, endpoint, **kwargs)
+        except QuarkError as exc:
+            self._observer.api_result(False, _api_error_kind(exc))
+            raise
+        self._observer.api_result(True)
+        return payload
+
 
 
 def _failure(kind: str, message: str) -> dict[str, Any]:
@@ -187,6 +259,10 @@ class Service:
         login_factory: Callable[[], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
         guard: RequestGuard | None = None,
+        native_factory: Callable[[], Any] | None = None,
+        status_launcher: Callable[[], Any] | None = None,
+        monitor_poll_interval: float = POLL_INTERVAL,
+        monitor_start: bool = True,
     ) -> None:
         self.instance = secrets.token_hex(8)
         self.token = secrets.token_urlsafe(32)
@@ -194,6 +270,16 @@ class Service:
         self.server: ThreadingHTTPServer | None = None
         self.sessions = Sessions(clock)
         self.library = Library()
+        self.diagnostics = Diagnostics()
+        # The native receiver is created lazily on the monitor's own worker, so
+        # no HTTP request thread ever touches it.
+        self.monitor = PlaybackMonitor(
+            self.library,
+            native_factory=native_factory if native_factory is not None else NativePlayer,
+            clock=clock,
+            poll_interval=monitor_poll_interval,
+            start=monitor_start,
+        )
         self._transport = transport
         self._cookie = cookie
         # One guard is shared by the bridge, its Quark client and the QR login it
@@ -208,6 +294,9 @@ class Service:
         self._login_lock = threading.Lock()
         self._login_thread: threading.Thread | None = None
         self._login_window: QrLoginWindow | None = None
+        self._status_launcher = status_launcher
+        self._status_process: Any = None
+        self._status_lock = threading.Lock()
         self.login_state = "idle"
         self.login_message: str | None = None
         self.qr_png: str | None = None
@@ -229,7 +318,12 @@ class Service:
             if self._client is None or self._client_cookie != cookie:
                 if self._client is not None:
                     self._client.close()
-                self._client = QuarkClient(cookie, transport=self._transport, guard=self._guard)
+                # A genuinely new credential: any previously observed validity
+                # (including a stale-cookie expiry) no longer applies.
+                self.diagnostics.credential_changed()
+                self._client = _ObservedClient(
+                    cookie, transport=self._transport, guard=self._guard, observer=self.diagnostics
+                )
                 self._client_cookie = cookie
             return self._client
 
@@ -249,7 +343,8 @@ class Service:
             client.close()
 
     def close(self) -> None:
-        """Stop the bridge: close a QR window still on screen, then drop the client."""
+        """Stop the bridge: flush/close the monitor, then the QR window and client."""
+        self.monitor.close()
         with self._login_lock:
             window, self._login_window = self._login_window, None
         if isinstance(window, QrLoginWindow):
@@ -341,15 +436,39 @@ class Service:
         """Clear only the bridge's own credential; the CLI Cookie stays untouched.
 
         An explicit logout also drops the favorites and recent lists; a merely
-        expired credential (``invalidate_credential``) keeps them.
+        expired credential (``invalidate_credential``) keeps them. Monitor
+        bindings are suppressed before the library is cleared, so a poll that was
+        already in flight cannot resurrect the progress logout just removed.
         """
         self.invalidate_credential()
+        self.monitor.clear()
         self.library.clear()
         with self._login_lock:
             self.login_state = "idle"
             self.login_message = None
             self.qr_png = None
+        self.diagnostics.credential_changed()
         return {"authenticated": False}
+
+    # -- diagnostics window ----------------------------------------------
+
+    def open_status_window(self) -> str:
+        """Reuse a live diagnostics window, else spawn one; never blocks on it.
+
+        The child is an independent GUI process (``--status-window``) that reads
+        the private runtime record itself; no token, URL or credential is placed
+        on its command line. Closing the window does not stop media or the bridge.
+        """
+        with self._status_lock:
+            process = self._status_process
+            if process is not None and process.poll() is None:
+                return "already_open"
+            launcher = self._status_launcher or _spawn_status_window
+            try:
+                self._status_process = launcher()
+            except OSError:
+                raise LocalIOError("无法打开播放状态与诊断窗口") from None
+            return "opened"
 
     # -- lifecycle -------------------------------------------------------
 
@@ -470,12 +589,54 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
             body = self._body(raw)
             fid = require_fid(body.get("fid"), label="fid")
+            # Validate the optional pid before any Quark request: a bad pid must
+            # never trigger an upstream call or a media session.
+            pid_value = body.get("player_pid")
+            player_pid = None if pid_value is None else _parse_pid(pid_value, label="player_pid")
             media = resolve(service.files(), service.client(), fid)
             session = service.sessions.create(media)
-            return self._json(200, {
-                "url": f"/v1/stream/{session.session}/{quote(session.name, safe='')}",
-                "title": session.name,
-            })
+            service.diagnostics.media_started(session.session, session.name)
+            relative = f"/v1/stream/{session.session}/{quote(session.name, safe='')}"
+            if player_pid is not None:
+                # Bind the native pid to the exact loopback address the player is
+                # handed. A storage/native failure here must never block playback.
+                try:
+                    service.monitor.bind(session, player_pid, f"http://{HOST}:{service.port}{relative}")
+                except QuarkError:
+                    pass
+            return self._json(200, {"url": relative, "title": session.name})
+        if route == "/v1/diagnostics":
+            if method not in ("GET", "HEAD"):
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
+            payload = service.diagnostics.snapshot(
+                credential_present=service.authenticated(), guard=service._guard
+            )
+            payload["playback"] = service.monitor.snapshot()
+            return self._json(200, payload)
+        if route == "/v1/diagnostics/report":
+            if method not in ("GET", "HEAD"):
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
+            return self._json(200, service.diagnostics.report(
+                credential_present=service.authenticated(), guard=service._guard
+            ))
+        if route == "/v1/diagnostics/open":
+            if method != "POST":
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
+            return self._json(202, {"status": service.open_status_window()})
+        if route == "/v1/playback/restart":
+            if method != "POST":
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
+            body = self._body(raw)
+            player_pid = _parse_pid(body.get("player_pid"), label="player_pid")
+            fid = require_fid(body.get("fid"), label="fid")
+            try:
+                restarted = service.monitor.restart(player_pid, fid)
+            except UsageError:
+                restarted = False
+            if not restarted:
+                # Explicit JSON conflict; this is never a credential failure.
+                return self._json(409, _failure("media_changed", "未找到可从头开始的播放绑定"))
+            return self._json(200, {"status": "restarted"})
         if route == "/v1/shutdown":
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
@@ -523,6 +684,7 @@ class _Handler(BaseHTTPRequestHandler):
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
             service.require_login()
+            service.monitor.clear()
             service.library.clear_recent()
             return self._json(200, {"items": []})
         if route == "/v1/subtitles":
@@ -572,6 +734,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _stream_body(self, session: PlaySession, byte_range: tuple[int, int] | None) -> None:
         service = self.service
+        diagnostics = service.diagnostics
 
         def refetch() -> None:
             media = resolve(service.files(), service.client(), session.fid)
@@ -579,6 +742,10 @@ class _Handler(BaseHTTPRequestHandler):
                 service.sessions.forget(session.session)
                 raise MediaChanged("文件大小或版本已变化，已中止播放")
             service.sessions.refresh(session.session, media)
+
+        def on_origin(status: int, elapsed_ms: int) -> None:
+            # One fixed, URL-free observation per real origin response/redirect.
+            diagnostics.origin_response(session.session, status, elapsed_ms)
 
         # The player keeps one GET open for the whole episode, so a half-watched
         # title still counts as played. Record the moment the first chunk leaves
@@ -591,6 +758,12 @@ class _Handler(BaseHTTPRequestHandler):
             if not recorded:
                 recorded = True
                 self._record_played(session)
+                service.monitor.stream_started(session.session)
+
+        def on_chunk(count: int) -> None:
+            # Counted only after a successful socket write; every chunk, including
+            # a repeated seek over the same range, counts again.
+            diagnostics.transferred(session.session, count)
 
         sent = False
         start, end = byte_range if byte_range is not None else (0, session.size - 1)
@@ -601,28 +774,34 @@ class _Handler(BaseHTTPRequestHandler):
                 position = start
                 while position <= end:
                     stop = min(position + MEDIA_SEGMENT - 1, end)
-                    with open_content(service.client(), session, (position, stop), refetch) as response:
+                    with open_content(
+                        service.client(), session, (position, stop), refetch, on_origin=on_origin
+                    ) as response:
                         _, length, _ = _upstream_plan(response, session, (position, stop))
                         self._pin_version(session, response)
                         if not sent:
                             self._stream_headers(session, byte_range, end - start + 1)
                             sent = True
-                        if not self._forward(response, length, on_started=record_once):
+                        if not self._forward(response, length, on_started=record_once, on_chunk=on_chunk):
                             return
                     position = stop + 1
                 return
-            with open_content(service.client(), session, byte_range, refetch) as response:
+            with open_content(
+                service.client(), session, byte_range, refetch, on_origin=on_origin
+            ) as response:
                 status, length, header = _upstream_plan(response, session, byte_range)
                 self._pin_version(session, response)
                 self._stream_headers(session, byte_range if status == 206 else None, length, status=status, header=header)
                 sent = True
-                self._forward(response, length, on_started=record_once)
+                self._forward(response, length, on_started=record_once, on_chunk=on_chunk)
         except (QuarkError, httpx.HTTPError) as exc:
             if sent:
-                # The body is already in flight; only an aborted connection is honest here.
+                # The body is already in flight; only an aborted connection is
+                # honest here, but the failure is still logged as a fixed event.
                 self.close_connection = True
+                self._record_failure(exc, phase="origin")
             else:
-                self._failure_response(exc)
+                self._failure_response(exc, phase="origin")
 
     def _record_played(self, session: PlaySession) -> None:
         """One disk write per started media response, never per chunk or segment.
@@ -633,6 +812,15 @@ class _Handler(BaseHTTPRequestHandler):
         reporting the stored document as broken.
         """
         self.service.library.record_recent(session.fid, session.name, session.size)
+
+    def _record_failure(self, exc: BaseException, *, phase: str | None = None) -> None:
+        """Log one fixed, sanitized failure event; never a raw exception or URL."""
+        status, kind = _status_for(exc)
+        if kind == "local_io_error":
+            phase = "local"
+        elif phase is None:
+            phase = _error_phase(kind)
+        self.service.diagnostics.error(phase, kind, status)
 
     def _pin_version(self, session: PlaySession, response: httpx.Response) -> None:
         """Bind the first strong ETag; any later different strong ETag aborts."""
@@ -668,11 +856,18 @@ class _Handler(BaseHTTPRequestHandler):
         length: int,
         *,
         on_started: Callable[[], None] | None = None,
+        on_chunk: Callable[[int], None] | None = None,
     ) -> bool:
         """Copy exactly ``length`` bytes; ``False`` means the body stopped short.
 
         ``on_started`` runs once, right after the first non-empty chunk is
         written to the socket, so callers can react before the body completes.
+        ``on_chunk`` runs after every successful socket write with the number of
+        bytes written, so callers can count real transfer.
+
+        A write to the client socket failing is a normal player disconnect (a
+        seek or close), so nothing is logged for it; a failed origin read or an
+        origin body that ends early is logged as one fixed event instead.
         """
         written = 0
         try:
@@ -686,17 +881,25 @@ class _Handler(BaseHTTPRequestHandler):
                     chunk = chunk[:remaining]
                 self.wfile.write(chunk)
                 written += len(chunk)
+                if on_chunk is not None:
+                    on_chunk(len(chunk))
                 if on_started is not None:
                     on_started()
                     on_started = None
                 if written >= length:
                     break
-        except (httpx.HTTPError, OSError):
+        except httpx.HTTPError:
+            self.close_connection = True
+            self.service.diagnostics.error("origin", "network_error")
+            return False
+        except OSError:
+            # The player closed the connection (seek/close): not a failure.
             self.close_connection = True
             return False
         if written < length:
             # The origin ended early; the announced Content-Length can no longer hold.
             self.close_connection = True
+            self.service.diagnostics.error("origin", "remote_error")
             return False
         return True
 
@@ -759,7 +962,7 @@ class _Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _failure_response(self, exc: BaseException) -> None:
+    def _failure_response(self, exc: BaseException, *, phase: str | None = None) -> None:
         status, kind = _status_for(exc)
         if kind == "login_required":
             # The account API (not the origin) rejected the Cookie: the plugin's
@@ -768,6 +971,8 @@ class _Handler(BaseHTTPRequestHandler):
             message = "插件未登录或登录已失效，请在播放器中重新扫码登录"
         else:
             message = str(exc) or "服务内部错误"
+        # One fixed, sanitized event per terminal failure; no raw exception text.
+        self._record_failure(exc, phase=phase)
         retry_after = getattr(exc, "retry_after", None)
         extra = None
         if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool) and retry_after > 0:
@@ -832,7 +1037,8 @@ def _healthy_runtime() -> dict[str, Any] | None:
     return entry
 
 
-def _spawn_service(executable: str) -> None:
+def _detached_options() -> dict[str, Any]:
+    """Spawn options for a background process with no visible console on Windows."""
     options: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
@@ -843,10 +1049,26 @@ def _spawn_service(executable: str) -> None:
         options["creationflags"] = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
     else:
         options["start_new_session"] = True
+    return options
+
+
+def _spawn_service(executable: str) -> None:
     try:
-        subprocess.Popen([executable, "-m", "quark_cli.potplayer", "--serve"], **options)
+        subprocess.Popen([executable, "-m", "quark_cli.potplayer", "--serve"], **_detached_options())
     except OSError:
         raise LocalIOError("无法启动夸克网盘本地服务进程") from None
+
+
+def _spawn_status_window() -> Any:
+    """Start the standalone GUI in its own process; it reads the private runtime itself.
+
+    No token, credential or URL is placed on the command line. The frozen entry
+    drops the ``-m quark_cli.potplayer`` selector, and ``--status-window`` only
+    opens the window: it never starts the service or a login.
+    """
+    return subprocess.Popen(
+        [sys.executable or "python", "-m", "quark_cli.potplayer", "--status-window"], **_detached_options()
+    )
 
 
 def ensure_service(

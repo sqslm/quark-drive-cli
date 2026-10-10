@@ -525,6 +525,9 @@ class LibraryEntryDesignTests(unittest.TestCase):
         self.assertRegex(body, r'keyword\["type"\]\s*=\s*"search"')
         self.assertRegex(body, r'favorites\["Category"\]\s*=\s*"favorites"')
         self.assertRegex(body, r'recent\["Category"\]\s*=\s*"recent"')
+        # 0.5.0 新增：本地诊断入口，纯本地功能，不需要夸克登录。
+        self.assertRegex(body, r'diagnostics\["Category"\]\s*=\s*"diagnostics"')
+        self.assertIn("播放状态与诊断", read_script(URL_LIST))
 
     def test_titles_keep_simplified_chinese_and_the_cp0_fallback(self):
         body = self.body("array<dictionary> GetCategorys()")
@@ -647,6 +650,76 @@ class LibraryEntryDesignTests(unittest.TestCase):
         self.assertIn('Category == "favorites"', body)
         self.assertIn('Category == "recent"', body)
         self.assertIn("QuarkDirectoryList(PathToken, page, true)", body)
+        # 诊断入口在登录检查之前处理：它是纯本地功能。
+        self.assertIn('Category == "diagnostics"', body)
+        self.assertLess(body.index('Category == "diagnostics"'), body.index("QuarkEnsureLogin()"))
+
+
+class DiagnosticsEntryDesignTests(unittest.TestCase):
+    """The 0.5.0 diagnostics entry: local-only, folder action row, no invented player APIs."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.url_raw = read_script(URL_LIST)
+        cls.play_raw = read_script(PLAY_PARSE)
+        cls.sub_raw = read_script(SUBTITLE_SEARCH)
+
+    def raw_body(self, raw, signature):
+        return body_raw(raw, signature)
+
+    def test_versions_report_0_5_0(self):
+        for raw in (self.url_raw, self.play_raw):
+            self.assertIn('return "0.5.0";', self.raw_body(raw, "string GetVersion()"))
+
+    def test_diagnostics_category_posts_a_json_body_and_returns_a_back_row(self):
+        page = self.raw_body(self.url_raw, "array<dictionary> QuarkDiagnosticsPage()")
+        self.assertIsNotNone(
+            re.search(r'"/v1/diagnostics/open"\s*,\s*"\{', page), "open must POST a JSON body"
+        )
+        self.assertIn("已打开播放状态与诊断窗口", page)
+        self.assertIn("QuarkActionResult", page)
+        # 结果是可导航的返回行，不是媒体地址。
+        self.assertNotIn('row["url"]', page)
+        self.assertNotIn("{$CP", page)
+
+    def test_player_pid_comes_from_the_launcher_local_action(self):
+        pid_body = self.raw_body(self.play_raw, "int QuarkPlayerPid()")
+        # PID 只能来自启动器的本地动作；不再加载 DLL、也不再猜进程。
+        self.assertIn("QuarkLauncher()", pid_body)
+        self.assertIn('HostExecuteProgram(launcher, "--player-pid")', pid_body)
+        self.assertIn("QuarkJsonObject", pid_body)
+        self.assertIn('json["player_pid"]', pid_body)
+        self.assertIn("pid.isInt()", pid_body)
+        self.assertIn("pid.asInt()", pid_body)
+        self.assertIn("value <= 0", pid_body)
+        self.assertNotIn("HostLoadLibrary", pid_body)
+        self.assertNotIn("HostGetProcAddress", pid_body)
+        self.assertNotIn("HostCallProcInt", pid_body)
+        # 未取得 PID 时返回 0，调用方据此省略字段。
+        self.assertIn("return 0", pid_body)
+
+    def test_no_script_loads_a_native_library(self):
+        # 实测 HostLoadLibrary 对任何 DLL 都返回 0，故全部脚本（含 SubtitleSearch）都不再使用它。
+        for path, raw in (
+            (URL_LIST, self.url_raw),
+            (PLAY_PARSE, self.play_raw),
+            (SUBTITLE_SEARCH, self.sub_raw),
+        ):
+            code, _ = strip_literals(raw)
+            self.assertNotIn("HostLoadLibrary", code, f"{path.name} must not load native libraries")
+
+    def test_play_body_keeps_fid_and_only_adds_a_positive_pid(self):
+        parse = self.raw_body(
+            self.play_raw,
+            "string PlayitemParse(const string &in path, dictionary &MetaData, array<dictionary> &QualityList)",
+        )
+        # 旧请求体字面量必须保留，缺 PID 时行为完全不变。
+        self.assertIsNotNone(re.search(r'"\{\\"fid\\":\\""\s*\+\s*fid\s*\+\s*"\\"\}"', parse))
+        self.assertIn("QuarkPlayerPid()", parse)
+        self.assertIn("player_pid > 0", parse)
+        self.assertIn(
+            '"{\\"fid\\":\\"" + fid + "\\",\\"player_pid\\":" + formatInt(player_pid) + "}"', parse
+        )
 
 
 class SubtitleSearchDesignTests(unittest.TestCase):
