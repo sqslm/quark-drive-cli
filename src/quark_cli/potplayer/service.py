@@ -58,6 +58,7 @@ from .stream import (
     open_content,
     resolve,
 )
+from .subtitles import UnknownSession, match_subtitles, read_subtitle
 
 HOST = "127.0.0.1"
 HEALTH_TIMEOUT = 2.0
@@ -77,6 +78,7 @@ _CONTROL_ROUTES = frozenset({
     "/v1/files", "/v1/playlist", "/v1/play", "/v1/shutdown",
     "/v1/search", "/v1/favorites", "/v1/favorites/remove",
     "/v1/recent", "/v1/recent/clear",
+    "/v1/subtitles", "/v1/subtitle",
 })
 
 
@@ -506,6 +508,24 @@ class _Handler(BaseHTTPRequestHandler):
             service.require_login()
             service.library.clear_recent()
             return self._json(200, {"items": []})
+        if route == "/v1/subtitles":
+            if method not in ("GET", "HEAD"):
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
+            service.require_login()
+            try:
+                payload = match_subtitles(
+                    service.files(), service.sessions,
+                    _first(query, "fid", None), _first(query, "session", None),
+                )
+            except UnknownSession:
+                return self._json(404, _failure("not_found", "播放会话不存在或已失效"))
+            return self._json(200, payload)
+        if route == "/v1/subtitle":
+            if method not in ("GET", "HEAD"):
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
+            service.require_login()
+            fid = require_fid(_first(query, "fid", None), label="fid")
+            return self._text(200, read_subtitle(service.files(), service.client(), fid))
         if route in _CONTROL_ROUTES:
             return self._json(405, _failure("method_not_allowed", "请求方法不受支持"))
         return self._json(404, _failure("not_found", "未知接口"))
@@ -708,6 +728,16 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         for name, value in (extra or {}).items():
             self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _text(self, status: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)

@@ -190,10 +190,11 @@ class DriveFixture:
             base["Content-Encoding"] = self.origin_encoding
         header = request.headers.get("range")
         if self.ignore_range or not header:
+            announced = len(body) if self.content_length_override is None else self.content_length_override
             return httpx.Response(
                 200,
                 stream=_ByteStream(body),
-                headers={"Content-Length": str(len(body)), **base},
+                headers={"Content-Length": str(announced), **base},
                 request=request,
             )
         first, _, last = header[6:].partition("-")

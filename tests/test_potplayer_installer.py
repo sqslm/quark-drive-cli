@@ -54,6 +54,7 @@ class RoutingTests(unittest.TestCase):
     def test_targets_follow_file_name_prefix(self) -> None:
         self.assertEqual(core.as_target_for("MediaUrlList - Quark网盘.as"), "Media/UrlList")
         self.assertEqual(core.as_target_for("MediaPlayParse - Quark网盘.as"), "Media/PlayParse")
+        self.assertEqual(core.as_target_for("SubtitleSearch - Quark网盘.as"), "Subtitle/Search")
 
     def test_unknown_prefix_is_rejected(self) -> None:
         with self.assertRaises(core.InstallError):

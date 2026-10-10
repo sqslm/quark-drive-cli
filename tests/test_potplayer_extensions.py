@@ -4,7 +4,7 @@ PotPlayer ships no standalone AngelScript toolchain, so these scripts cannot be
 compiled here.  The checks below therefore verify what a compiler and a real
 player would catch:
 
-* both scripts tokenise cleanly (terminated literals/comments, balanced
+* all three scripts tokenise cleanly (terminated literals/comments, balanced
   delimiters, and no call to a function the file does not define);
 * every ``Host*`` call exists in the ``api.txt`` that ships with the installed
   player, which is what stops invented native interfaces;
@@ -42,6 +42,7 @@ ROOT = Path(__file__).resolve().parents[1]
 AS_DIR = ROOT / "potplayer"
 URL_LIST = AS_DIR / "MediaUrlList - Quark.as"
 PLAY_PARSE = AS_DIR / "MediaPlayParse - Quark.as"
+SUBTITLE_SEARCH = AS_DIR / "SubtitleSearch - Quark.as"
 LAUNCHER = AS_DIR / "quark-potplayer.cmd"
 
 URL_LIST_EXPORTS = (
@@ -60,6 +61,18 @@ PLAY_PARSE_EXPORTS = (
     "bool PlaylistCheck(const string &in path)",
     "array<dictionary> PlaylistParse(const string &in path)",
 )
+# Mirrors the installed ``Extension/Subtitle/Search/SubtitleSearch - *.as`` exports.
+SUBTITLE_SEARCH_EXPORTS = (
+    "string GetTitle()",
+    "string GetVersion()",
+    "string GetDesc()",
+    "string GetLanguages()",
+    "array<dictionary> SubtitleSearch(string MovieFileName, dictionary MovieMetaData)",
+    "string SubtitleDownload(string id)",
+)
+
+#: A minimal ASS subtitle body the bridge must return verbatim (Unicode kept).
+SUBTITLE_BODY = "1\n00:00:01,000 --> 00:00:02,000\n你好，世界\n".encode("utf-8")
 
 #: Calls that exist in PotPlayer's AngelScript runtime but are not in api.txt.
 BUILTIN_CALLS = frozenset({"formatInt", "formatFloat", "parseInt", "parseFloat", "sizeof"})
@@ -219,6 +232,33 @@ def as_url_list_page(items, *, has_more, page, path_token, saved=False):
     return rows
 
 
+def as_subtitle_source(source: str) -> tuple[str, str]:
+    """Executable transcription of ``QuarkCurrentVideo``: ``(fid, session)``.
+
+    Both empty unless ``source`` is a Quark logical link or a loopback bridge
+    stream URL, so the script and this model cannot drift on what is recognised.
+    """
+    for prefix in ("https://quark.invalid/play/", "https://quark.invalid/video/"):
+        if source.startswith(prefix):
+            fid = source[len(prefix):]
+            unsafe = any(char in fid for char in '/\\"?#& \t')
+            return (fid, "") if fid and not unsafe else ("", "")
+    if not source.startswith("http://"):
+        return "", ""
+    rest = source[len("http://"):]
+    slash = rest.find("/")
+    if slash <= 0:
+        return "", ""
+    host, path = rest[:slash], rest[slash:]
+    hostname = host.split(":")[0] if not host.startswith("[") else host.split("]")[0] + "]"
+    if hostname not in ("127.0.0.1", "localhost", "[::1]") or not path.startswith("/v1/stream/"):
+        return "", ""
+    session = path[len("/v1/stream/"):].split("/")[0]
+    if not session or any(char in session for char in '/\\"?#& \t'):
+        return "", ""
+    return "", session
+
+
 class _StartedBridge:
     """A real Service serving an in-memory fixture on an ephemeral loopback port."""
 
@@ -260,7 +300,11 @@ class ScriptSyntaxTests(unittest.TestCase):
     """Tokenising and delimiter checks: the defects a compiler reports first."""
 
     def scripts(self):
-        return ((URL_LIST, read_script(URL_LIST)), (PLAY_PARSE, read_script(PLAY_PARSE)))
+        return (
+            (URL_LIST, read_script(URL_LIST)),
+            (PLAY_PARSE, read_script(PLAY_PARSE)),
+            (SUBTITLE_SEARCH, read_script(SUBTITLE_SEARCH)),
+        )
 
     def test_scripts_keep_the_bom_and_terminate_literals(self):
         for path, source in self.scripts():
@@ -310,10 +354,13 @@ class ScriptSyntaxTests(unittest.TestCase):
     def test_exports_keep_the_player_signatures(self):
         url_code, _ = strip_literals(read_script(URL_LIST))
         play_code, _ = strip_literals(read_script(PLAY_PARSE))
+        subtitle_code, _ = strip_literals(read_script(SUBTITLE_SEARCH))
         for signature in URL_LIST_EXPORTS:
             self.assertRegex(url_code, signature_pattern(signature))
         for signature in PLAY_PARSE_EXPORTS:
             self.assertRegex(play_code, signature_pattern(signature))
+        for signature in SUBTITLE_SEARCH_EXPORTS:
+            self.assertRegex(subtitle_code, signature_pattern(signature))
 
 
 class HostApiTests(unittest.TestCase):
@@ -329,7 +376,7 @@ class HostApiTests(unittest.TestCase):
         declared = self.declared_hosts()
         self.assertIn("HostUrlGetString", declared)
         self.assertIn("HostExecuteProgram", declared)
-        for path in (URL_LIST, PLAY_PARSE):
+        for path in (URL_LIST, PLAY_PARSE, SUBTITLE_SEARCH):
             code, _ = strip_literals(read_script(path))
             used = set(re.findall(r"\b(Host\w+)\s*\(", code))
             self.assertEqual(used - declared, set(), f"{path.name}: {sorted(used - declared)}")
@@ -602,6 +649,123 @@ class LibraryEntryDesignTests(unittest.TestCase):
         self.assertIn("QuarkDirectoryList(PathToken, page, true)", body)
 
 
+class SubtitleSearchDesignTests(unittest.TestCase):
+    """Subtitle search stays scoped to the current Quark video and writes nothing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.raw = read_script(SUBTITLE_SEARCH)
+
+    def body(self, signature):
+        return squash(body_raw(self.raw, signature))
+
+    def test_title_uses_the_simplified_chinese_selector(self):
+        body = self.body("string GetTitle()")
+        self.assertIn("{$CP936=", body)
+        self.assertIn("{$CP950=", body)
+        self.assertIn("{$CP0=", body)
+
+    def test_only_quark_links_and_loopback_streams_are_recognized(self):
+        body = self.body("bool QuarkCurrentVideo(string source, string &out fid, string &out session)")
+        self.assertIn("QUARK_PLAY_PREFIX", body)
+        self.assertIn("QUARK_VIDEO_PREFIX", body)
+        self.assertIn("QuarkStreamSession(source)", body)
+
+        stream = self.body("string QuarkStreamSession(const string &in source)")
+        self.assertIn('"127.0.0.1"', stream)
+        self.assertIn('"localhost"', stream)
+        self.assertIn('"/v1/stream/"', stream)
+        self.assertIn("QuarkValidId(session)", stream)
+
+        # 转写模型与脚本一致：普通本地/其它网络视频一律返回空。
+        for source in (
+            r"C:\Movies\第2集.mp4",
+            "D:/media/clip.mkv",
+            "https://example.com/movie.mkv",
+            "http://192.168.1.5:8080/v1/stream/abc/name.mp4",
+            "http://127.0.0.1:52311/other/abc",
+            "https://quark.invalid/folder/abc",
+            "",
+        ):
+            self.assertEqual(as_subtitle_source(source), ("", ""), source)
+        self.assertEqual(as_subtitle_source("https://quark.invalid/play/v9"), ("v9", ""))
+        self.assertEqual(as_subtitle_source("https://quark.invalid/video/v9"), ("v9", ""))
+        self.assertEqual(
+            as_subtitle_source("http://127.0.0.1:52311/v1/stream/sess123/%E7%AC%AC2%E9%9B%86.mp4"),
+            ("", "sess123"),
+        )
+        self.assertEqual(as_subtitle_source("http://localhost:1/v1/stream/abc/x"), ("", "abc"))
+
+    def test_rejects_unsafe_ids_before_using_them(self):
+        body = self.body("bool QuarkValidId(string value)")
+        self.assertIn("value.empty()", body)
+        self.assertIn('value.find("\\"") >= 0', body)
+        self.assertIn('value.find("\\\\") >= 0', body)
+        self.assertIn('value.find("/") >= 0', body)
+        self.assertIn('value.find("?") >= 0', body)
+
+    def test_search_requests_fid_or_the_current_session_only(self):
+        body = self.body("array<dictionary> SubtitleSearch(string MovieFileName, dictionary MovieMetaData)")
+        self.assertIn('"/v1/subtitles?fid=" + HostUrlEncode(fid)', body)
+        self.assertIn('"/v1/subtitles?session=" + HostUrlEncode(session)', body)
+        self.assertIn("HostGetPlayingFileName()", body)
+        self.assertIn("if (!QuarkCurrentVideo(source, fid, session)) return ret", body)
+        self.assertIn("QuarkEnsureLogin()", body)
+        # 普通本地/其它视频必须在触达组件或登录之前就返回空。
+        self.assertLess(
+            body.index("if (!QuarkCurrentVideo(source, fid, session)) return ret"),
+            body.index("QuarkEnsureLogin()"),
+        )
+
+    def test_rows_carry_the_subtitle_id_prefix_and_real_names(self):
+        body = body_raw(
+            self.raw, "array<dictionary> SubtitleSearch(string MovieFileName, dictionary MovieMetaData)"
+        )
+        self.assertIn('row["id"] = QUARK_SUBTITLE_ID_PREFIX + id.asString()', body)
+        self.assertIn('row["title"] = name.asString()', body)
+        # format/lang 只在存在时写入，未知语言保留为空（不猜标签）。
+        self.assertIn("if (format.isString() && !format.asString().empty()) row[\"format\"]", body)
+        self.assertIn("if (lang.isString() && !lang.asString().empty()) row[\"lang\"]", body)
+        langs = self.body("string GetLanguages()")
+        self.assertIn('return ""', langs)
+
+    def test_download_is_a_bearer_text_request_that_never_returns_error_json(self):
+        body = body_raw(self.raw, "string SubtitleDownload(string id)")
+        self.assertIn('id.find(QUARK_SUBTITLE_ID_PREFIX) != 0', body)
+        self.assertIn("QuarkValidId(fid)", body)
+        self.assertIn('"/v1/subtitle?fid=" + HostUrlEncode(fid)', body)
+        self.assertIn("QuarkHeader(token, false)", body)
+        self.assertIn("QuarkErrorType(text)", body)
+        self.assertIn("if (type.empty()) return text", body)
+        self.assertIn('if (type == "unauthorized")', body)
+        self.assertIn("QuarkClearService()", body)
+        # 令牌刷新只重试一次，绝不无限循环。
+        self.assertIn("attempt < 2", body)
+
+    def test_never_writes_subtitle_or_video_files(self):
+        code, _ = strip_literals(self.raw)
+        for name in ("HostFileCreate", "HostFileWrite", "HostFolderCreate", "HostFileOpen"):
+            self.assertNotIn(name, code)
+
+    def test_implements_no_upload_or_third_party_search(self):
+        code, _ = strip_literals(self.raw)
+        for name in (
+            "SubtitleUpload",
+            "GetUploadFormat",
+            "SubtitleWebSearch",
+            "ServerLogin",
+            "ServerCheck",
+        ):
+            self.assertNotIn(name, code)
+        for host in ("opensubtitles", "yifysubtitles", "yts.mx", "podnapisi", "napisy", "titlovi"):
+            self.assertNotIn(host, self.raw.lower())
+
+    def test_leaves_embedded_tracks_and_player_preferences_alone(self):
+        code, _ = strip_literals(self.raw)
+        for name in ("HostSetUrlHeaderHTTP", "HostSaveInteger", "HostMessageBox", "HostCheckMediaFile"):
+            self.assertNotIn(name, code)
+
+
 class FakeLogin:
     """Deterministic stand-in for the QR window: no Tk, no network."""
 
@@ -709,6 +873,62 @@ class BridgeContractTests(BridgeCase):
         missing = self.client.post("/v1/play", headers=self.headers, json={"fid": "nope"}).json()
         self.assertIsInstance(missing["error"]["type"], str)
         self.assertIsInstance(missing["error"]["message"], str)
+
+
+class SubtitleBridgeContractTests(BridgeCase):
+    """The subtitle script parses these exact payloads from the real bridge."""
+
+    records = [
+        record("sub-dir", "剧集", directory=True),
+        record("sub-video", "剧.S01E01.mkv", "sub-dir"),
+        record("sub-ass", "剧.S01E01.zh.ass", "sub-dir", size=len(SUBTITLE_BODY)),
+    ]
+
+    def setUp(self):
+        super().setUp()
+        self.fixture.bodies["sub-ass"] = SUBTITLE_BODY
+
+    def test_search_lists_candidates_with_the_fields_the_script_reads(self):
+        response = self.client.get("/v1/subtitles?fid=sub-video", headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["video_fid"], "sub-video")
+        self.assertIsInstance(payload["items"], list)
+        for item in payload["items"]:
+            self.assertIsInstance(item["fid"], str)
+            self.assertIsInstance(item["name"], str)
+            self.assertIn(item.get("format"), ("srt", "ass"))
+            self.assertIn(item.get("lang"), ("zh", "en", ""))
+        item = next(row for row in payload["items"] if row["fid"] == "sub-ass")
+        self.assertEqual(item["name"], "剧.S01E01.zh.ass")
+        self.assertEqual(item["format"], "ass")
+
+    def test_subtitle_text_is_returned_verbatim_as_utf8(self):
+        response = self.client.get("/v1/subtitle?fid=sub-ass", headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("text/plain", response.headers["content-type"])
+        self.assertIn("utf-8", response.headers["content-type"])
+        self.assertEqual(response.content, SUBTITLE_BODY)
+
+    def test_session_selection_and_errors_match_the_script_paths(self):
+        self.assertEqual(
+            self.client.get("/v1/subtitles", headers=self.headers).json()["error"]["type"], "bad_request"
+        )
+        self.assertEqual(
+            self.client.get("/v1/subtitles?fid=sub-video&session=x", headers=self.headers).json()["error"]["type"],
+            "bad_request",
+        )
+        self.assertEqual(
+            self.client.get("/v1/subtitles?session=missing", headers=self.headers).json()["error"]["type"],
+            "not_found",
+        )
+        self.assertEqual(
+            self.client.get("/v1/subtitles?fid=sub-video").json()["error"]["type"], "unauthorized"
+        )
+
+    def test_a_video_is_never_read_as_a_subtitle(self):
+        response = self.client.get("/v1/subtitle?fid=sub-video", headers=self.headers)
+        self.assertNotEqual(response.status_code, 200)
 
 
 class CancelLogin:

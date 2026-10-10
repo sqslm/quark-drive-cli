@@ -36,6 +36,7 @@
 <PotPlayer 目录>\Extension\quark-potplayer.path   记录上面的组件路径
 <PotPlayer 目录>\Extension\Media\UrlList\MediaUrlList - *.as
 <PotPlayer 目录>\Extension\Media\PlayParse\MediaPlayParse - *.as
+<PotPlayer 目录>\Extension\Subtitle\Search\SubtitleSearch - *.as
 %APPDATA%\Microsoft\Windows\Start Menu\Programs\夸克网盘 (PotPlayer).lnk   指向 PotPlayer 本身的快捷方式
 ```
 
@@ -90,7 +91,7 @@ QuarkPotPlayer-Setup.exe --uninstall --silent [--clear-credentials]
 
 ## 首版不包含
 
-分享转存、外挂字幕、影视海报库、转码、多账号；不实现视频落盘缓存。仅支持插件内置字幕/音轨。
+分享转存、影视海报库、转码、多账号；不实现视频落盘缓存。内嵌字幕/音轨保留原生解码与切换；同目录外挂字幕在原生“字幕搜索”里手动选择，插件自身不写字幕或视频文件。
 
 ## 开发者构建
 
