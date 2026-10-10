@@ -16,3 +16,6 @@ dist/
 /docs/plans/
 /docs/research/
 /docs/validation/
+/video/node_modules/
+/video/.remotion/
+/video/stills/

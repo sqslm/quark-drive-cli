@@ -1,5 +1,7 @@
 # quark-drive-cli
 
+Watch the [33-second project introduction video](video/quark-drive-intro.mp4) or edit its [Remotion source](video/README.md).
+
 `quark` is a Python 3.10+ command-line client for managing files in Quark Drive on Windows and Linux. It supports QR login and manual Cookie credentials; it does not read browser storage.
 
 The Quark web API is undocumented and may change. The commands below are implemented against the request shapes summarized in [Implementation notes](#implementation-notes). Offline tests cover the HTTP flows.
