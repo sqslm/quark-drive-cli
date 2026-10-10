@@ -9,6 +9,10 @@
 	  https://quark.invalid/folder/<fid>  目录（同目录自然排序播放列表）
 	  https://quark.invalid/play/<fid>    从该视频开始的同目录选集
 	  https://quark.invalid/video/<fid>   播放列表内的单集条目（不再展开）
+
+	入口分类：我的网盘、搜索（根页面在 Query 里输入关键词）、收藏目录、最近观看。
+	收藏/取消收藏/清空最近都是列表内的导航动作行，靠 PathToken 进入幂等动作页，
+	动作行不是媒体地址；目录收藏状态由桥接的本地收藏列表判断。
 */
 
 // string GetTitle() 																-> get title for UI
@@ -20,6 +24,11 @@
 string QUARK_VIDEO_PREFIX = "https://quark.invalid/video/";
 string QUARK_PLAY_PREFIX = "https://quark.invalid/play/";
 string QUARK_FOLDER_PREFIX = "https://quark.invalid/folder/";
+
+// 动作页 PathToken：动作行把它交给列表，动作页再按前缀执行一次幂等请求。
+string QUARK_ACTION_ADD = "quark-action-add-";
+string QUARK_ACTION_DEL = "quark-action-del-";
+string QUARK_ACTION_CLEAR_RECENT = "quark-action-clear-recent";
 
 // 扫码窗口由桥接组件打开；这里最多等待这段时间，扫码完成后直接显示目录。
 int QUARK_LOGIN_WAIT_MS = 60000;
@@ -390,55 +399,54 @@ bool QuarkIsVideo(string name)
 	return QUARK_VIDEO_EXTENSIONS.find("|" + ext.substr(1) + "|") >= 0;
 }
 
-array<dictionary> GetCategorys()
+// 收藏动作、清空动作的目录标识来自本脚本生成的 PathToken；含引号或路径分隔符时拒绝，
+// 避免拼进 JSON 请求体。
+bool QuarkValidFid(string fid)
 {
-	array<dictionary> ret;
-	dictionary item;
-
-	item["title"] = "{$CP936=我的网盘$}{$CP950=我的網盤$}{$CP0=My Drive$}";
-	item["Category"] = "drive";
-	ret.insertLast(item);
-	return ret;
+	if (fid.empty()) return false;
+	if (fid.find("\"") >= 0 || fid.find("\\") >= 0 || fid.find("/") >= 0) return false;
+	if (fid.find("?") >= 0 || fid.find("&") >= 0 || fid.find("#") >= 0) return false;
+	return true;
 }
 
-array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)
+// 当前目录是否已在收藏里：读本地收藏列表，判断不出来时按未收藏处理。
+bool QuarkIsFavorite(string fid)
 {
-	array<dictionary> ret;
-	string parent = PathToken;
-	string page = PageToken;
-	string message;
+	if (!QuarkValidFid(fid)) return false;
 
-	if (parent.empty()) parent = "0";
-	if (page.empty()) page = "1";
+	string response = QuarkRequest("/v1/favorites", "");
 
-	if (!QuarkEnsureLogin()) return QuarkStatus(QuarkLoginReason());
-
-	string response = QuarkRequest("/v1/files?parent=" + HostUrlEncode(parent) + "&page=" + HostUrlEncode(page), "");
-
-	if (QuarkFailed(response, message)) return QuarkStatus(message);
+	if (response.empty()) return false;
 
 	JsonReader reader;
 	JsonValue root;
 
-	if (!reader.parse(response, root) || !root.isObject()) return QuarkStatus("本地网盘组件返回了无法解析的目录");
-
-	if (!PathToken.empty() && page == "1")
-	{
-		dictionary up;
-
-		up["title"] = "..";
-		up["folder"] = "parent";
-		ret.insertLast(up);
-	}
+	if (!reader.parse(response, root) || !root.isObject()) return false;
 
 	JsonValue items = root["items"];
 
-	if (!items.isArray()) return ret;
+	if (!items.isArray()) return false;
 
-	JsonValue more = root["has_more"];
-	JsonValue page_value = root["page"];
-	bool has_more = more.isBool() && more.asBool();
-	int next_page = page_value.isInt() ? page_value.asInt() + 1 : 0;
+	int count = items.size();
+
+	for (int index = 0; index < count; index++)
+	{
+		JsonValue item = items[index];
+
+		if (!item.isObject()) continue;
+
+		JsonValue value = item["fid"];
+
+		if (value.isString() && value.asString() == fid) return true;
+	}
+	return false;
+}
+
+// 目录行：文件夹可点击进入，视频复用自然选集链接，其余文件跳过。
+void QuarkAppendItems(array<dictionary> &ret, JsonValue &items)
+{
+	if (!items.isArray()) return;
+
 	int count = items.size();
 
 	for (int index = 0; index < count; index++)
@@ -475,18 +483,284 @@ array<dictionary> GetUrlList(string Category, string Extra, string PathToken, st
 		}
 		ret.insertLast(row);
 	}
-	// 本页可能全是被过滤掉的非视频文件：只要后端还有后页就保留 PageToken，本页没有
-	// 任何可显示行时补一条不可播放的提示行承载它，否则后面含视频的页会整页丢失。
-	if (has_more && next_page > 0)
-	{
-		if (ret.size() == 0)
-		{
-			dictionary hint;
+}
 
-			hint["title"] = "加载下一页…";
-			ret.insertLast(hint);
-		}
-		ret[ret.size() - 1]["PageToken"] = formatInt(next_page);
+// 原生协议：PageToken 挂在最后一条行上。整页都被过滤掉时补一条提示行承载它，
+// 否则后面含视频的页会整页丢失。
+void QuarkAttachPageToken(array<dictionary> &ret, JsonValue &root)
+{
+	JsonValue more = root["has_more"];
+	JsonValue value = root["page"];
+
+	if (!more.isBool() || !more.asBool()) return;
+
+	int next_page = value.isInt() ? value.asInt() + 1 : 0;
+
+	if (next_page <= 0) return;
+
+	if (ret.size() == 0)
+	{
+		dictionary hint;
+
+		hint["title"] = "加载下一页…";
+		ret.insertLast(hint);
 	}
+	ret[ret.size() - 1]["PageToken"] = formatInt(next_page);
+}
+
+// 收藏/取消收藏入口行：导航行，不是媒体地址；标题按已有状态取反，指向幂等动作页。
+// 行标题不做 CP 选择展开——播放器只展开 GetTitle/GetCategorys 的元数据，
+// 行标题里的 {$CP936=…$} 会原样显示，所以这里用纯文本。
+void QuarkAppendFavoriteAction(array<dictionary> &ret, string fid, bool saved)
+{
+	dictionary row;
+
+	if (saved)
+	{
+		row["title"] = "取消收藏当前目录";
+		row["PathToken"] = QUARK_ACTION_DEL + fid;
+	}
+	else
+	{
+		row["title"] = "收藏当前目录";
+		row["PathToken"] = QUARK_ACTION_ADD + fid;
+	}
+	row["folder"] = "1";
+	ret.insertLast(row);
+}
+
+// 目录打不开（例如收藏已失效）时，只要本地收藏列表里还有这个目录，就保留取消入口。
+array<dictionary> QuarkDirectoryFailure(string PathToken, string page, string message)
+{
+	array<dictionary> ret;
+
+	if (!PathToken.empty() && page == "1" && QuarkIsFavorite(PathToken))
+	{
+		dictionary up;
+
+		up["title"] = "..";
+		up["folder"] = "parent";
+		ret.insertLast(up);
+
+		QuarkAppendFavoriteAction(ret, PathToken, true);
+	}
+
+	dictionary hint;
+
+	hint["title"] = message;
+	ret.insertLast(hint);
 	return ret;
+}
+
+// 动作结果页：只有标题、没有地址或目录标记的行会被播放器过滤掉，所以不再单独发一条
+// 结果提示行，而是把结果消息并入可导航的父级行标题，成功/失败与“返回”同时可见。
+array<dictionary> QuarkActionResult(string message)
+{
+	array<dictionary> ret;
+	dictionary back;
+
+	back["title"] = message + " · 返回";
+	back["folder"] = "parent";
+	ret.insertLast(back);
+	return ret;
+}
+
+// 浏览一个网盘目录：非根目录第一页插入“..”和收藏入口，收藏入口只出现一次。
+array<dictionary> QuarkDirectoryList(string PathToken, string page, bool favorite_action)
+{
+	array<dictionary> ret;
+	string parent = PathToken;
+
+	if (parent.empty()) parent = "0";
+	if (page.empty()) page = "1";
+
+	string response = QuarkRequest("/v1/files?parent=" + HostUrlEncode(parent) + "&page=" + HostUrlEncode(page), "");
+	string message;
+
+	if (QuarkFailed(response, message)) return QuarkDirectoryFailure(PathToken, page, message);
+
+	JsonReader reader;
+	JsonValue root;
+
+	if (!reader.parse(response, root) || !root.isObject())
+		return QuarkDirectoryFailure(PathToken, page, "本地网盘组件返回了无法解析的目录");
+
+	bool first = page == "1";
+
+	if (!PathToken.empty() && first)
+	{
+		dictionary up;
+
+		up["title"] = "..";
+		up["folder"] = "parent";
+		ret.insertLast(up);
+
+		if (favorite_action) QuarkAppendFavoriteAction(ret, PathToken, QuarkIsFavorite(PathToken));
+	}
+
+	JsonValue items = root["items"];
+
+	QuarkAppendItems(ret, items);
+	QuarkAttachPageToken(ret, root);
+	return ret;
+}
+
+// 收藏动作页：POST /v1/favorites 与 /v1/favorites/remove 都幂等，刷新重复执行无副作用。
+array<dictionary> QuarkFavoriteActionPage(bool add, string fid)
+{
+	if (!QuarkValidFid(fid)) return QuarkActionResult("收藏操作缺少目录标识");
+
+	string path = "/v1/favorites";
+
+	if (!add) path = "/v1/favorites/remove";
+
+	string response = QuarkRequest(path, "{\"fid\":\"" + fid + "\"}");
+	string message;
+
+	if (QuarkFailed(response, message)) return QuarkActionResult(message);
+
+	if (add) return QuarkActionResult("已收藏当前目录");
+	return QuarkActionResult("已取消收藏当前目录");
+}
+
+// 清空最近记录：送一个非空 JSON 请求体（服务端忽略内容），重复执行幂等。
+array<dictionary> QuarkRecentClearPage()
+{
+	string response = QuarkRequest("/v1/recent/clear", "{\"client\":\"potplayer\"}");
+	string message;
+
+	if (QuarkFailed(response, message)) return QuarkActionResult(message);
+	return QuarkActionResult("已清空最近观看");
+}
+
+// 搜索根页面用 Query 查全网盘；进入结果目录后按 FID 浏览，不再使用 Query。
+array<dictionary> QuarkSearchList(string Query, string PathToken, string page)
+{
+	if (!PathToken.empty()) return QuarkDirectoryList(PathToken, page, true);
+
+	if (Query.empty()) return QuarkStatus("请在上方输入搜索关键词后回车");
+
+	array<dictionary> ret;
+	string response = QuarkRequest("/v1/search?q=" + HostUrlEncode(Query) + "&page=" + HostUrlEncode(page), "");
+	string message;
+
+	if (QuarkFailed(response, message)) return QuarkStatus(message);
+
+	JsonReader reader;
+	JsonValue root;
+
+	if (!reader.parse(response, root) || !root.isObject()) return QuarkStatus("本地网盘组件返回了无法解析的搜索结果");
+
+	JsonValue items = root["items"];
+
+	QuarkAppendItems(ret, items);
+	QuarkAttachPageToken(ret, root);
+	return ret;
+}
+
+// 收藏目录：根页面列出收藏，进入后按普通目录浏览。
+array<dictionary> QuarkFavoritesList(string PathToken, string page)
+{
+	if (!PathToken.empty()) return QuarkDirectoryList(PathToken, page, true);
+
+	array<dictionary> ret;
+	string response = QuarkRequest("/v1/favorites", "");
+	string message;
+
+	if (QuarkFailed(response, message)) return QuarkStatus(message);
+
+	JsonReader reader;
+	JsonValue root;
+
+	if (!reader.parse(response, root) || !root.isObject()) return QuarkStatus("本地网盘组件返回了无法解析的收藏列表");
+
+	JsonValue items = root["items"];
+
+	if (!items.isArray() || items.size() == 0) return QuarkStatus("收藏列表为空：进入目录后选“收藏当前目录”即可添加");
+
+	QuarkAppendItems(ret, items);
+	return ret;
+}
+
+// 最近观看：条目直接复用稳定播放链接，从该集开始同目录选集；根页面提供清空入口。
+array<dictionary> QuarkRecentList()
+{
+	array<dictionary> ret;
+	string response = QuarkRequest("/v1/recent", "");
+	string message;
+
+	if (QuarkFailed(response, message)) return QuarkStatus(message);
+
+	JsonReader reader;
+	JsonValue root;
+
+	if (!reader.parse(response, root) || !root.isObject()) return QuarkStatus("本地网盘组件返回了无法解析的最近记录");
+
+	JsonValue items = root["items"];
+
+	if (!items.isArray() || items.size() == 0) return QuarkStatus("最近没有播放记录：打开一个视频后会出现在这里");
+
+	dictionary clear;
+
+	clear["title"] = "清空最近观看";
+	clear["PathToken"] = QUARK_ACTION_CLEAR_RECENT;
+	clear["folder"] = "1";
+	ret.insertLast(clear);
+
+	QuarkAppendItems(ret, items);
+	return ret;
+}
+
+array<dictionary> GetCategorys()
+{
+	array<dictionary> ret;
+	dictionary item;
+
+	item["title"] = "{$CP936=我的网盘$}{$CP950=我的網盤$}{$CP0=My Drive$}";
+	item["Category"] = "drive";
+	ret.insertLast(item);
+
+	dictionary keyword;
+
+	keyword["title"] = "{$CP936=搜索网盘$}{$CP950=搜尋網盤$}{$CP0=Search Drive$}";
+	keyword["Category"] = "search";
+	// type=search 让播放器在根页面给出关键词输入框（Query）。
+	keyword["type"] = "search";
+	ret.insertLast(keyword);
+
+	dictionary favorites;
+
+	favorites["title"] = "{$CP936=收藏目录$}{$CP950=收藏目錄$}{$CP0=Favorite Folders$}";
+	favorites["Category"] = "favorites";
+	ret.insertLast(favorites);
+
+	dictionary recent;
+
+	recent["title"] = "{$CP936=最近观看$}{$CP950=最近觀看$}{$CP0=Recent Videos$}";
+	recent["Category"] = "recent";
+	ret.insertLast(recent);
+	return ret;
+}
+
+array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)
+{
+	string page = PageToken;
+
+	if (page.empty()) page = "1";
+
+	if (!QuarkEnsureLogin()) return QuarkStatus(QuarkLoginReason());
+
+	// 动作页由列表里的动作行携带 PathToken 进入，刷新时重复执行同样的幂等请求。
+	if (PathToken.find(QUARK_ACTION_ADD) == 0)
+		return QuarkFavoriteActionPage(true, PathToken.substr(QUARK_ACTION_ADD.length()));
+
+	if (PathToken.find(QUARK_ACTION_DEL) == 0)
+		return QuarkFavoriteActionPage(false, PathToken.substr(QUARK_ACTION_DEL.length()));
+
+	if (PathToken == QUARK_ACTION_CLEAR_RECENT) return QuarkRecentClearPage();
+
+	if (Category == "search") return QuarkSearchList(Query, PathToken, page);
+	if (Category == "favorites") return QuarkFavoritesList(PathToken, page);
+	if (Category == "recent") return QuarkRecentList();
+	return QuarkDirectoryList(PathToken, page, true);
 }

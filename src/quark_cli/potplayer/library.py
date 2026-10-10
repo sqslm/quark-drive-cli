@@ -65,6 +65,37 @@ def page(files: Files, parent: str, page_number: int, size: int) -> dict[str, An
     return {"items": items, "page": page_number, "has_more": has_more}
 
 
+def search(files: Files, query: str, page_number: int, size: int) -> dict[str, Any]:
+    """Return one remote-wide name search page reduced to directories and videos.
+
+    The server matches any file type. ``has_more`` follows the remote total rather
+    than the filtered items, so hiding a poster or a text file cannot skip a page.
+    """
+    payload = files.client.get(
+        "file/search",
+        params={
+            "q": query,
+            "_page": page_number,
+            "_size": size,
+            "_fetch_total": 1,
+            "_sort": "file_type:asc,file_name:asc",
+        },
+    )
+    data = payload.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+        raise RemoteError("搜索响应缺少 data.list")
+    if any(not isinstance(item, dict) for item in data["list"]):
+        raise RemoteError("搜索响应包含无效记录")
+    matched = [_record(item) for item in data["list"]]
+    items = [item for item in matched if item["is_dir"] or is_video(item["name"])]
+    total = _total(payload)
+    if total is None:
+        has_more = len(matched) >= size
+    else:
+        has_more = (page_number - 1) * size + len(matched) < total
+    return {"items": items, "page": page_number, "has_more": has_more}
+
+
 def playlist(files: Files, parent: str | None, start: str | None) -> tuple[str, list[dict[str, Any]]]:
     """Return same-directory videos in natural order; ``start`` trims to its tail.
 

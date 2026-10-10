@@ -139,6 +139,16 @@ class DriveFixture:
                 )
             children = [row for row in self.records if row.get("pdir_fid") == parent]
             return self._data(request, {"list": children[(page - 1) * size: page * size], "_total": len(children)})
+        if path.endswith("/file/search"):
+            keyword = request.url.params.get("q", "")
+            page, size = int(request.url.params["_page"]), int(request.url.params["_size"])
+            matched = [row for row in self.records if keyword in str(row.get("file_name", ""))]
+            # The real endpoint sorts by file_type:asc,file_name:asc: directories first.
+            matched.sort(key=lambda row: (row.get("file_type", 1), str(row.get("file_name", ""))))
+            return self._data(request, {
+                "list": matched[(page - 1) * size: page * size],
+                "_total": len(matched),
+            })
         if path.endswith("/file/info"):
             return self._data(request, self._find(request.url.params["fid"]) or {})
         if path.endswith("/file/download"):

@@ -28,6 +28,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 
@@ -178,8 +179,15 @@ def body_raw(source: str, signature: str) -> str:
     return source[start + 1:end]
 
 
-def as_url_list_page(items, *, has_more, page, path_token):
-    """Executable transcription of ``GetUrlList``'s row building and PageToken tail.
+def favorite_action_row(fid, saved):
+    """Transcription of ``QuarkAppendFavoriteAction``: a navigation row, never a media url."""
+    if saved:
+        return {"title": "取消收藏当前目录", "PathToken": "quark-action-del-" + fid, "folder": "1"}
+    return {"title": "收藏当前目录", "PathToken": "quark-action-add-" + fid, "folder": "1"}
+
+
+def as_url_list_page(items, *, has_more, page, path_token, saved=False):
+    """Executable transcription of ``QuarkDirectoryList``'s row building and PageToken tail.
 
     PotPlayer ships no standalone AngelScript toolchain, so the script cannot run
     here; this mirrors ``MediaUrlList - Quark.as`` one branch at a time and
@@ -189,6 +197,7 @@ def as_url_list_page(items, *, has_more, page, path_token):
     rows = []
     if path_token and page == 1:
         rows.append({"title": "..", "folder": "parent"})
+        rows.append(favorite_action_row(path_token, saved))
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -357,13 +366,17 @@ class PlaybackDesignTests(unittest.TestCase):
         self.assertIn("QUARK_PLAY_PREFIX", body)
 
     def test_directory_rows_navigate_and_episodes_start_a_playlist(self):
-        body = body_raw(self.url_raw, "array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)")
-        self.assertRegex(body, r'row\["url"\]\s*=\s*QUARK_FOLDER_PREFIX')
-        self.assertRegex(body, r'row\["folder"\]\s*=\s*"1"')
-        self.assertRegex(body, r'row\["PathToken"\]\s*=\s*fid\.asString\(\)')
-        self.assertRegex(body, r'row\["url"\]\s*=\s*QUARK_PLAY_PREFIX')
-        self.assertIn("PageToken", body)
-        self.assertRegex(body, r'up\["folder"\]\s*=\s*"parent"')
+        rows = body_raw(self.url_raw, "void QuarkAppendItems(array<dictionary> &ret, JsonValue &items)")
+        self.assertRegex(rows, r'row\["url"\]\s*=\s*QUARK_FOLDER_PREFIX')
+        self.assertRegex(rows, r'row\["folder"\]\s*=\s*"1"')
+        self.assertRegex(rows, r'row\["PathToken"\]\s*=\s*fid\.asString\(\)')
+        self.assertRegex(rows, r'row\["url"\]\s*=\s*QUARK_PLAY_PREFIX')
+
+        listing = body_raw(
+            self.url_raw, "array<dictionary> QuarkDirectoryList(string PathToken, string page, bool favorite_action)"
+        )
+        self.assertRegex(listing, r'up\["folder"\]\s*=\s*"parent"')
+        self.assertIn("QuarkAttachPageToken", listing)
 
     def test_play_request_body_is_a_json_object_with_a_fid(self):
         match = re.search(r'"\{\\"fid\\":\\""\s*\+\s*fid\s*\+\s*"\\"\}"', self.play_raw)
@@ -428,12 +441,7 @@ class PlaybackDesignTests(unittest.TestCase):
         self.assertIn("--ensure-service", text)
 
     def test_url_list_keeps_paging_when_a_page_filters_to_nothing(self):
-        body = squash(
-            body_raw(
-                self.url_raw,
-                "array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)",
-            )
-        )
+        body = squash(body_raw(self.url_raw, "void QuarkAttachPageToken(array<dictionary> &ret, JsonValue &root)"))
         # 原生协议：PageToken 挂在最后一条行上，且不再要求本页有可显示行。
         self.assertRegex(body, r'ret\[ret\.size\(\) - 1\]\["PageToken"\]\s*=\s*formatInt\(next_page\)')
         self.assertNotIn("next_page > 0 && ret.size() > 0", body)
@@ -450,6 +458,148 @@ class PlaybackDesignTests(unittest.TestCase):
             self.assertIn("QuarkLoginState", raw)
         state = squash(body_raw(self.url_raw, "string QuarkLoginState()"))
         self.assertIn('root["login_state"]', state)
+
+
+class LibraryEntryDesignTests(unittest.TestCase):
+    """Search, favorites and recent entries: native rows, no invented player features."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.url_raw = read_script(URL_LIST)
+
+    def body(self, signature):
+        return squash(body_raw(self.url_raw, signature))
+
+    def test_categories_keep_drive_and_add_search_favorites_recent(self):
+        body = self.body("array<dictionary> GetCategorys()")
+        self.assertRegex(body, r'item\["Category"\]\s*=\s*"drive"')
+        self.assertRegex(body, r'keyword\["Category"\]\s*=\s*"search"')
+        # type=search 是播放器给出关键词输入框（Query）的原生标记。
+        self.assertRegex(body, r'keyword\["type"\]\s*=\s*"search"')
+        self.assertRegex(body, r'favorites\["Category"\]\s*=\s*"favorites"')
+        self.assertRegex(body, r'recent\["Category"\]\s*=\s*"recent"')
+
+    def test_titles_keep_simplified_chinese_and_the_cp0_fallback(self):
+        body = self.body("array<dictionary> GetCategorys()")
+        for selector in ("{$CP936=", "{$CP950=", "{$CP0="):
+            self.assertIn(selector, body)
+
+    def test_search_root_searches_the_whole_drive_and_encodes_the_query(self):
+        body = self.body("array<dictionary> QuarkSearchList(string Query, string PathToken, string page)")
+        self.assertIn('"/v1/search?q=" + HostUrlEncode(Query)', body)
+        self.assertIn("Query.empty()", body)
+        self.assertIn("请在上方输入搜索关键词", body)
+        # 进入结果目录后按 FID 浏览，不再使用 Query。
+        self.assertRegex(body, r"if \(!PathToken\.empty\(\)\) return QuarkDirectoryList\(")
+
+    def test_favorite_action_rows_navigate_and_are_never_media_urls(self):
+        body = self.body("void QuarkAppendFavoriteAction(array<dictionary> &ret, string fid, bool saved)")
+        self.assertIn('row["folder"] = "1"', body)
+        self.assertIn("QUARK_ACTION_ADD + fid", body)
+        self.assertIn("QUARK_ACTION_DEL + fid", body)
+        self.assertNotIn('row["url"]', body)
+        # 同一记号永远执行同一个动作：不是 toggle。
+        self.assertNotIn("saved = !", body)
+
+    def test_favorite_action_posts_to_the_documented_routes_only(self):
+        body = body_raw(self.url_raw, "array<dictionary> QuarkFavoriteActionPage(bool add, string fid)")
+        self.assertIn('"/v1/favorites/remove"', body)
+        self.assertIn('"/v1/favorites"', body)
+        self.assertIn("QuarkValidFid", body)
+        self.assertIsNotNone(
+            re.search(r'"\{\\"fid\\":\\""\s*\+\s*fid\s*\+\s*"\\"\}"', body),
+            'favorite bodies must be built as {"fid":"<fid>"}',
+        )
+        self.assertIn("已收藏当前目录", body)
+        self.assertIn("已取消收藏当前目录", body)
+
+    def test_favorite_entry_is_only_on_the_first_page_of_a_real_folder(self):
+        body = self.body(
+            "array<dictionary> QuarkDirectoryList(string PathToken, string page, bool favorite_action)"
+        )
+        self.assertIn('bool first = page == "1"', body)
+        self.assertRegex(body, r"if \(!PathToken\.empty\(\) && first\)")
+        self.assertIn("QuarkIsFavorite(PathToken)", body)
+        # 收藏状态取自本地收藏列表，而不是远端目录数据。
+        status = self.body("bool QuarkIsFavorite(string fid)")
+        self.assertIn('QuarkRequest("/v1/favorites", "")', status)
+        self.assertIn('item["fid"]', status)
+
+    def test_a_broken_favorite_still_offers_removal(self):
+        listing = self.body(
+            "array<dictionary> QuarkDirectoryList(string PathToken, string page, bool favorite_action)"
+        )
+        # 请求失败与响应损坏两条路径都走兜底页。
+        self.assertEqual(listing.count("QuarkDirectoryFailure(PathToken, page"), 2)
+        failure = self.body("array<dictionary> QuarkDirectoryFailure(string PathToken, string page, string message)")
+        self.assertIn("QuarkIsFavorite(PathToken)", failure)
+        self.assertIn("QuarkAppendFavoriteAction(ret, PathToken, true)", failure)
+        self.assertRegex(failure, r'up\["folder"\]\s*=\s*"parent"')
+
+    def test_favorites_list_reads_local_items_and_hints_when_empty(self):
+        body = self.body("array<dictionary> QuarkFavoritesList(string PathToken, string page)")
+        self.assertIn('QuarkRequest("/v1/favorites", "")', body)
+        self.assertIn("items.size() == 0", body)
+        self.assertIn("收藏列表为空", body)
+        # 收藏项是目录：复用普通目录浏览与收藏入口。
+        self.assertRegex(body, r"if \(!PathToken\.empty\(\)\) return QuarkDirectoryList\(")
+
+    def test_recent_list_reuses_stable_play_links_and_clears_idempotently(self):
+        body = self.body("array<dictionary> QuarkRecentList()")
+        self.assertIn('QuarkRequest("/v1/recent", "")', body)
+        self.assertIn("QUARK_ACTION_CLEAR_RECENT", body)
+        self.assertIn("最近没有播放记录", body)
+        # 条目走共享行构造：视频复用 QUARK_PLAY_PREFIX，从该集开始同目录选集。
+        rows = self.body("void QuarkAppendItems(array<dictionary> &ret, JsonValue &items)")
+        self.assertIn('row["url"] = QUARK_PLAY_PREFIX + fid.asString()', rows)
+
+        clear = body_raw(self.url_raw, "array<dictionary> QuarkRecentClearPage()")
+        self.assertIsNotNone(re.search(r'"/v1/recent/clear"\s*,\s*"\{', clear), "clear must POST a JSON body")
+        self.assertIn("client", clear)
+        self.assertIn("已清空最近观看", clear)
+
+    def test_action_pages_are_explicit_and_go_back(self):
+        body = self.body("array<dictionary> QuarkActionResult(string message)")
+        self.assertRegex(body, r'back\["folder"\]\s*=\s*"parent"')
+        self.assertNotIn('back["url"]', body)
+        # 播放器只展开 GetTitle/GetCategorys 的元数据；行标题里的 {$CP936=…$}
+        # 会原样显示，所以结果行必须用纯文本。
+        self.assertNotIn("{$CP", body)
+        self.assertIn("返回", body)
+        # 只有标题的行会被播放器过滤：结果必须并入可导航的父级行，不再单独发提示行。
+        self.assertNotRegex(body, r'done\["title"\]')
+        self.assertEqual(body.count("ret.insertLast"), 1)
+        self.assertRegex(body, r'back\["title"\]\s*=\s*message\s*\+')
+
+    def test_row_titles_are_plain_text_and_match_the_row_model(self):
+        # 行标题不做 CP 选择展开（只有 GetTitle/GetCategorys 元数据会被播放器展开），
+        # 否则用户会看到整段 {$CP936=…$} 模板。
+        for signature in (
+            "void QuarkAppendFavoriteAction(array<dictionary> &ret, string fid, bool saved)",
+            "array<dictionary> QuarkActionResult(string message)",
+            "array<dictionary> QuarkFavoriteActionPage(bool add, string fid)",
+            "array<dictionary> QuarkRecentClearPage()",
+            "array<dictionary> QuarkRecentList()",
+        ):
+            self.assertNotIn("{$CP", self.body(signature), signature)
+        # 纯文本标题与 FavoriteRowModelTests 的转写保持一字不差。
+        action = self.body("void QuarkAppendFavoriteAction(array<dictionary> &ret, string fid, bool saved)")
+        self.assertIn('row["title"] = "收藏当前目录"', action)
+        self.assertIn('row["title"] = "取消收藏当前目录"', action)
+        self.assertIn('clear["title"] = "清空最近观看"', self.body("array<dictionary> QuarkRecentList()"))
+        self.assertIn("已清空最近观看", self.body("array<dictionary> QuarkRecentClearPage()"))
+
+    def test_get_url_list_dispatches_without_a_generic_router(self):
+        body = self.body(
+            "array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)"
+        )
+        self.assertIn("QUARK_ACTION_ADD", body)
+        self.assertIn("QUARK_ACTION_DEL", body)
+        self.assertIn("QUARK_ACTION_CLEAR_RECENT", body)
+        self.assertIn('Category == "search"', body)
+        self.assertIn('Category == "favorites"', body)
+        self.assertIn('Category == "recent"', body)
+        self.assertIn("QuarkDirectoryList(PathToken, page, true)", body)
 
 
 class FakeLogin:
@@ -645,9 +795,10 @@ class FilteredPageBridgeTests(BridgeCase):
         rows = as_url_list_page(
             first["items"], has_more=first["has_more"], page=first["page"], path_token="paged"
         )
-        # 该页内容行全被过滤掉，只剩“..”导航行；PageToken 落在最后一行上。
-        self.assertEqual([row["title"] for row in rows], [".."])
+        # 该页内容行全被过滤掉，只剩“..”与收藏入口两条导航行；PageToken 落在最后一行上。
+        self.assertEqual([row["title"] for row in rows], ["..", "收藏当前目录"])
         self.assertEqual([row for row in rows if "url" in row], [])
+        self.assertEqual(rows[1]["PathToken"], "quark-action-add-paged")
         self.assertEqual(rows[-1]["PageToken"], "2")
 
         token = rows[-1]["PageToken"]
@@ -670,6 +821,154 @@ class FilteredPageBridgeTests(BridgeCase):
         )
         self.assertEqual([row["title"] for row in rows], ["加载下一页…"])
         self.assertEqual(rows[-1]["PageToken"], "2")
+
+
+class FavoriteRowModelTests(unittest.TestCase):
+    """The transcription and the script must agree on the favorites entry row."""
+
+    def test_action_tokens_are_shared_with_the_script(self):
+        source = read_script(URL_LIST)
+        for constant in (
+            'string QUARK_ACTION_ADD = "quark-action-add-";',
+            'string QUARK_ACTION_DEL = "quark-action-del-";',
+            'string QUARK_ACTION_CLEAR_RECENT = "quark-action-clear-recent";',
+        ):
+            self.assertIn(constant, source)
+        self.assertTrue(favorite_action_row("d1", False)["PathToken"].startswith("quark-action-add-"))
+        self.assertTrue(favorite_action_row("d1", True)["PathToken"].startswith("quark-action-del-"))
+
+    def test_saved_folder_offers_removal_and_an_url_never_leaks_in(self):
+        added = favorite_action_row("d1", False)
+        self.assertEqual(added, {"title": "收藏当前目录", "PathToken": "quark-action-add-d1", "folder": "1"})
+        removed = favorite_action_row("d1", True)
+        self.assertEqual(
+            removed, {"title": "取消收藏当前目录", "PathToken": "quark-action-del-d1", "folder": "1"}
+        )
+
+    def test_directory_model_keeps_content_rows_after_the_navigation_rows(self):
+        items = [
+            {"fid": "sub", "name": "子目录", "is_dir": True, "size": 0},
+            {"fid": "v1", "name": "第1集.mp4", "is_dir": False, "size": 4},
+        ]
+        rows = as_url_list_page(items, has_more=False, page=1, path_token="d1", saved=True)
+        self.assertEqual([row["title"] for row in rows], ["..", "取消收藏当前目录", "子目录", "第1集.mp4"])
+        self.assertEqual(rows[2]["url"], "https://quark.invalid/folder/sub")
+        self.assertEqual(rows[3]["url"], "https://quark.invalid/play/v1")
+
+    def test_second_page_carries_no_navigation_rows(self):
+        rows = as_url_list_page([], has_more=True, page=2, path_token="d1")
+        self.assertEqual([row["title"] for row in rows], ["加载下一页…"])
+        self.assertEqual(rows[-1]["PageToken"], "3")
+
+
+class LibraryRouteShapeTests(BridgeCase):
+    """The new routes' payloads the search/favorites/recent entries parse.
+
+    The routes belong to the bridge task; if a route is absent the bridge answers
+    ``404 not_found`` and the test skips instead of reporting a false failure.
+    Anything else (wrong status, wrong shape) still fails.
+    """
+
+    records = (
+        record("fav-dir", "收藏剧集", directory=True),
+        record("fav-vid", "第1集.mp4", "fav-dir"),
+    )
+
+    def required(self, response, path):
+        if response.status_code == 404:
+            error = response.json().get("error", {})
+            if error.get("type") == "not_found":
+                self.skipTest(f"bridge has no {path} route yet (parallel bridge task pending)")
+        return response
+
+    def get_json(self, path):
+        return self.required(self.client.get(path, headers=self.headers), path).json()
+
+    def post_json(self, path, payload):
+        headers = dict(self.headers, Connection="close", **{"Content-Type": "application/json"})
+        response = self.client.post(path, headers=headers, json=payload)
+        return self.required(response, path).json()
+
+    def test_search_returns_items_with_chinese_and_paging_fields(self):
+        payload = self.get_json("/v1/search?q=" + quote("集") + "&page=1")
+        self.assertIsInstance(payload["page"], int)
+        self.assertIsInstance(payload["has_more"], bool)
+        self.assertIsInstance(payload["items"], list)
+        for item in payload["items"]:
+            for key, kind in (("fid", str), ("name", str), ("is_dir", bool), ("size", int)):
+                self.assertIsInstance(item[key], kind, item)
+        found = {item["name"]: item["is_dir"] for item in payload["items"]}
+        # 目录与视频都在搜索结果里，脚本据此分别给出目录行与选集链接。
+        self.assertIs(found["收藏剧集"], True)
+        self.assertIs(found["第1集.mp4"], False)
+
+    def test_favorites_add_lists_and_deduplicates(self):
+        first = self.post_json("/v1/favorites", {"fid": "fav-dir"})
+        self.assertEqual([item["fid"] for item in first["items"]], ["fav-dir"])
+        again = self.post_json("/v1/favorites", {"fid": "fav-dir"})
+        self.assertEqual([item["fid"] for item in again["items"]], ["fav-dir"])
+        listed = self.get_json("/v1/favorites")
+        self.assertEqual([item["fid"] for item in listed["items"]], ["fav-dir"])
+        for item in listed["items"]:
+            self.assertIs(item["is_dir"], True)
+            self.assertIsInstance(item["name"], str)
+
+    def test_favorites_remove_is_idempotent(self):
+        self.post_json("/v1/favorites", {"fid": "fav-dir"})
+        self.assertEqual(self.post_json("/v1/favorites/remove", {"fid": "fav-dir"})["items"], [])
+        self.assertEqual(self.post_json("/v1/favorites/remove", {"fid": "fav-dir"})["items"], [])
+        self.assertEqual(self.get_json("/v1/favorites")["items"], [])
+
+    def test_a_stale_favorite_can_still_be_removed(self):
+        """A folder that no longer exists remotely must not block its own removal."""
+        payload = self.post_json("/v1/favorites/remove", {"fid": "deleted-elsewhere"})
+        self.assertEqual(payload["items"], [])
+        self.assertEqual(self.post_json("/v1/favorites/remove", {"fid": "deleted-elsewhere"})["items"], [])
+
+    def test_a_broken_favorite_stays_listed_and_removable(self):
+        """The script's cancel fallback: a stale entry lists, its folder fails, removal works."""
+        self.post_json("/v1/favorites", {"fid": "fav-dir"})
+        self.bridge.fixture.records = [
+            entry
+            for entry in self.bridge.fixture.records
+            if entry["fid"] != "fav-dir" and entry.get("pdir_fid") != "fav-dir"
+        ]
+        self.assertEqual([item["fid"] for item in self.get_json("/v1/favorites")["items"]], ["fav-dir"])
+        page = self.client.get("/v1/files?parent=fav-dir&page=1", headers=self.headers)
+        self.assertEqual(page.status_code, 502, page.text)
+        self.assertEqual(self.post_json("/v1/favorites/remove", {"fid": "fav-dir"})["items"], [])
+
+    def test_favorites_reject_a_file(self):
+        headers = dict(self.headers, Connection="close", **{"Content-Type": "application/json"})
+        response = self.client.post("/v1/favorites", headers=headers, json={"fid": "fav-vid"})
+        self.required(response, "/v1/favorites")
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["error"]["type"], "bad_request")
+
+    def test_a_successful_media_read_records_one_recent_entry(self):
+        play = self.post_json("/v1/play", {"fid": "fav-vid"})
+        streamed = self.client.get(self.base + play["url"])
+        self.assertEqual(streamed.status_code, 200)
+        payload = self.get_json("/v1/recent")
+        self.assertEqual([item["fid"] for item in payload["items"]], ["fav-vid"])
+        entry = payload["items"][0]
+        self.assertIsInstance(entry["name"], str)
+        self.assertIsInstance(entry["size"], int)
+        self.assertIs(entry["is_dir"], False)
+        self.assertIsInstance(entry["played_at"], int)
+
+    def test_recent_head_does_not_record(self):
+        play = self.post_json("/v1/play", {"fid": "fav-vid"})
+        self.assertEqual(self.client.head(self.base + play["url"]).status_code, 200)
+        self.assertEqual(self.get_json("/v1/recent")["items"], [])
+
+    def test_recent_clear_is_idempotent(self):
+        play = self.post_json("/v1/play", {"fid": "fav-vid"})
+        self.assertEqual(self.client.get(self.base + play["url"]).status_code, 200)
+        for _ in range(2):
+            cleared = self.post_json("/v1/recent/clear", {"client": "potplayer"})
+            self.assertNotIn("error", cleared)
+        self.assertEqual(self.get_json("/v1/recent")["items"], [])
 
 
 if __name__ == "__main__":

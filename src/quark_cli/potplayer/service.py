@@ -34,8 +34,10 @@ from ..errors import (
     UsageError,
 )
 from ..files import Files
+from ..paths import is_directory
 from . import SERVICE_VERSION
-from .library import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, page, playlist, require_fid
+from .library import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, page, playlist, require_fid, search
+from .library_state import Library
 from .login_gui import QrLoginWindow
 from .naming import content_type
 from .plugin_state import (
@@ -73,6 +75,8 @@ EXIT_UNAVAILABLE = 5
 _CONTROL_ROUTES = frozenset({
     "/v1/auth", "/v1/auth/login", "/v1/auth/logout",
     "/v1/files", "/v1/playlist", "/v1/play", "/v1/shutdown",
+    "/v1/search", "/v1/favorites", "/v1/favorites/remove",
+    "/v1/recent", "/v1/recent/clear",
 })
 
 
@@ -176,6 +180,7 @@ class Service:
         self.port = 0
         self.server: ThreadingHTTPServer | None = None
         self.sessions = Sessions(clock)
+        self.library = Library()
         self._transport = transport
         self._cookie = cookie
         self._login_factory = login_factory or (
@@ -214,6 +219,11 @@ class Service:
 
     def files(self) -> Files:
         return Files(self.client())
+
+    def require_login(self) -> None:
+        """Reject a control call whose data belongs to a signed-in plugin."""
+        if not self.authenticated():
+            raise AuthenticationError("插件尚未登录夸克网盘，请先扫码登录")
 
     def drop_client(self) -> None:
         with self._client_lock:
@@ -309,8 +319,13 @@ class Service:
             pass
 
     def logout(self) -> dict[str, Any]:
-        """Clear only the bridge's own credential; the CLI Cookie stays untouched."""
+        """Clear only the bridge's own credential; the CLI Cookie stays untouched.
+
+        An explicit logout also drops the favorites and recent lists; a merely
+        expired credential (``invalidate_credential``) keeps them.
+        """
         self.invalidate_credential()
+        self.library.clear()
         with self._login_lock:
             self.login_state = "idle"
             self.login_message = None
@@ -449,6 +464,48 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             service.stop()
             return
+        if route == "/v1/search":
+            if method not in ("GET", "HEAD"):
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
+            service.require_login()
+            keyword = _first(query, "q", None)
+            if keyword is None or not keyword.strip():
+                raise UsageError("q 不能为空")
+            number = _int_param(query, "page", 1, 1, MAX_PAGE_NUMBER)
+            size = _int_param(query, "size", DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE)
+            return self._json(200, search(service.files(), keyword.strip(), number, size))
+        if route == "/v1/favorites":
+            if method in ("GET", "HEAD"):
+                service.require_login()
+                return self._json(200, {"items": service.library.favorites()})
+            if method != "POST":
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 GET 或 POST"))
+            service.require_login()
+            fid = require_fid(self._body(raw).get("fid"), label="fid")
+            info = service.files().info(fid)
+            if not is_directory(info):
+                raise UsageError("fid 不是网盘目录")
+            name = info.get("file_name")
+            if not isinstance(name, str) or not name:
+                raise RemoteError("目录详情缺少有效名称")
+            return self._json(200, {"items": service.library.add_favorite(fid, name)})
+        if route == "/v1/favorites/remove":
+            if method != "POST":
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
+            service.require_login()
+            fid = require_fid(self._body(raw).get("fid"), label="fid")
+            return self._json(200, {"items": service.library.remove_favorite(fid)})
+        if route == "/v1/recent":
+            if method not in ("GET", "HEAD"):
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
+            service.require_login()
+            return self._json(200, {"items": service.library.recent()})
+        if route == "/v1/recent/clear":
+            if method != "POST":
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
+            service.require_login()
+            service.library.clear_recent()
+            return self._json(200, {"items": []})
         if route in _CONTROL_ROUTES:
             return self._json(405, _failure("method_not_allowed", "请求方法不受支持"))
         return self._json(404, _failure("not_found", "未知接口"))
@@ -486,6 +543,18 @@ class _Handler(BaseHTTPRequestHandler):
                 raise MediaChanged("文件大小或版本已变化，已中止播放")
             service.sessions.refresh(session.session, media)
 
+        # The player keeps one GET open for the whole episode, so a half-watched
+        # title still counts as played. Record the moment the first chunk leaves
+        # the socket; one flag shared by every segment keeps it to one write, and
+        # a later disconnect or truncation never erases the entry.
+        recorded = False
+
+        def record_once() -> None:
+            nonlocal recorded
+            if not recorded:
+                recorded = True
+                self._record_played(session)
+
         sent = False
         start, end = byte_range if byte_range is not None else (0, session.size - 1)
         try:
@@ -501,7 +570,7 @@ class _Handler(BaseHTTPRequestHandler):
                         if not sent:
                             self._stream_headers(session, byte_range, end - start + 1)
                             sent = True
-                        if not self._forward(response, length):
+                        if not self._forward(response, length, on_started=record_once):
                             return
                     position = stop + 1
                 return
@@ -510,13 +579,23 @@ class _Handler(BaseHTTPRequestHandler):
                 self._pin_version(session, response)
                 self._stream_headers(session, byte_range if status == 206 else None, length, status=status, header=header)
                 sent = True
-                self._forward(response, length)
+                self._forward(response, length, on_started=record_once)
         except (QuarkError, httpx.HTTPError) as exc:
             if sent:
                 # The body is already in flight; only an aborted connection is honest here.
                 self.close_connection = True
             else:
                 self._failure_response(exc)
+
+    def _record_played(self, session: PlaySession) -> None:
+        """One disk write per started media response, never per chunk or segment.
+
+        A corrupt library raises ``LocalIOError`` here; it is left to propagate
+        so the original ``QuarkError`` path aborts the stream instead of the
+        library being silently reset, and ``/v1/recent``/``/v1/favorites`` keep
+        reporting the stored document as broken.
+        """
+        self.service.library.record_recent(session.fid, session.name, session.size)
 
     def _pin_version(self, session: PlaySession, response: httpx.Response) -> None:
         """Bind the first strong ETag; any later different strong ETag aborts."""
@@ -546,8 +625,18 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
-    def _forward(self, response: httpx.Response, length: int) -> bool:
-        """Copy exactly ``length`` bytes; ``False`` means the body stopped short."""
+    def _forward(
+        self,
+        response: httpx.Response,
+        length: int,
+        *,
+        on_started: Callable[[], None] | None = None,
+    ) -> bool:
+        """Copy exactly ``length`` bytes; ``False`` means the body stopped short.
+
+        ``on_started`` runs once, right after the first non-empty chunk is
+        written to the socket, so callers can react before the body completes.
+        """
         written = 0
         try:
             for chunk in response.iter_raw(CHUNK_SIZE):
@@ -560,6 +649,9 @@ class _Handler(BaseHTTPRequestHandler):
                     chunk = chunk[:remaining]
                 self.wfile.write(chunk)
                 written += len(chunk)
+                if on_started is not None:
+                    on_started()
+                    on_started = None
                 if written >= length:
                     break
         except (httpx.HTTPError, OSError):

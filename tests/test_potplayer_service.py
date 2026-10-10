@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 
@@ -17,6 +18,7 @@ from quark_cli.errors import AuthenticationError
 from quark_cli.potplayer import plugin_state
 from quark_cli.potplayer.service import Service
 from quark_cli.potplayer.stream import Media, Sessions
+from quark_cli.state import write_json
 
 from potplayer_fixture import (
     COOKIE,
@@ -678,6 +680,382 @@ class SegmentCase(_ServerCase):
             else:
                 current, stable = latest, 0
         return current
+
+
+class SearchCase(_ServerCase):
+    """Remote-wide name search reduced to directories and videos."""
+
+    def service_kwargs(self) -> dict:
+        return {"transport": self.fixture.transport(), "cookie": COOKIE}
+
+    def search_request(self) -> httpx.Request:
+        return next(
+            request for request in self.fixture.requests if request.url.path.endswith("/file/search")
+        )
+
+    def test_search_sends_the_verified_parameters_and_keeps_dirs_and_videos(self):
+        payload = self.api("GET", "/v1/search?q=%E7%AC%AC").json()
+        self.assertEqual(payload["page"], 1)
+        self.assertFalse(payload["has_more"])
+        self.assertEqual(
+            [item["name"] for item in payload["items"]],
+            ["第10集.mp4", "第2集.mp4", "第9集.mkv"],
+        )
+        request = self.search_request()
+        self.assertEqual(request.url.params["q"], "第")
+        self.assertEqual(request.url.params["_page"], "1")
+        self.assertEqual(request.url.params["_size"], "50")
+        self.assertEqual(request.url.params["_fetch_total"], "1")
+        self.assertEqual(request.url.params["_sort"], "file_type:asc,file_name:asc")
+        names = {name.lower() for name in request.url.params.keys()}
+        self.assertNotIn("highlight", names)
+        self.assertNotIn("_highlight", names)
+
+    def test_search_hides_other_file_types_but_keeps_the_remote_total(self):
+        self.fixture.records.append(record("s-dir", "课程目录", directory=True))
+        self.fixture.records.append(record("s-video", "课程01.mp4"))
+        self.fixture.records.append(record("s-notes", "课程说明.txt", size=8))
+        payload = self.api("GET", "/v1/search?q=课程").json()
+        self.assertEqual([item["name"] for item in payload["items"]], ["课程目录", "课程01.mp4"])
+        self.assertEqual([item["is_dir"] for item in payload["items"]], [True, False])
+        self.assertFalse(payload["has_more"])
+
+    def test_search_pages_on_the_remote_total(self):
+        for index in range(60):
+            self.fixture.records.append(record(f"p{index:03d}", f"批量{index:03d}.mp4"))
+        first = self.api("GET", "/v1/search?q=批量&size=50").json()
+        self.assertEqual(len(first["items"]), 50)
+        self.assertTrue(first["has_more"])
+        second = self.api("GET", "/v1/search?q=批量&size=50&page=2").json()
+        self.assertEqual(second["page"], 2)
+        self.assertEqual(len(second["items"]), 10)
+        self.assertFalse(second["has_more"])
+
+    def test_search_validates_the_query_and_paging(self):
+        self.assertEqual(self.api("GET", "/v1/search").status_code, 400)
+        self.assertEqual(self.api("GET", "/v1/search?q=%20").status_code, 400)
+        self.assertEqual(self.api("GET", "/v1/search?q=a&page=0").status_code, 400)
+        self.assertEqual(self.api("GET", "/v1/search?q=a&size=101").status_code, 400)
+        self.assertEqual(self.api("POST", "/v1/search?q=a").status_code, 405)
+
+    def test_search_rejects_an_invalid_remote_record(self):
+        self.fixture.records.append(record("bad/fid", "坏记录.mp4"))
+        response = self.api("GET", "/v1/search?q=坏")
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["type"], "remote_error")
+
+
+class FavoritesCase(_ServerCase):
+    """Favorite directories: local JSON only, never a remote write."""
+
+    def service_kwargs(self) -> dict:
+        return {"transport": self.fixture.transport(), "cookie": COOKIE}
+
+    def test_add_verifies_a_real_directory_and_returns_the_collection(self):
+        response = self.api("POST", "/v1/favorites", body={"fid": "root-dir"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"items": [{"fid": "root-dir", "name": "剧集", "is_dir": True, "size": 0}]},
+        )
+        self.assertEqual(self.api("GET", "/v1/favorites").json(), response.json())
+
+    def test_add_is_idempotent_and_rejects_non_directories(self):
+        self.api("POST", "/v1/favorites", body={"fid": "root-dir"})
+        again = self.api("POST", "/v1/favorites", body={"fid": "root-dir"})
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(len(again.json()["items"]), 1)
+        self.assertEqual(self.api("POST", "/v1/favorites", body={"fid": "v2"}).status_code, 400)
+        self.assertEqual(self.api("POST", "/v1/favorites", body={"fid": "0"}).status_code, 400)
+        self.assertEqual(self.api("POST", "/v1/favorites", body={}).status_code, 400)
+        self.assertEqual(self.api("POST", "/v1/favorites", content=b"[]").status_code, 400)
+        self.assertEqual(self.api("POST", "/v1/favorites", body={"fid": "missing"}).status_code, 502)
+
+    def test_favorites_are_listed_newest_first(self):
+        self.api("POST", "/v1/favorites", body={"fid": "root-dir"})
+        self.fixture.records.append(record("second-dir", "第二目录", directory=True))
+        self.api("POST", "/v1/favorites", body={"fid": "second-dir"})
+        payload = self.api("GET", "/v1/favorites").json()
+        self.assertEqual([item["fid"] for item in payload["items"]], ["second-dir", "root-dir"])
+
+    def test_remove_is_idempotent_and_needs_no_remote_directory(self):
+        self.api("POST", "/v1/favorites", body={"fid": "root-dir"})
+        self.fixture.records = [row for row in self.fixture.records if row["fid"] != "root-dir"]
+        removed = self.api("POST", "/v1/favorites/remove", body={"fid": "root-dir"})
+        self.assertEqual(removed.status_code, 200)
+        self.assertEqual(removed.json(), {"items": []})
+        self.assertEqual(
+            self.api("POST", "/v1/favorites/remove", body={"fid": "root-dir"}).json(),
+            {"items": []},
+        )
+        self.assertEqual(
+            self.api("POST", "/v1/favorites/remove", body={"fid": "never"}).json(),
+            {"items": []},
+        )
+        self.assertEqual(self.api("POST", "/v1/favorites/remove", body={}).status_code, 400)
+
+    def test_favorites_never_write_to_the_remote(self):
+        self.api("POST", "/v1/favorites", body={"fid": "root-dir"})
+        self.api("POST", "/v1/favorites/remove", body={"fid": "root-dir"})
+        self.assertEqual([request.method for request in self.fixture.requests if request.method != "GET"], [])
+
+    def test_corrupt_library_reports_a_local_error_and_keeps_the_file(self):
+        path = self.service.library.path
+        write_json(path, {"version": 1, "favorites": [], "recent": []})
+        path.write_text("{broken", encoding="utf-8")
+        response = self.api("GET", "/v1/favorites")
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["type"], "local_io_error")
+        self.assertEqual(self.api("GET", "/v1/recent").status_code, 500)
+        self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
+
+    def test_explicit_logout_clears_favorites_and_recent(self):
+        cli_cookie = auth.credential_path()
+        auth.save_cookie("cli=1; __puus=cli", cli_cookie)
+        self.api("POST", "/v1/favorites", body={"fid": "root-dir"})
+        self.stream(self.play("v2")["url"])
+        # The bridge records the play right after the first chunk leaves the
+        # socket, so the disk write can land just after the client has finished
+        # reading the body. Wait (bounded) for that persistence to become
+        # observable, otherwise logout wipes a record the bridge never stored.
+        deadline = time.monotonic() + 2.0
+        while not self.service.library.recent() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(self.service.library.recent()), 1)
+
+        self.assertEqual(self.api("POST", "/v1/auth/logout").json(), {"authenticated": False})
+        self.assertEqual(self.service.library.favorites(), [])
+        self.assertEqual(self.service.library.recent(), [])
+        self.assertFalse(self.service.library.path.exists())
+        self.assertTrue(cli_cookie.exists())
+
+    def test_logout_reports_a_clear_failure_and_keeps_the_records(self):
+        plugin_state.store_cookie(COOKIE)
+        self.api("POST", "/v1/favorites", body={"fid": "root-dir"})
+        library_path = self.service.library.path
+        self.assertTrue(library_path.exists())
+        real_unlink = Path.unlink
+
+        def refuse(target, *args, **kwargs):
+            if target == library_path:
+                raise PermissionError("sharing violation")
+            return real_unlink(target, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", refuse):
+            response = self.api("POST", "/v1/auth/logout")
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["type"], "local_io_error")
+        self.assertFalse(self.api("GET", "/v1/auth").json()["authenticated"])
+        self.assertEqual(self.api("GET", "/v1/files").status_code, 401)
+        self.assertFalse(plugin_state.credential_path().exists())
+        self.assertEqual([entry["fid"] for entry in self.service.library.favorites()], ["root-dir"])
+
+    def test_credential_expiry_keeps_favorites_and_recent(self):
+        self.api("POST", "/v1/favorites", body={"fid": "root-dir"})
+        self.stream(self.play("v2")["url"])
+
+        self.fixture.api_unauthorized = True
+        self.assertEqual(self.api("GET", "/v1/files").status_code, 401)
+        self.assertEqual(self.api("GET", "/v1/favorites").status_code, 401)
+        self.assertEqual([item["fid"] for item in self.service.library.favorites()], ["root-dir"])
+        self.assertEqual([item["fid"] for item in self.service.library.recent()], ["v2"])
+        self.assertTrue(self.service.library.path.exists())
+
+
+class RecentCase(_ServerCase):
+    """A media GET is recorded once as soon as it starts streaming."""
+
+    def service_kwargs(self) -> dict:
+        return {"transport": self.fixture.transport(), "cookie": COOKIE}
+
+    def setUp(self):
+        super().setUp()
+        self.fixture.records.append(record("big", "大剧集.mp4", "root-dir", size=VIRTUAL_SIZE))
+        self.fixture.virtual["big"] = VIRTUAL_SIZE
+        self.fixture.segment_limit = SEGMENT_LIMIT
+
+    def test_play_and_head_are_not_recorded_but_a_full_get_is(self):
+        self.assertEqual(self.api("GET", "/v1/recent").json(), {"items": []})
+        url = self.play("v2")["url"]
+        self.assertEqual(self.api("GET", "/v1/recent").json(), {"items": []})
+        self.assertEqual(self.client.head(self.base + url).status_code, 200)
+        self.assertEqual(self.api("GET", "/v1/recent").json(), {"items": []})
+
+        self.assertEqual(self.stream(url).status_code, 200)
+        payload = self.api("GET", "/v1/recent").json()
+        self.assertEqual(len(payload["items"]), 1)
+        item = payload["items"][0]
+        self.assertEqual(item["fid"], "v2")
+        self.assertEqual(item["name"], "第2集.mp4")
+        self.assertEqual(item["is_dir"], False)
+        self.assertEqual(item["size"], len(VIDEO_BYTES))
+        self.assertIsInstance(item["played_at"], int)
+
+    def test_a_range_get_records_once_and_repeats_move_to_the_front(self):
+        self.assertEqual(self.stream(self.play("v2")["url"], headers={"Range": "bytes=0-9"}).status_code, 206)
+        self.assertEqual(self.stream(self.play("v9")["url"]).status_code, 200)
+        self.assertEqual(
+            [item["fid"] for item in self.api("GET", "/v1/recent").json()["items"]],
+            ["v9", "v2"],
+        )
+        self.assertEqual(self.stream(self.play("v2")["url"]).status_code, 200)
+        self.assertEqual(
+            [item["fid"] for item in self.api("GET", "/v1/recent").json()["items"]],
+            ["v2", "v9"],
+        )
+
+    def test_a_segmented_large_get_records_exactly_once(self):
+        url = self.play("big")["url"]
+        with self.client.stream("GET", self.base + url) as response:
+            self.assertEqual(response.status_code, 200)
+            forwarded = 0
+            for chunk in response.iter_bytes():
+                forwarded += len(chunk)
+            self.assertEqual(forwarded, VIRTUAL_SIZE)
+        self.assertGreater(len(self.fixture.origin_requests()), 1)
+        self.assertEqual([item["fid"] for item in self.api("GET", "/v1/recent").json()["items"]], ["big"])
+
+    def test_a_started_stream_is_recorded_once_before_the_body_finishes(self):
+        calls: list[str] = []
+        library = self.service.library
+        original = library.record_recent
+
+        def spy(fid, name, size):
+            calls.append(fid)
+            return original(fid, name, size)
+
+        library.record_recent = spy
+
+        url = self.play("big")["url"]
+        with self.client.stream("GET", self.base + url) as response:
+            self.assertEqual(response.status_code, 200)
+            received = 0
+            for chunk in response.iter_bytes(16 * 1024):
+                received += len(chunk)
+                if received >= 128 * 1024:
+                    break
+            # A >4 MiB title spans several segments; because the >64 KiB read past
+            # the first chunk forces a second segment write, the record has already
+            # happened while the media GET is still open.
+            self.assertGreaterEqual(received, 128 * 1024)
+            payload = self.api("GET", "/v1/recent").json()
+            self.assertEqual([item["fid"] for item in payload["items"]], ["big"])
+            self.assertEqual(calls, ["big"])
+
+        # Closing the player connection must not drop the already-started entry.
+        self.assertEqual([item["fid"] for item in self.api("GET", "/v1/recent").json()["items"]], ["big"])
+        self.assertEqual(calls, ["big"])
+
+    def test_failures_without_media_bytes_are_not_recorded(self):
+        url = self.play("big")["url"]
+        self.assertEqual(self.client.head(self.base + url).status_code, 200)
+        self.assertEqual(self.api("GET", "/v1/recent").json(), {"items": []})
+
+        self.fixture.origin_status = 500
+        self.assertEqual(self.stream(url).status_code, 502)
+        self.assertEqual(self.api("GET", "/v1/recent").json(), {"items": []})
+
+        self.fixture.origin_status = None
+        unsatisfiable = self.stream(url, headers={"Range": f"bytes={VIRTUAL_SIZE}-"})
+        self.assertEqual(unsatisfiable.status_code, 416)
+        self.assertEqual(self.api("GET", "/v1/recent").json(), {"items": []})
+
+    def test_a_truncated_response_after_the_first_chunk_is_recorded(self):
+        url = self.play("big")["url"]
+        self.fixture.truncate_at = 1
+        with self.assertRaises(httpx.HTTPError):
+            with self.client.stream("GET", self.base + url) as response:
+                self.assertEqual(response.status_code, 200)
+                for _ in response.iter_bytes():
+                    pass
+        self.assertEqual([item["fid"] for item in self.api("GET", "/v1/recent").json()["items"]], ["big"])
+
+    def test_a_corrupt_library_aborts_a_started_stream_and_keeps_the_file(self):
+        path = self.service.library.path
+        write_json(path, {"version": 1, "favorites": [], "recent": []})
+        path.write_text("{broken", encoding="utf-8")
+
+        url = self.play("big")["url"]
+        with self.assertRaises(httpx.HTTPError):
+            with self.client.stream("GET", self.base + url) as response:
+                self.assertEqual(response.status_code, 200)
+                for _ in response.iter_bytes():
+                    pass
+
+        self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
+        broken = self.api("GET", "/v1/recent")
+        self.assertEqual(broken.status_code, 500)
+        self.assertEqual(broken.json()["error"]["type"], "local_io_error")
+        self.assertEqual(self.api("GET", "/v1/favorites").status_code, 500)
+
+    def test_clear_recent_answers_with_an_empty_collection(self):
+        self.stream(self.play("v2")["url"])
+        cleared = self.api("POST", "/v1/recent/clear", body={})
+        self.assertEqual(cleared.status_code, 200)
+        self.assertEqual(cleared.json(), {"items": []})
+        self.assertEqual(self.api("GET", "/v1/recent").json(), {"items": []})
+        self.assertEqual(self.api("POST", "/v1/recent/clear", body={}).json(), {"items": []})
+
+
+class PersistenceCase(_ServerCase):
+    """The private document is read back by a fresh service instance."""
+
+    def service_kwargs(self) -> dict:
+        return {"transport": self.fixture.transport(), "cookie": COOKIE}
+
+    def test_favorites_and_recent_survive_a_service_restart(self):
+        self.api("POST", "/v1/favorites", body={"fid": "root-dir"})
+        self.assertEqual(self.stream(self.play("v2")["url"]).status_code, 200)
+
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(10)
+        self.service.close()
+
+        self.service = Service(transport=self.fixture.transport(), cookie=COOKIE)
+        self.server = self.service.build_server()
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.service.port}"
+
+        self.assertEqual(
+            [item["fid"] for item in self.api("GET", "/v1/favorites").json()["items"]],
+            ["root-dir"],
+        )
+        self.assertEqual(
+            [item["fid"] for item in self.api("GET", "/v1/recent").json()["items"]],
+            ["v2"],
+        )
+
+
+class AuthGateCase(_ServerCase):
+    """Library endpoints follow the bridge's existing token plus login gate."""
+
+    def service_kwargs(self) -> dict:
+        return {"transport": self.fixture.transport()}
+
+    def test_library_endpoints_require_the_token(self):
+        for path in ("/v1/search?q=a", "/v1/favorites", "/v1/recent"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(self.base + path).status_code, 401)
+
+    def test_library_endpoints_require_a_login(self):
+        requests = (
+            ("GET", "/v1/search?q=a"),
+            ("GET", "/v1/favorites"),
+            ("GET", "/v1/recent"),
+            ("POST", "/v1/favorites"),
+            ("POST", "/v1/favorites/remove"),
+            ("POST", "/v1/recent/clear"),
+        )
+        for method, path in requests:
+            with self.subTest(path=path):
+                response = self.api(method, path, body={"fid": "root-dir"} if method == "POST" else None)
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.json()["error"]["type"], "login_required")
 
 
 if __name__ == "__main__":

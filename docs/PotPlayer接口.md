@@ -102,6 +102,58 @@
 
 `url` 是本地相对地址，只含不可猜测的会话标识；**不含** Cookie、账号信息或夸克签名地址。目录 FID → `502`；`fid` 缺失/空 → `400`。
 
+## 搜索、收藏与最近观看
+
+扩展开关在根页面选择类别：`drive`（我的网盘）、`search`（`type=search`，用 Query 输入关键词）、`favorites`、`recent`。搜索只在根页面消费 `Query`；进入结果目录后按 `PathToken` 里的 FID 正常浏览，不再使用 `Query`。
+
+### `GET /v1/search?q=<keyword>&page=<n>&size=<n>`
+
+全网盘**文件名**搜索，支持中文（`q` 需 URL 编码）。`q` 必填且去空白后非空，`page` 从 `1` 开始（上限 `1000000`），`size` `1..100`（缺省 `50`）。返回：
+
+```json
+{"items":[{"fid":"...","name":"剧集","is_dir":true,"size":0}],"page":1,"has_more":false}
+```
+
+- 只返回**目录与视频**（过滤掉图片、文本等），`has_more` 依据远端原始总数而非过滤后的条数，避免隐藏海报/文本后整页丢失。
+- 远端请求 `file/search`，参数 `q,_page,_size,_fetch_total=1,_sort=file_type:asc,file_name:asc`；不启用文件名 HTML 高亮。
+- `q` 缺失/空白 → `400 bad_request`；未登录 → `401 login_required`。
+
+### `GET /v1/favorites`
+
+返回已收藏的目录，最近添加在前：
+
+```json
+{"items":[{"fid":"...","name":"剧集","is_dir":true,"size":0}]}
+```
+
+### `POST /v1/favorites`
+
+请求体 `{"fid":"<目录 fid>"}`。服务端向上游校验这是**真实目录**并取其名称，按 FID 去重（重复添加幂等，已存在的条目位置不变）。返回与 `GET /v1/favorites` 相同的 `items`。非目录或 `fid` 缺失/空 → `400 bad_request`；远端找不到 FID 或返回无效详情 → `502 remote_error`。
+
+### `POST /v1/favorites/remove`
+
+请求体 `{"fid":"<目录 fid>"}`。幂等删除：FID 不存在也返回成功，**不修改远端**，因此网盘里已删除/移动的目录仍能移除。返回 `items`。
+
+### `GET /v1/recent`
+
+最近**成功播放**过的视频，最近在前，按 FID 去重，最多 `100` 条：
+
+```json
+{"items":[{"fid":"...","name":"第2集.mp4","is_dir":false,"size":123,"played_at":1699999999}]}
+```
+
+`played_at` 是本机 Unix 秒。条目只有位置信息，用于从该集开始同目录选集，不是秒级续播。
+
+### `POST /v1/recent/clear`
+
+清空本机最近记录，幂等；请求体按通用规则读完有界内容后忽略，返回 `{"items":[]}`（扩展固定发送一个非空 JSON 请求体）。
+
+### 写入时机与数据边界
+
+- 最近记录在**首个非空媒体块成功转发之后**写入，不等整集传输结束：取链、`HEAD`、未转发任何媒体字节的失败 `GET` 不记录。已经开始传输后再关闭、拖动或遇到上游中断，已写入的记录仍保留；每个 HTTP 请求只记一次，不按分段或数据块重复写盘。
+- 收藏与最近观看存放在插件私有目录 `config_directory()/potplayer/library.json`（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。
+- 显式插件退出登录（`POST /v1/auth/logout`）会一并清空这两份列表；本地清理失败时返回 `500 local_io_error`，凭证仍已失效，不误报清理成功。登录过期只要求重新扫码，不清空。跨进程重启与升级保留。
+
 ## 播放流
 
 ### `GET|HEAD /v1/stream/<session>/<name>`
@@ -145,5 +197,6 @@
 
 - 插件凭证：`config_directory()/potplayer/cookie`，由 `QRLogin` 单独保存；`quark` CLI 的 Cookie 从不读取、写入或删除。
 - 运行配置：同目录 `runtime.json`；单实例锁 `service.lock`。
+- 收藏与最近观看：同目录 `library.json`，只含 FID、名称、大小与本机时间；显式退出登录清空，过期不清、升级保留。
 - 视频不落盘：无分片、无磁盘缓存、无转码；仅内存转发请求的字节范围。
-- 首版仅内嵌字幕/音轨；不含分享转存、外挂字幕、海报库、转码、多账号。
+- 首版仅内嵌字幕/音轨；不含分享转存、外挂字幕、海报库、转码、多账号；不含断点/秒级续播。
