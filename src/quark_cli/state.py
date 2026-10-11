@@ -37,8 +37,28 @@ def _not_link(path: Path) -> None:
             raise LocalIOError("私有状态路径不能包含符号链接或重解析点")
 
 
+def _acl_failure(message: str, exception: BaseException) -> str:
+    """One safe line with the native error code: never a path, SID or credential."""
+    if not isinstance(exception, OSError):
+        return message
+    code = exception.winerror or exception.errno
+    return f"{message}（Win32 错误 {code}）" if code else message
+
+
 def restrict_windows_acl(path: Path, *, directory: bool) -> None:
-    """Replace the DACL, including explicit grants, with one current-SID ACE."""
+    """Replace the DACL, including explicit grants, with one current-SID ACE.
+
+    Only the DACL is written. The owner of an object implicitly holds
+    READ_CONTROL and WRITE_DAC, but WRITE_OWNER comes from the DACL alone, so
+    requesting OWNER_SECURITY_INFORMATION needs rights an inheriting folder such
+    as a plain save directory does not grant and fails with ERROR_ACCESS_DENIED.
+    Ownership is therefore never taken over here; callers that must not adopt
+    foreign state check the owner separately.
+
+    The DACL written here is protected: the P flag of the SDDL sets
+    SE_DACL_PROTECTED on the descriptor, so the object stops inheriting ACEs
+    and later reads see exactly the single ACE placed here.
+    """
     import ctypes
     from ctypes import wintypes
 
@@ -56,24 +76,26 @@ def restrict_windows_acl(path: Path, *, directory: bool) -> None:
     sid_text, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
     try:
         if not api.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
-            raise OSError()
+            raise OSError(ctypes.get_last_error(), "OpenProcessToken")
         needed = wintypes.DWORD()
         api.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
         buffer = ctypes.create_string_buffer(needed.value)
         if not api.GetTokenInformation(token, 1, buffer, needed, ctypes.byref(needed)):
-            raise OSError()
+            raise OSError(ctypes.get_last_error(), "GetTokenInformation")
         sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
         if not api.ConvertSidToStringSidW(sid, ctypes.byref(sid_text)):
-            raise OSError()
+            raise OSError(ctypes.get_last_error(), "ConvertSidToStringSidW")
         current_sid = ctypes.wstring_at(sid_text)
         inheritance = "OICI" if directory else ""
-        sddl = f"O:{current_sid}D:P(A;{inheritance};FA;;;{current_sid})"
+        # No owner or group component: this call writes the DACL only, so what
+        # the descriptor states is exactly what the object receives.
+        sddl = f"D:P(A;{inheritance};FA;;;{current_sid})"
         if not api.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None):
-            raise OSError()
-        if not api.SetFileSecurityW(str(path), 0x80000005, descriptor):
-            raise OSError()
-    except (OSError, ValueError):
-        raise LocalIOError("无法设置仅当前用户可访问的 Windows ACL") from None
+            raise OSError(ctypes.get_last_error(), "ConvertStringSecurityDescriptorToSecurityDescriptorW")
+        if not api.SetFileSecurityW(str(path), 0x80000004, descriptor):  # DACL | PROTECTED_DACL
+            raise OSError(ctypes.get_last_error(), "SetFileSecurityW")
+    except (OSError, ValueError) as exception:
+        raise LocalIOError(_acl_failure("无法设置仅当前用户可访问的 Windows ACL", exception)) from None
     finally:
         if descriptor.value:
             kernel.LocalFree(descriptor)

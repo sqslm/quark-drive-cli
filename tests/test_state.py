@@ -18,6 +18,37 @@ def lock_worker(directory, pipe):
         pipe.recv()
 
 
+def powershell(script, payload=None):
+    response = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; " + script],
+                              input=json.dumps(payload) if payload is not None else None,
+                              capture_output=True, text=True, encoding="utf-8", check=True)
+    return json.loads(response.stdout)
+
+
+def legacy_owner_acl_request(target, sid):
+    """Replay the pre-fix owner plus protected DACL request; returns the Win32 error, 0 on success."""
+    import ctypes
+
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    api = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    api.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)]
+    api.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+    descriptor = ctypes.c_void_p()
+    try:
+        sddl = f"O:{sid}D:P(A;;FA;;;{sid})"
+        if not api.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None):
+            return ctypes.get_last_error()
+        if api.SetFileSecurityW(str(target), 0x80000005, descriptor):  # OWNER | DACL | PROTECTED_DACL
+            return 0
+        return ctypes.get_last_error()
+    finally:
+        if descriptor.value:
+            kernel.LocalFree(descriptor)
+
+
 class StateTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -177,20 +208,53 @@ class StateTests(unittest.TestCase):
                 os.fstat(captured[0])
         self.assertEqual(cookie.read_text(encoding="utf-8"), "sid=offline")
 
+    def test_acl_repair_needs_only_write_dac_on_modify_granted_targets(self):
+        # A DACL granting the current user nothing but Modify carries WRITE_OWNER
+        # neither explicitly nor implicitly for the object's owner, so the pre-fix
+        # request that also included OWNER_SECURITY_INFORMATION failed on such
+        # targets with ERROR_ACCESS_DENIED, while a DACL-only write does not.
+        if sys.platform != "win32":
+            self.skipTest("Windows DACL semantics")
+        sid = powershell("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value | ConvertTo-Json -Compress")
+        path = self.root / "data.json"
+        path.write_text("{}")
+        directory = self.root / "parts"
+        directory.mkdir()
+        for target in (path, directory):
+            grant = subprocess.run(["icacls", str(target), "/inheritance:r", "/grant:r", f"*{sid}:(M)"], capture_output=True, check=False)
+            self.assertEqual(grant.returncode, 0, "unable to inject a Modify-only current-user DACL")
+            legacy_error = legacy_owner_acl_request(target, sid)
+            if legacy_error == 0:
+                self.skipTest("token can take ownership, so the legacy denial cannot be shown here")
+            self.assertEqual(legacy_error, 5, "Modify alone grants no WRITE_OWNER")
+            for _ in range(2):  # a second pass must not need rights the first one consumed
+                state.private_path(target, directory=target.is_dir())
+                state.validate_windows_acl(target)
+            self.assertEqual(legacy_owner_acl_request(target, sid), 0, "repaired DACL must grant WRITE_OWNER again")
+            state.validate_windows_acl(target)
+        self.assertEqual(state.read_json(path), {})
+
+    def test_acl_failure_reports_native_code_without_paths_or_sids(self):
+        if sys.platform != "win32":
+            self.skipTest("Windows DACL semantics")
+        missing = self.root / "absent.json"
+        with self.assertRaises(LocalIOError) as caught:
+            state.restrict_windows_acl(missing, directory=False)
+        message = str(caught.exception)
+        self.assertIn("Win32 错误", message)
+        self.assertNotIn(str(missing), message)
+        self.assertNotIn(str(self.root), message)
+
     def test_native_private_permissions_remove_old_explicit_grants_or_reject_untrusted_owner_and_links(self):
         path = self.root / "data.json"
         state.write_json(path, {"version": 1})
         if sys.platform == "win32":
-            def powershell(script):
-                response = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; " + script],
-                                          input=json.dumps(str(path)), capture_output=True, text=True, encoding="utf-8", check=True)
-                return json.loads(response.stdout)
             grant = subprocess.run(["icacls", str(path), "/grant", "*S-1-1-0:F"], capture_output=True, check=False)
             self.assertEqual(grant.returncode, 0, "unable to inject an explicit Everyone grant")
-            injected = powershell("$p=[Console]::In.ReadToEnd()|ConvertFrom-Json; $b=Get-Acl -LiteralPath $p; @{count=@($b.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])).Count}|ConvertTo-Json -Compress")
+            injected = powershell("$p=[Console]::In.ReadToEnd()|ConvertFrom-Json; $b=Get-Acl -LiteralPath $p; @{count=@($b.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])).Count}|ConvertTo-Json -Compress", str(path))
             self.assertGreater(injected["count"], 1)
             self.assertEqual(state.read_json(path), {"version": 1})
-            actual = powershell("$p=[Console]::In.ReadToEnd()|ConvertFrom-Json; $a=Get-Acl -LiteralPath $p; $u=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $rules=@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])); @{count=$rules.Count; protected=$a.AreAccessRulesProtected; current=($rules[0].IdentityReference.Value -eq $u); allow=($rules[0].AccessControlType -eq 'Allow')}|ConvertTo-Json -Compress")
+            actual = powershell("$p=[Console]::In.ReadToEnd()|ConvertFrom-Json; $a=Get-Acl -LiteralPath $p; $u=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $rules=@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])); @{count=$rules.Count; protected=$a.AreAccessRulesProtected; current=($rules[0].IdentityReference.Value -eq $u); allow=($rules[0].AccessControlType -eq 'Allow')}|ConvertTo-Json -Compress", str(path))
             self.assertEqual(actual, {"count": 1, "protected": True, "current": True, "allow": True})
         else:
             self.assertEqual(self.root.stat().st_mode & 0o777, 0o700)
