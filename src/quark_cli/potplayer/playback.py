@@ -70,6 +70,7 @@ MSG_SEEK_FAILED = "恢复观看位置失败，已保留上次保存位置"
 MSG_NATIVE_FAILED = "读取播放器进度失败，播放不受影响"
 MSG_STORAGE_FAILED = "保存观看进度失败，已停止记录，播放不受影响"
 MSG_CLEARED = "最近观看已清空，不再记录进度"
+MSG_HISTORY_REMOVED = "该视频的观看记录已删除，不再记录进度"
 MSG_RESTARTED = "已从头开始播放"
 
 _DISPLAY = {
@@ -102,6 +103,15 @@ class _Flush:
     is dropped when the same pid has since been re-bound to the same FID (or
     cleared), because that newer binding is the authoritative owner of the
     record and an older last-good point must not overwrite it.
+
+    ``epoch`` is ``_progress_epoch`` captured when the flush was *created*, not
+    when it runs. A clear() or a one-FID forget_fid() bumps that epoch, so a
+    flush queued before the change is dropped on execution: it can never land
+    after the row was deleted and a later explicit ``/v1/play`` (a different
+    pid, or no pid at all for this one) re-created it. Carrying the epoch -- and
+    not re-reading the live one at execution -- is what closes the window in
+    which the current binding is absent or bound to another FID, where the
+    generation check alone cannot reject the stale point.
     """
 
     player_pid: int
@@ -110,6 +120,7 @@ class _Flush:
     position_ms: int
     duration_ms: int
     generation: int
+    epoch: int
 
 
 @dataclass
@@ -241,6 +252,12 @@ class PlaybackMonitor:
         # that lets a queued write detect that a clear superseded it. It is
         # never held together with ``_lock`` and never held over a native call.
         self._storage_lock = threading.Lock()
+        # Bumped by a clear and by a one-FID forget; compared by ``_save_progress``
+        # and ``_reset_progress`` so a resume write decided before the bump can
+        # never land after it. Kept apart from ``_storage_epoch`` so forgetting one
+        # video never aborts another video's bookmark capture, which only a clear
+        # supersedes.
+        self._progress_epoch = 0
         self._storage_epoch = 0
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -262,6 +279,15 @@ class PlaybackMonitor:
         with self._lock:
             if self._closed:
                 raise UsageError("播放监控已关闭")
+            if session.history_removed:
+                # The session was registered just before /v1/recent/remove marked
+                # it: the removal ran between ``new_session`` and this delayed
+                # bind (remove_history marks sessions *before* calling
+                # forget_fid, whose monitor lock serializes this check). Tracking
+                # the pid here would let the deleted video's stream mark itself
+                # started and write progress again, re-creating the row. Skip it;
+                # a later explicit /v1/play is a fresh unmarked session.
+                return
             previous = self._bindings.pop(player_pid, None)
             if previous is None and len(self._bindings) >= MAX_BINDINGS:
                 oldest = min(self._bindings.values(), key=lambda item: item.generation)
@@ -273,6 +299,7 @@ class PlaybackMonitor:
                 self._pending.append(_Flush(
                     previous.player_pid, previous.session.fid, previous.session.size,
                     previous.last_position, previous.last_duration, previous.generation,
+                    self._progress_epoch,
                 ))
             self._wake.set()
 
@@ -424,13 +451,15 @@ class PlaybackMonitor:
     def clear(self) -> None:
         """Stop persisting progress for current bindings until each is bound again.
 
-        Bumps the storage epoch and suppresses every binding first, then waits
-        out any write that is already past its check, so a caller that empties
-        the recent list afterwards can never be overwritten by an in-flight
-        write of the same FID.
+        Bumps both epochs and suppresses every binding first, then waits out any
+        write that is already past its check, so a caller that empties the recent
+        list afterwards can never be overwritten by an in-flight write of the
+        same FID. The progress epoch rejects a late resume write; the storage
+        epoch rejects a late bookmark capture.
         """
         with self._lock:
             self._storage_epoch += 1
+            self._progress_epoch += 1
             for task in self._pending:
                 self._cancel(task)
             self._pending.clear()
@@ -438,6 +467,33 @@ class PlaybackMonitor:
                 binding.suppressed = True
                 binding.generation = self._bump()
                 binding.state, binding.message = STATE_STOPPED, MSG_CLEARED
+            self._wake.set()
+        with self._storage_lock:
+            pass  # drain: wait for any write that already passed the epoch check
+
+    def forget_fid(self, fid: str) -> None:
+        """Stop persisting progress for the bindings of exactly one FID.
+
+        Used by ``/v1/recent/remove``: every binding currently playing ``fid`` is
+        marked suppressed, so an in-flight periodic write, a paused transition or
+        the close-time flush can never re-create a point for the row the caller
+        is about to delete. Bindings for any other video are untouched and no
+        native seek or stop is ever issued. A later explicit ``/v1/play`` binds a
+        brand-new, unsuppressed binding and records again. A resume write that was
+        already decided for this FID is rejected by bumping the progress epoch
+        (bindings of other videos keep retrying their own writes normally), and
+        the storage barrier is drained afterwards so such a write has finished
+        before the caller deletes the row.
+        """
+        if not isinstance(fid, str) or not fid:
+            return
+        with self._lock:
+            self._progress_epoch += 1
+            for binding in self._bindings.values():
+                if binding.session.fid == fid:
+                    binding.suppressed = True
+                    binding.generation = self._bump()
+                    binding.state, binding.message = STATE_STOPPED, MSG_HISTORY_REMOVED
             self._wake.set()
         with self._storage_lock:
             pass  # drain: wait for any write that already passed the epoch check
@@ -650,13 +706,20 @@ class PlaybackMonitor:
 
     def _apply_flush(self, task: _Flush) -> None:
         with self._lock:
+            if task.epoch != self._progress_epoch:
+                # A clear() or a one-FID forget_fid() ran after this flush was
+                # queued. The row was deleted (and possibly re-created by a new
+                # explicit play this pid does not own), so the old point must
+                # never be written: reject on the *creation* epoch, not the live
+                # one. The generation check below cannot catch this when the
+                # current binding is absent or bound to a different FID.
+                return
             current = self._bindings.get(task.player_pid)
             if current is not None and current.session.fid == task.fid and current.generation != task.generation:
                 # The same pid was re-bound (or cleared) to this FID after the
                 # flush was queued; the newer binding owns the record now.
                 return
-            epoch = self._storage_epoch
-        self._save_progress(task.fid, task.size, task.position_ms, task.duration_ms, epoch)
+        self._save_progress(task.fid, task.size, task.position_ms, task.duration_ms, task.epoch)
 
     def _apply_restart(self, adapter: NativeAdapter | None, task: _Restart) -> bool:
         if adapter is None or task.cancelled:
@@ -683,7 +746,7 @@ class PlaybackMonitor:
         with self._lock:
             if not self._fresh(task.player_pid, task.generation):
                 return False
-            epoch = self._storage_epoch
+            epoch = self._progress_epoch
             if task.cancelled:
                 return False
         try:
@@ -922,7 +985,7 @@ class PlaybackMonitor:
                 return
             if position == binding.last_saved_position:
                 return
-            epoch = self._storage_epoch
+            epoch = self._progress_epoch
         written = self._save_progress(fid, size, position, duration, epoch)
         if written is None:
             self._storage_failed(player_pid, generation)
@@ -938,7 +1001,7 @@ class PlaybackMonitor:
 
     def _flush_all(self) -> None:
         with self._lock:
-            epoch = self._storage_epoch
+            epoch = self._progress_epoch
             items = [
                 (binding.player_pid, binding.generation, binding.session.fid, binding.session.size,
                  binding.last_position, binding.last_duration)
@@ -954,12 +1017,13 @@ class PlaybackMonitor:
         """Write a resume point under the storage barrier.
 
         The epoch is re-checked *while holding* the barrier, so a write that was
-        decided before a :meth:`clear` can never land after that clear has been
-        observed. Returns ``True``/``False`` like ``Library.save_progress`` or
-        ``None`` when the write raised :class:`LocalIOError`.
+        decided before a :meth:`clear` or a one-FID :meth:`forget_fid` can never
+        land after that change has been observed. Returns ``True``/``False`` like
+        ``Library.save_progress`` or ``None`` when the write raised
+        :class:`LocalIOError`.
         """
         with self._storage_lock:
-            if epoch != self._storage_epoch:
+            if epoch != self._progress_epoch:
                 return False
             try:
                 return bool(self._library.save_progress(fid, size, position, duration))
@@ -969,7 +1033,7 @@ class PlaybackMonitor:
     def _reset_progress(self, fid: str, epoch: int) -> bool | None:
         """Reset one resume point under the storage barrier (``None`` on I/O error)."""
         with self._storage_lock:
-            if epoch != self._storage_epoch:
+            if epoch != self._progress_epoch:
                 return False
             try:
                 return bool(self._library.reset_progress(fid))
@@ -1063,6 +1127,7 @@ class PlaybackMonitor:
         return _Flush(
             binding.player_pid, binding.session.fid, binding.session.size,
             binding.last_position, binding.last_duration, binding.generation,
+            self._progress_epoch,
         )
 
     def _flushable(self, binding: _Binding | None) -> bool:

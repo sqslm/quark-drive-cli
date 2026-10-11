@@ -51,7 +51,7 @@ from .library import (
     search,
     select_continue,
 )
-from .library_state import Library, completed, display_name, unfinished
+from .library_state import Library, completed, display_name, progress_text, unfinished
 from .native_player import NativePlayer
 from .playback import POLL_INTERVAL, PlaybackMonitor
 from .login_gui import QrLoginWindow
@@ -97,17 +97,24 @@ MAX_ASSOCIATIONS = 4096
 #: prefix: a movie stored at the root keeps its full name.
 ROOT_FID = "0"
 
+#: Watch-center wording. A series whose directory name was never verified keeps
+#: this neutral, honest label instead of guessing one from a file name.
+WATCH_UNNAMED = "来源目录未命名"
+#: The bookmark-window request's fallback label, used only when no local recent
+#: or bookmark row names the video; it deliberately carries no FID or name.
+BOOKMARK_FALLBACK_NAME = "所选视频"
+
 _CONTROL_ROUTES = frozenset({
     "/v1/auth", "/v1/auth/login", "/v1/auth/logout",
     "/v1/files", "/v1/playlist", "/v1/play", "/v1/shutdown",
     "/v1/search", "/v1/favorites", "/v1/favorites/remove",
-    "/v1/recent", "/v1/recent/clear", "/v1/continue",
-    "/v1/series", "/v1/mark",
+    "/v1/recent", "/v1/recent/clear", "/v1/recent/remove", "/v1/continue",
+    "/v1/series", "/v1/watch-center", "/v1/mark",
     "/v1/subtitles", "/v1/subtitle",
     "/v1/diagnostics", "/v1/diagnostics/report", "/v1/diagnostics/open",
     "/v1/playback/restart",
     "/v1/bookmarks", "/v1/bookmarks/add", "/v1/bookmarks/rename",
-    "/v1/bookmarks/remove", "/v1/bookmarks/jump",
+    "/v1/bookmarks/remove", "/v1/bookmarks/jump", "/v1/bookmarks/open",
 })
 
 
@@ -252,16 +259,142 @@ def _continue_items(snapshot: Mapping[str, Any], names: Mapping[str, str]) -> li
     return items
 
 
+def _watch_display(title: str, watched: bool, position_ms: int, duration_ms: int) -> str:
+    """Title plus the latest episode's own progress; never a directory total.
+
+    The watch center never lists a directory's episodes, so it can show a saved
+    point but must never imply how many episodes exist or that a series is
+    finished. ``已看`` (no percentage) only means that one episode is watched.
+    """
+    if watched:
+        return f"{title} · 已看"
+    percent = progress_text(position_ms, duration_ms)
+    return title if not percent else f"{title} · 已看{percent}"
+
+
+def _watch_center_items(snapshot: Mapping[str, Any], names: Mapping[str, str]) -> list[dict[str, Any]]:
+    """Home-screen groups: one per verified directory, one per root/unknown video.
+
+    History is grouped by the verified ``parent`` FID stored with each recent
+    row, never by a name, so two directories that share a title stay apart and a
+    renamed one keeps its identity. A row whose parent is the drive root or
+    unknown has no series identity and stands alone, keyed by its own video FID.
+    Groups are ordered by the latest episode's ``max(played_at, progress_at)``;
+    the recent list is already newest-played first, so equal stamps keep a
+    stable, newest-first order.
+    """
+    marks = _mark_keys(snapshot)
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str]] = []
+    for entry in snapshot["recent"]:
+        parent = entry["parent"]
+        series = bool(parent) and parent != ROOT_FID
+        kind = "series" if series else "video"
+        key = parent if series else entry["fid"]
+        group_key = (kind, key)
+        bucket = groups.get(group_key)
+        if bucket is None:
+            bucket = groups[group_key] = {
+                "kind": kind,
+                "key": key,
+                "parent": parent,
+                "rows": [],
+            }
+            order.append(group_key)
+        bucket["rows"].append(entry)
+    items: list[dict[str, Any]] = []
+    for group_key in order:
+        bucket = groups[group_key]
+        rows = bucket["rows"]
+        # ``max`` keeps the first maximal row, and recent is newest-played first,
+        # so a tie names the most recently watched episode.
+        latest = max(rows, key=lambda row: max(row["played_at"], row["progress_at"]))
+        watched = _watched(latest, marks)
+        if bucket["kind"] == "series":
+            name = names.get(bucket["parent"], "")
+            if not name:
+                name = next((row["parent_name"] for row in rows if row["parent_name"]), "")
+            if not name:
+                name = WATCH_UNNAMED
+            title = f"{name} · 上次：{latest['name']}"
+        else:
+            name = latest["name"]
+            title = name
+        items.append({
+            "kind": bucket["kind"],
+            "key": bucket["key"],
+            "parent": bucket["parent"],
+            "name": name,
+            "display": _watch_display(
+                title, watched, latest["position_ms"], latest["duration_ms"]
+            ),
+            "latest": _episode_view(latest, watched),
+            "unfinished_count": sum(
+                1 for row in rows
+                if not _watched(row, marks) and unfinished(row["position_ms"], row["duration_ms"])
+            ),
+            "_stamp": max(latest["played_at"], latest["progress_at"]),
+        })
+    items.sort(key=lambda item: item["_stamp"], reverse=True)
+    for item in items:
+        del item["_stamp"]
+    return items
+
+
+def _series_latest(snapshot: Mapping[str, Any], views: Mapping[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """The most recently watched episode that is still in this listing, or ``None``.
+
+    Only a recent record whose file is in the listing at the *same size* counts,
+    so a stale record from a replaced object never names a "last watched"
+    episode. The most recent ``max(played_at, progress_at)`` wins; the recent
+    list is newest-played first, so a tie keeps the newest one.
+    """
+    best: dict[str, Any] | None = None
+    best_stamp = -1
+    for record in snapshot["recent"]:
+        view = views.get(record["fid"])
+        if view is None or view["size"] != record["size"]:
+            continue
+        stamp = max(record["played_at"], record["progress_at"])
+        if stamp > best_stamp:
+            best_stamp, best = stamp, view
+    return best
+
+
+def _series_next(
+    videos: list[dict[str, Any]], views: Mapping[str, dict[str, Any]], latest: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """The episode immediately after ``latest`` in natural order, or ``None``.
+
+    Only the listing's own order is used, so a moved or renamed episode cannot
+    make a stale FID association, and the last episode never wraps to the first.
+    With no latest episode the first unwatched one is offered, else ``None``.
+    """
+    if latest is not None:
+        position = next(
+            (index for index, video in enumerate(videos) if video["fid"] == latest["fid"]), None
+        )
+        if position is not None and position + 1 < len(videos):
+            return views[videos[position + 1]["fid"]]
+        return None
+    return next(
+        (views[video["fid"]] for video in videos if not views[video["fid"]]["watched"]), None
+    )
+
+
 def _series_payload(snapshot: Mapping[str, Any], parent: str, videos: list[dict[str, Any]]) -> dict[str, Any]:
-    """Continue target plus per-episode status for one directory listing.
+    """Continue target, last-watched pair, and per-episode status for one listing.
 
     The trusted listing is the only source of a video's name, size, and parent:
     a saved recent record contributes only its resume point, so a stale stored
     name or an old unknown parent can never label or re-associate an episode.
+    No extra directory is ever scanned; ``latest`` and ``next`` are derived from
+    this same listing.
     """
     marks = _mark_keys(snapshot)
     saved = {entry["fid"]: entry for entry in snapshot["recent"]}
     episodes = []
+    views: dict[str, dict[str, Any]] = {}
     for video in videos:
         record = saved.get(video["fid"])
         if record is not None and record["size"] != video["size"]:
@@ -282,7 +415,9 @@ def _series_payload(snapshot: Mapping[str, Any], parent: str, videos: list[dict[
         view["progress_at"] = record["progress_at"] if record is not None else 0
         view["unfinished"] = not watched and unfinished(position, duration)
         episodes.append(view)
+        views[video["fid"]] = view
     target = select_continue(episodes)
+    latest = _series_latest(snapshot, views)
     return {
         "parent": parent,
         "total": len(episodes),
@@ -297,6 +432,8 @@ def _series_payload(snapshot: Mapping[str, Any], parent: str, videos: list[dict[
             "duration_ms": target["duration_ms"],
             "display": target["display"],
         },
+        "latest": latest,
+        "next": _series_next(videos, views, latest),
         "episodes": [
             {key: episode[key] for key in
              ("fid", "name", "size", "watched", "position_ms", "duration_ms", "display")}
@@ -477,6 +614,14 @@ class Service:
         self._status_launcher = status_launcher
         self._status_process: Any = None
         self._status_lock = threading.Lock()
+        # One-shot bookmark-window target handed to the status GUI, plus the lock
+        # that serializes setting/clearing it with the two diagnostics opens.
+        self._bookmark_lock = threading.Lock()
+        self._bookmark_request: dict[str, str] | None = None
+        # Serializes a stream's one-time history record against
+        # ``/v1/recent/remove``, so a record that already started can never
+        # re-create the row the removal just deleted.
+        self._history_lock = threading.Lock()
         self.login_state = "idle"
         self.login_message: str | None = None
         self.qr_png: str | None = None
@@ -708,6 +853,102 @@ class Service:
                 raise LocalIOError("无法打开播放状态与诊断窗口") from None
             return "opened"
 
+    def open_plain_status_window(self) -> str:
+        """Open/reuse the status window and drop any stale bookmark target.
+
+        A plain entry means the operator just wants the diagnostics window, so
+        the pending bookmark request is cleared under the lock shared with
+        :meth:`request_bookmark_window`; the GUI then never re-opens the video an
+        earlier request pointed at.
+        """
+        with self._bookmark_lock:
+            self._bookmark_request = None
+            return self.open_status_window()
+
+    def bookmark_request(self) -> dict[str, str] | None:
+        """A copy of the pending bookmark-window request, or ``None``."""
+        with self._bookmark_lock:
+            request = self._bookmark_request
+            return None if request is None else dict(request)
+
+    def request_bookmark_window(self, fid: str) -> str:
+        """Retain one bookmark-window target, then open/reuse the status window.
+
+        The name is read from local state only (the recent row, else the local
+        bookmark document, else a FID-neutral label): no cloud request is made.
+        The request is stored before the window is spawned, so the GUI can pick
+        it up; a spawn failure clears it again, leaving no stale target behind.
+        """
+        request = {"id": secrets.token_hex(16), "fid": fid, "name": self._bookmark_target_name(fid)}
+        with self._bookmark_lock:
+            self._bookmark_request = request
+            try:
+                return self.open_status_window()
+            except LocalIOError:
+                self._bookmark_request = None
+                raise
+
+    def _bookmark_target_name(self, fid: str) -> str:
+        """The best local name for ``fid``: recent row, then bookmark, else neutral."""
+        for row in self.library.snapshot()["recent"]:
+            if row["fid"] == fid and row["name"]:
+                return row["name"]
+        for entry in self.monitor.bookmarks.list(fid):
+            if entry["name"]:
+                return entry["name"]
+        return BOOKMARK_FALLBACK_NAME
+
+    # -- history ---------------------------------------------------------
+
+    def record_played(self, session: PlaySession) -> None:
+        """Write the one history row a started stream owns, under the history lock.
+
+        ``Sessions.remove_history`` marks a session whose history was deleted; the
+        lock is shared with :meth:`remove_history`, so a late first chunk or a
+        repeated range GET of that session can never re-create the row, while a
+        record that already started either finishes and is deleted afterwards or
+        sees the mark and never writes. A brand-new session (a new explicit
+        ``/v1/play``) is unmarked and records normally. A corrupt library raises
+        ``LocalIOError`` here; it is left to propagate.
+        """
+        with self._history_lock:
+            if session.history_removed:
+                return
+            self.library.record_recent(
+                session.fid, session.name, session.size,
+                self.parent_of(session.fid), self.parent_name_of(session.fid),
+            )
+            self.monitor.stream_started(session.session)
+
+    def remove_history(self, fid: str) -> None:
+        """Forget one video's recent row, blocking any live stream from restoring it.
+
+        The sessions of ``fid`` are marked, the monitor suppresses exactly that
+        FID's bindings (draining any in-flight write), and only then is the row
+        deleted -- all under the history lock, so an already-running record is
+        deleted while a later one never starts. Marking the sessions inside the
+        same critical section (rather than before it) closes the window in which
+        a concurrent new session could begin an unmarked record. Other videos'
+        bindings, favorites, marks and bookmarks are untouched, and no player is
+        seeked or stopped.
+        """
+        with self._history_lock:
+            self.sessions.remove_history(fid)
+            self.monitor.forget_fid(fid)
+            self.library.remove_recent(fid)
+
+    def new_session(self, media: Any) -> PlaySession:
+        """Create one play session under the history lock.
+
+        Serializing creation with :meth:`remove_history` means no stream for a
+        FID can begin between that removal's session marking and its row
+        deletion, so an in-flight record can never resurrect the removed row. A
+        session created after the removal is a genuinely new explicit
+        ``/v1/play`` and records normally.
+        """
+        with self._history_lock:
+            return self.sessions.create(media)
+
     # -- lifecycle -------------------------------------------------------
 
     def build_server(self) -> ThreadingHTTPServer:
@@ -835,7 +1076,7 @@ class _Handler(BaseHTTPRequestHandler):
             pid_value = body.get("player_pid")
             player_pid = None if pid_value is None else _parse_pid(pid_value, label="player_pid")
             media = resolve(service.files(), service.client(), fid)
-            session = service.sessions.create(media)
+            session = service.new_session(media)
             service.diagnostics.media_started(session.session, session.name)
             relative = f"/v1/stream/{session.session}/{quote(session.name, safe='')}"
             if player_pid is not None:
@@ -853,6 +1094,7 @@ class _Handler(BaseHTTPRequestHandler):
                 credential_present=service.authenticated(), guard=service._guard
             )
             payload["playback"] = service.monitor.snapshot()
+            payload["bookmark_request"] = service.bookmark_request()
             return self._json(200, payload)
         if route == "/v1/diagnostics/report":
             if method not in ("GET", "HEAD"):
@@ -863,7 +1105,7 @@ class _Handler(BaseHTTPRequestHandler):
         if route == "/v1/diagnostics/open":
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
-            return self._json(202, {"status": service.open_status_window()})
+            return self._json(202, {"status": service.open_plain_status_window()})
         if route == "/v1/playback/restart":
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
@@ -928,6 +1170,13 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
             service.require_login()
             return self._json(200, {"items": _continue_items(service.library.snapshot(), service.directory_names())})
+        if route == "/v1/watch-center":
+            if method not in ("GET", "HEAD"):
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
+            # Local-only: the watch center is built from the private document and
+            # already-verified directory names; it needs no login and no request.
+            snapshot = service.library.snapshot()
+            return self._json(200, {"items": _watch_center_items(snapshot, service.directory_names())})
         if route == "/v1/series":
             if method not in ("GET", "HEAD"):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
@@ -964,6 +1213,13 @@ class _Handler(BaseHTTPRequestHandler):
             service.monitor.clear()
             service.library.clear_recent()
             return self._json(200, {"items": []})
+        if route == "/v1/recent/remove":
+            if method != "POST":
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
+            # Local-only: deleting one row needs no login and no cloud request.
+            fid = require_fid(self._body(raw).get("fid"), label="fid")
+            service.remove_history(fid)
+            return self._json(200, {"status": "removed"})
         if route == "/v1/subtitles":
             if method not in ("GET", "HEAD"):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
@@ -1018,6 +1274,13 @@ class _Handler(BaseHTTPRequestHandler):
             if not service.monitor.bookmarks.remove(bookmark_id):
                 return self._json(404, _failure("not_found", "书签不存在"))
             return self._json(200, {"status": "removed"})
+        if route == "/v1/bookmarks/open":
+            if method != "POST":
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
+            # Local-only: the target name is read from local state, no login and
+            # no cloud request are needed to open the bookmark window.
+            fid = require_fid(self._body(raw).get("fid"), label="fid")
+            return self._json(202, {"status": service.request_bookmark_window(fid)})
         if route == "/v1/bookmarks/jump":
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
@@ -1134,15 +1397,10 @@ class _Handler(BaseHTTPRequestHandler):
         A corrupt library raises ``LocalIOError`` here; it is left to propagate
         so the original ``QuarkError`` path aborts the stream instead of the
         library being silently reset, and ``/v1/recent``/``/v1/favorites`` keep
-        reporting the stored document as broken.
+        reporting the stored document as broken. The service owns the write so
+        ``/v1/recent/remove`` can serialize against it.
         """
-        self.service.library.record_recent(
-            session.fid,
-            session.name,
-            session.size,
-            self.service.parent_of(session.fid),
-            self.service.parent_name_of(session.fid),
-        )
+        self.service.record_played(session)
 
     def _record_failure(self, exc: BaseException, *, phase: str | None = None) -> None:
         """Log one fixed, sanitized failure event; never a raw exception or URL."""

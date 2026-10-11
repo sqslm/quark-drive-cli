@@ -1,4 +1,4 @@
-"""Standalone Tk status window for the PotPlayer bridge (release 0.7.0).
+"""Standalone Tk status window for the PotPlayer bridge (release 0.8.0).
 
 The service owns the bridge; this module only *observes* it. It loads the
 bridge's private runtime record (``plugin_state.read_runtime``), confirms that
@@ -15,6 +15,15 @@ then reuses the recorded Bearer token for a fixed set of read-only endpoints:
                                    window; these are local bridge calls, so no
                                    cloud login is required and the diagnostics
                                    report never contains bookmarks or notes
+
+A diagnostics snapshot may also carry one *external* bookmark request
+(``bookmark_request``: ``{id, fid, name}``) that ``POST /v1/bookmarks/open``
+recorded for this window. Each request id is consumed exactly once and binds the
+bookmark manager to that FID even while nothing is playing: the list, a rename
+and a remove are local file operations, so they work offline. Adding or jumping
+needs one unambiguous live player, which is resolved from the snapshot by FID
+alone -- never by a title guess -- and only when exactly one operable binding
+matches; otherwise the two buttons stay disabled with the fixed on-screen reason.
 
 Nothing else is ever fetched, no host other than ``127.0.0.1`` is ever
 contacted, and no Cookie, token, URL or raw upstream text is shown or logged.
@@ -61,6 +70,12 @@ POLL_INTERVAL = 1.0
 REQUEST_TIMEOUT = 3.0
 EXIT_OK = 0
 EXIT_UNAVAILABLE = 5
+
+# Association pid of an *external* bookmark target: a request names a FID that
+# may have no live player at all, so the window tracks it with this sentinel in
+# ``(player_pid, fid)`` tuples. It is never a real pid, so it is never sent to
+# the add/jump endpoints -- those resolve the one live binding first.
+EXTERNAL_PID = 0
 
 MAX_ERROR_ROWS = 20
 WINDOW_WIDTH = 800
@@ -116,6 +131,11 @@ _INACTIVE_STATES = frozenset(
     {"stopped", "missing", "mismatch", "suspended", "unavailable", "error"}
 )
 
+# An external target may only sample/seek a binding that is actually holding and
+# playing the file: ``waiting`` (bound, not started), multi-instance, mismatch
+# and every inactive state can never be an unambiguous add/jump target.
+_OPERABLE_STATES = frozenset({"playing", "paused"})
+
 _COOLDOWN_LABELS = {
     "rate_limited": "上游限流",
     "access_restricted": "上游拒绝访问",
@@ -162,6 +182,9 @@ _BOOKMARK_REMOVED = "已删除书签"
 _BOOKMARK_JUMPED = "已请求跳转"
 _BOOKMARK_NOTE_TOO_LONG = "备注过长，请控制在 200 个字符以内"
 _BOOKMARK_STALE = "当前选择已变更，请重新操作"
+# Shown while the manager is bound to an external FID with no single live
+# binding to add a bookmark from or jump to; the list/rename/remove stay usable.
+_BOOKMARK_EXTERNAL_REASON = "先播放同一视频后才能添加或跳转书签"
 
 
 # -- formatting ---------------------------------------------------------
@@ -576,6 +599,66 @@ def bookmark_id_of(entry: Any) -> Any:
     return None
 
 
+def bookmark_request_of(snapshot: Any) -> dict[str, Any] | None:
+    """The validated external bookmark request in a snapshot, or ``None``.
+
+    Only ``{id, fid, name}`` is read: the id and the FID must be non-empty
+    strings, and a missing/blank name falls back to the FID (never a title from
+    anywhere else). A malformed request is ignored entirely so a tampered
+    snapshot cannot steer the window at an unvalidated identifier.
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    request = snapshot.get("bookmark_request")
+    if not isinstance(request, dict):
+        return None
+    request_id = request.get("id")
+    fid = request.get("fid")
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    if not isinstance(fid, str) or not fid:
+        return None
+    name = request.get("name")
+    if not isinstance(name, str) or not name:
+        name = fid
+    return {"id": request_id, "fid": fid, "name": name}
+
+
+def external_action_target(playback: Any, fid: Any) -> tuple[int, str] | None:
+    """The one native binding that may act for an external ``fid``, or ``None``.
+
+    Only a single binding for exactly this FID that is actually *operable*
+    (``playing`` or ``paused``) counts. With no live binding, more than one
+    instance, or a waiting/suspended/mismatched one there is no unambiguous
+    player to sample or seek, so add/jump stay disabled -- the choice is never
+    made by name. A ``suspended`` same-FID sibling is the server's multi-instance
+    conflict: it is a *second* live instance, so every add/jump for the FID is
+    rejected with 409 ``media_changed`` and no binding may act (a never-streamed
+    ``waiting`` sibling is not a conflict and never blocks). The pid is always a
+    real, positive pid, so the :data:`EXTERNAL_PID` sentinel never reaches an add
+    or jump endpoint.
+    """
+    if not isinstance(fid, str) or not fid or not isinstance(playback, list):
+        return None
+    matches: list[int] = []
+    for row in playback:
+        if not isinstance(row, dict) or row.get("fid") != fid:
+            continue
+        player_pid = row.get("player_pid")
+        if type(player_pid) is not int or player_pid <= EXTERNAL_PID:
+            continue
+        if row.get("state") == "suspended":
+            # Same-FID multi-instance conflict: the server's _suspended(fid)
+            # guard refuses add/jump for the whole FID, so disable it here too.
+            return None
+        if row.get("state") not in _OPERABLE_STATES:
+            continue
+        matches.append(player_pid)
+    if len(matches) != 1:
+        return None
+    return matches[0], fid
+
+
 def restart_enabled(
     connected: bool, playback: Any, selected: Any, pending: bool = False
 ) -> bool:
@@ -636,12 +719,20 @@ class StatusWindow:
         self._rows: dict[str, tuple[Any, Any]] = {}
         self._restart_pending = False
         self._export_pending = False
+        self._rebuilding = False
 
-        # Bookmark manager state: the list always belongs to ``_selected``; a
-        # pending request records the binding it was issued for so a late answer
-        # from another binding is dropped instead of applied.
+        # Bookmark manager state: the list always belongs to the current
+        # binding; a pending request records the ``(player_pid, fid)`` it was
+        # issued for so a late answer from another binding is dropped instead of
+        # applied. ``_external`` is that binding when it was opened by an
+        # external request (FID with the ``EXTERNAL_PID`` sentinel) rather than
+        # by the playback selection. The service retains only the latest request
+        # and the worker delivers snapshots in order, so remembering the last
+        # consumed id is enough to act on each request exactly once.
         self._bookmarks: list[dict[str, Any]] = []
         self._bookmark_pending: tuple[Any, Any] | None = None
+        self._external: dict[str, Any] | None = None
+        self._last_request_id: str | None = None
 
         self._transfer_var: Any = None
         self._transfer_tree: Any = None
@@ -739,6 +830,8 @@ class StatusWindow:
             self._bookmark_window = None
             self._bookmark_tree = None
             self._bookmark_rows = {}
+            self._external = None
+            self._last_request_id = None
             self._bookmark_header_var = None
             self._bookmark_notice_var = None
             self._bookmark_add_button = None
@@ -935,6 +1028,9 @@ class StatusWindow:
         self._snapshot = snapshot
         playback = snapshot.get("playback")
         self._playback = playback if isinstance(playback, list) else []
+        # Consume an external bookmark request before the tables are rebuilt so
+        # the manager is already bound when ``_refresh_playback`` runs.
+        self._consume_bookmark_request(snapshot)
         self._notice_var.set("已连接本地服务")
         self._refresh_transfer(snapshot)
         self._refresh_account(snapshot)
@@ -942,10 +1038,40 @@ class StatusWindow:
         self._refresh_errors(snapshot)
         self._update_actions()
 
+    def _consume_bookmark_request(self, snapshot: dict[str, Any]) -> None:
+        """Open the manager for a new external request; each id runs once.
+
+        The service keeps only the latest request and invalidates it with a new
+        random id, so the last consumed id is enough: a repeated id (a request
+        left in the snapshot) never reopens a window the operator closed, while
+        a *different* id -- even for the same FID -- opens (or retargets) again.
+        """
+        request = bookmark_request_of(snapshot)
+        if request is None or request["id"] == self._last_request_id:
+            return
+        self._last_request_id = request["id"]
+        self._open_external(request)
+
+    def _open_external(self, request: dict[str, Any]) -> None:
+        """Bind the bookmark manager to an external request (Tk thread only)."""
+        self._external = request
+        if self._root is None:
+            return
+        if self._bookmark_live():
+            with contextlib.suppress(Exception):
+                self._bookmark_window.lift()
+        else:
+            self._build_bookmarks()
+        # Drop any list or pending answer of the previous target, then read the
+        # new FID's list exactly once.
+        self._clear_bookmarks()
+        self._request_bookmarks()
+
     def _show_disconnected(self) -> None:
         self._connected = False
         self._snapshot = None
         self._playback = []
+        self._external = None
         self._transfer_var.set("—")
         self._account_var.set("—")
         self._protection_var.set(_DISCONNECTED_NOTE)
@@ -1008,33 +1134,43 @@ class StatusWindow:
         # during ``delete``/``selection_set`` may fire ``_on_select``, and the
         # row is restored afterwards so the bookmark list keeps its binding.
         previous = self._selected
-        tree.delete(*tree.get_children())
-        self._rows = {}
-        restored = False
-        for index, row in enumerate(self._playback):
-            if not isinstance(row, dict):
-                continue
-            iid = f"row{index}"
-            tree.insert(
-                "",
-                "end",
-                iid=iid,
-                values=(
-                    row.get("name") or "—",
-                    format_duration_ms(row.get("position_ms")),
-                    format_duration_ms(row.get("duration_ms")),
-                    state_label(row.get("state")),
-                ),
-            )
-            self._rows[iid] = (row.get("player_pid"), row.get("fid"))
-            if previous is not None and self._rows[iid] == previous:
-                tree.selection_set(iid)
-                tree.focus(iid)
-                restored = True
-        if previous is not None:
-            self._selected = previous if restored else None
+        self._rebuilding = True
+        try:
+            tree.delete(*tree.get_children())
+            self._rows = {}
+            restored = False
+            for index, row in enumerate(self._playback):
+                if not isinstance(row, dict):
+                    continue
+                iid = f"row{index}"
+                tree.insert(
+                    "",
+                    "end",
+                    iid=iid,
+                    values=(
+                        row.get("name") or "—",
+                        format_duration_ms(row.get("position_ms")),
+                        format_duration_ms(row.get("duration_ms")),
+                        state_label(row.get("state")),
+                    ),
+                )
+                self._rows[iid] = (row.get("player_pid"), row.get("fid"))
+                if previous is not None and self._rows[iid] == previous:
+                    tree.selection_set(iid)
+                    tree.focus(iid)
+                    restored = True
+            if previous is not None:
+                self._selected = previous if restored else None
+        finally:
+            self._rebuilding = False
         if self._bookmark_live():
-            if selection_target(self._playback, self._selected) is None:
+            if self._external is not None:
+                # An external target is independent of the playback selection:
+                # keep its list and refresh the header/buttons against the new
+                # snapshot (a matching live player may have appeared or gone).
+                self._refresh_bookmark_header()
+                self._update_bookmark_actions()
+            elif selection_target(self._playback, self._selected) is None:
                 self._clear_bookmarks()
             else:
                 self._refresh_bookmark_header()
@@ -1060,11 +1196,20 @@ class StatusWindow:
             )
 
     def _on_select(self, _event: Any = None) -> None:
+        if self._rebuilding:
+            # Programmatic re-selection during a snapshot rebuild is not a change.
+            return
         selection = self._playback_tree.selection()
         selected = self._rows.get(selection[0]) if selection else None
         if selected == self._selected:
-            # Programmatic re-selection during a snapshot rebuild is not a change.
+            # Re-selecting the current row is not a change. ``ttk`` queues
+            # ``<<TreeviewSelect>>`` and delivers it *after* ``_refresh_playback``
+            # has reset its rebuild flag, so this guard is what keeps the periodic
+            # refresh from dropping an external target bound to the same row.
             return
+        # Explicitly choosing a different playback row leaves external mode and
+        # binds the manager to that row again.
+        self._external = None
         self._selected = selected
         self._update_actions()
         if self._bookmark_live():
@@ -1083,7 +1228,11 @@ class StatusWindow:
         else:
             self._export_button.state(["disabled"])
         busy = self._bookmark_pending is not None
-        if bookmark_enabled(self._connected, self._playback, self._selected, busy):
+        if self._external is not None:
+            enabled = self._connected and not busy
+        else:
+            enabled = bookmark_enabled(self._connected, self._playback, self._selected, busy)
+        if enabled:
             self._bookmark_button.state(["!disabled"])
         else:
             self._bookmark_button.state(["disabled"])
@@ -1137,21 +1286,59 @@ class StatusWindow:
             exists = bool(window.winfo_exists())
         return exists
 
+    def _binding_key(self) -> tuple[int, str] | None:
+        """The ``(player_pid, fid)`` the list currently belongs to, or ``None``.
+
+        External mode carries the :data:`EXTERNAL_PID` sentinel, so its answers
+        are never mistaken for a playback row's.
+        """
+        if self._external is not None:
+            return (EXTERNAL_PID, self._external["fid"])
+        return selection_target(self._playback, self._selected)
+
+    def _binding_name(self) -> str:
+        """The display name of the current binding (external name or the row's)."""
+        if self._external is not None:
+            return self._external["name"] or self._external["fid"]
+        row = match_selection(self._playback, self._selected)
+        name = row.get("name") if row is not None else None
+        return name if isinstance(name, str) and name else "—"
+
+    def _external_action_target(self) -> tuple[int, str] | None:
+        """The one live binding for the external FID, else ``None``."""
+        if self._external is None or not self._connected:
+            return None
+        return external_action_target(self._playback, self._external["fid"])
+
     def _list_target(self) -> tuple[int, str] | None:
-        """The selected binding when the list may address it, else ``None``."""
+        """The binding the list may be read for, else ``None``.
+
+        An external target is always listable while connected -- the local
+        bookmark document needs no live player -- and is addressed with the
+        sentinel pid. A playback target needs a matched, connected binding.
+        """
         if not self._bookmark_live() or self._bookmark_pending is not None:
             return None
+        if self._external is not None:
+            if not self._connected:
+                return None
+            return (EXTERNAL_PID, self._external["fid"])
         if not bookmark_enabled(self._connected, self._playback, self._selected):
             return None
         return selection_target(self._playback, self._selected)
 
     def _action_target(self) -> tuple[int, str] | None:
-        """The selected binding when the player can still be asked to add/jump."""
-        if not self._bookmark_live():
+        """The binding the player can still be asked to sample/seek for add/jump.
+
+        An external target resolves only when exactly one operable binding of
+        that FID is live, and always returns its *real* pid, so the sentinel
+        never reaches an add or jump endpoint.
+        """
+        if not self._bookmark_live() or self._bookmark_pending is not None:
             return None
-        if not bookmark_action_enabled(
-            self._connected, self._playback, self._selected, self._bookmark_pending is not None
-        ):
+        if self._external is not None:
+            return self._external_action_target()
+        if not bookmark_action_enabled(self._connected, self._playback, self._selected):
             return None
         return selection_target(self._playback, self._selected)
 
@@ -1179,10 +1366,13 @@ class StatusWindow:
             var.set(text)
 
     def _open_bookmarks(self) -> None:
-        """Open (or re-read) the bookmark manager for the selected binding."""
+        """Open (or re-read) the bookmark manager for the current binding."""
         if self._root is None:
             return
-        if not bookmark_enabled(
+        if self._external is not None:
+            if not self._connected or self._bookmark_pending is not None:
+                return
+        elif not bookmark_enabled(
             self._connected, self._playback, self._selected, self._bookmark_pending is not None
         ):
             return
@@ -1271,6 +1461,9 @@ class StatusWindow:
 
     def _close_bookmarks(self) -> None:
         """Tk thread only: destroy the manager window and drop its state."""
+        # Leaving the manager also leaves external mode; the consumed request
+        # ids stay, so the very same request never reopens a closed window.
+        self._external = None
         self._clear_bookmarks()
         window, self._bookmark_window = self._bookmark_window, None
         if window is not None:
@@ -1329,7 +1522,7 @@ class StatusWindow:
         if not self._bookmark_live() or not isinstance(value, tuple) or len(value) != 3:
             return
         player_pid, fid, items = value
-        if (player_pid, fid) != selection_target(self._playback, self._selected):
+        if (player_pid, fid) != self._binding_key():
             return
         self._bookmark_pending = None
         if items is None:
@@ -1342,8 +1535,15 @@ class StatusWindow:
         # renamed, removed or jumped, and the header count is the visible one.
         self._bookmarks = [entry for entry in items if bookmark_id_of(entry) is not None]
         self._render_bookmarks()
-        self._settle_bookmark_notice(f"已读取 {len(self._bookmarks)} 条书签")
+        self._settle_bookmark_notice(self._load_notice())
         self._update_actions()
+
+    def _load_notice(self) -> str:
+        """The list-load result, with the fixed reason when add/jump are offline."""
+        loaded = f"已读取 {len(self._bookmarks)} 条书签"
+        if self._external is not None and self._external_action_target() is None:
+            return f"{loaded}　{_BOOKMARK_EXTERNAL_REASON}"
+        return loaded
 
     def _apply_bookmark_result(self, value: Any, done: str, failed: str, *, refresh: bool) -> None:
         """Apply one add/rename/remove/jump answer for the binding that asked."""
@@ -1393,9 +1593,12 @@ class StatusWindow:
     def _refresh_bookmark_header(self) -> None:
         if self._bookmark_header_var is None:
             return
-        row = match_selection(self._playback, self._selected)
-        name = (row.get("name") if row is not None else None) or "—"
-        self._bookmark_header_var.set(f"当前视频：{name}　书签：{len(self._bookmarks)} 条")
+        header = f"当前视频：{self._binding_name()}　书签：{len(self._bookmarks)} 条"
+        if self._external is not None and self._external_action_target() is None:
+            # The list/rename/remove work offline; add/jump cannot, so say so
+            # right where the operator looks for the video.
+            header = f"{header}　{_BOOKMARK_EXTERNAL_REASON}"
+        self._bookmark_header_var.set(header)
 
     def _on_bookmark_select(self, _event: Any = None) -> None:
         self._update_bookmark_actions()
@@ -1404,11 +1607,13 @@ class StatusWindow:
         if self._root is None or not self._bookmark_live():
             return
         busy = self._bookmark_pending is not None
-        listing = bookmark_enabled(self._connected, self._playback, self._selected, busy)
-        acting = bookmark_action_enabled(
-            self._connected, self._playback, self._selected, busy
-        )
-        # Jump needs a row of the *attached* list of the selected binding: before
+        if self._external is not None:
+            listing = self._connected and not busy
+            acting = self._external_action_target() is not None and not busy
+        else:
+            listing = bookmark_enabled(self._connected, self._playback, self._selected, busy)
+            acting = bookmark_action_enabled(self._connected, self._playback, self._selected, busy)
+        # Jump needs a row of the *attached* list of the current binding: before
         # that list has arrived -- or after it was dropped -- nothing can be
         # selected, so jump stays disabled exactly like rename and remove.
         chosen = self._selected_bookmark() is not None

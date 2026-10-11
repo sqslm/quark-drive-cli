@@ -107,7 +107,7 @@
 
 ## 搜索、收藏、最近与继续观看
 
-扩展开关在根页面选择类别：`drive`（我的网盘）、`search`（`type=search`，用 Query 输入关键词）、`favorites`、`recent`、`continue`（继续观看）。搜索只在根页面消费 `Query`；进入结果目录后按 `PathToken` 里的 FID 正常浏览，不再使用 `Query`。
+扩展开关在根页面选择类别：`drive`（我的网盘）、`search`（`type=search`，用 Query 输入关键词）、`favorites`、`recent`、`continue`（追剧中心（继续观看））。搜索只在根页面消费 `Query`；进入结果目录后按 `PathToken` 里的 FID 正常浏览，不再使用 `Query`。
 
 ### `GET /v1/search?q=<keyword>&page=<n>&size=<n>`
 
@@ -156,6 +156,26 @@
 
 本机历史里**可续播且尚未看完**的视频，最近有进度者在前。过滤规则与播放器的续播判断一致：续播点至少 15 秒，且距结尾仍超过 `min(30 秒, 时长的 2%)`；手动标记为已看或已看完的视频不出现。返回与 `/v1/recent` 相同的行结构（不含 `played_at`）。纯本地读取，不向上游发请求。
 
+该接口保持原有扁平结构不变（0.8.0 未改动）；追剧中心根页用的是下面的 `/v1/watch-center`。
+
+### `GET /v1/watch-center`
+
+本机观看记录的分组视图，供扩展的“追剧中心（继续观看）”根页使用。**不需要**夸克登录，纯本地读取，不向上游发请求。返回：
+
+```json
+{"items":[{"kind":"series","key":"...","parent":"...","name":"剧集","display":"剧集 · 上次：第9集.mp4 · 已看5%",
+  "latest":{"fid":"...","name":"第9集.mp4","is_dir":false,"size":123,"parent":"...","watched":false,
+    "position_ms":90000,"duration_ms":1800000,"display":"第9集.mp4 · 已看 5%"},
+  "unfinished_count":2}]}
+```
+
+- 按最近观看记录中**真实的非根父目录 FID** 分组：同一目录的视频合成一条 `kind` 为 `series` 的条目；同名但 FID 不同的目录**分开**成多条，不按名字合并。分组按各自最近一集的时间从新到旧排列。
+- 根目录（存储的 `parent` 为 `0`）或无法确认所属目录的视频各自单列一条 `kind` 为 `video` 的条目，用原文件名，不猜测剧名或类型。
+- `key` 为分组标识（剧集分组为目录 FID，单集为视频 FID）；`parent` 为该分组视频真实所在目录的 FID（根/无法确认时为空串）。`name`：单集为该文件自己的名字；剧集分组为**已验证**的目录名（组件已经拉取过的目录清单，或记录里存的目录名），都确认不了时用固定占位“来源目录未命名”——它从不使用窗口标题、不猜剧名，也不为此新增任何云端请求。
+- `display` 是给列表用的标题：剧集分组为“目录名 · 上次：<最近一集名>”再加那一集自己的进度（“ · 已看”或“ · 已看<百分比>”，此处进度紧接百分号，如“ · 已看5%”）；单集为文件名加同样的进度。它只反映**那一条最近记录**的进度，不代表目录总集数或整季是否看完。
+- `latest` 为该分组最近观看过的一集视图（`fid`/`name`/`is_dir`/`size`/`parent`/`watched`/`position_ms`/`duration_ms`/`display`），按 `max(played_at, progress_at)` 取最新；`unfinished_count` 为该分组里仍可续播且未看完的视频数（判定与续播规则一致，并排除已标记已看）——已经全部看完的分组同样会列出，此时 `unfinished_count` 为 `0`。
+- 该接口只读本地 `library.json`，不做后台扫描，也不为此发起任何云端请求。
+
 ### `GET /v1/series?parent=<目录 fid>`
 
 某目录的继续观看目标与逐集状态。`parent` 必填，缺失/非法 → `400 bad_request`。只列出该目录本身一次（按自然顺序的视频），携带进度：
@@ -163,11 +183,20 @@
 ```json
 {"parent":"...","total":3,"watched":1,"complete":false,
  "continue":{"fid":"...","name":"第10集.mp4","position_ms":90000,"duration_ms":1800000,"display":"第10集.mp4 · 已看 5%"},
+ "latest":{"fid":"...","name":"第9集.mp4","position_ms":90000,"duration_ms":1800000,"display":"第9集.mp4 · 已看 5%"},
+ "next":{"fid":"...","name":"第10集.mp4","position_ms":0,"duration_ms":0,"display":"第10集.mp4"},
  "episodes":[{"fid":"...","name":"第2集.mp4","size":123,"watched":false,
    "position_ms":0,"duration_ms":0,"display":"第2集.mp4"}]}
 ```
 
 `watched` 为“手动标记已看 **或** 实际播放到结尾”的集数（用同一个 `min(30 秒, 2%)` 结尾窗口判定，位置为 0 或时长未知时不算已看）。`continue` 取进度最新的一集未看完视频；没有未看完的则取自然顺序里第一集未看的；整目录都看完时 `complete` 为 `true`、`continue` 为 `null`，扩展显示完成状态行而不会从头重播。目录中视频的名称、大小与归属只取服务端目录清单，存储里的旧名称/旧目录不会被采信。
+
+`latest` 与 `next` 是 0.8.0 新增的两个**可空**单集视图，现有字段（`parent`/`total`/`watched`/`complete`/`continue`/`episodes`）语义不变：
+
+- `latest`：该目录里最近观看过的一集（本机记录）。只有仍出现在本次目录清单中且**大小一致**的记录才算：被替换成不同大小的旧记录（`size` 不符）既不能作为 `latest`，其保存的续播点也被忽略——`episodes` 里该集按“无保存进度”处理（`position_ms`/`duration_ms` 为 `0`，除非被显式标记已看）。
+- `next`：**本次目录清单**里自然顺序中 `latest` 的下一集，名称、大小等元数据全部取本次清单（与 `latest` 同由这一份清单推出，**不**读取该下一集的本机记录，也不要求它有同大小的记录）。`latest` 已是最后一集时为 `null`，**不会**回绕到第一集。`latest` 为 `null` 时（本机没有该目录可用的记录）改为给出清单里自然顺序第一集未看的（都看完则 `null`）。
+- 两个视图都带 `episodes` 每项相同的字段，另含该集的 `is_dir`、`parent`、`unfinished`（是否仍可续播且未看完）与 `progress_at`（本机保存时间）；这些附加字段只用于分组页的排序与“下一集”判断，`episodes` 列表本身仍只有既有字段。
+- 两者都只由本机记录与本次目录清单推出，不额外猜测剧集名或顺序。完成判定同理：仅当本次清单**完整、非空且每一集都已看**时 `complete` 才为 `true`（空清单或只有非视频文件时 `complete` 为 `false`）。
 
 ### `POST /v1/mark`
 
@@ -180,11 +209,18 @@
 
 清空本机最近记录，幂等；请求体按通用规则读完有界内容后忽略，返回 `{"items":[]}`（扩展固定发送一个非空 JSON 请求体）。
 
+### `POST /v1/recent/remove`
+
+请求体 `{"fid":"<视频 fid>"}`。只从本机最近记录里删除**该视频这一条**（连同它的续播点），返回 `{"status":"removed"}`；FID 不存在或已经删除也返回同样结果（**幂等**）。`fid` 缺失/空 → `400 bad_request`。
+
+**不访问夸克**，也不改动收藏、独立的“已看”标记（`marks`）或播放书签；**不会**对播放器跳转或停止，播放本身继续，但该 `fid` 的实时监控会被抑制：正在播放的会话不再把这条观看历史与进度写回，删除**不会**被在途写入或关闭时的保存复活——只有再次显式播放（新的 `/v1/play`）才恢复该视频的记录与进度写入。
+
 ### 写入时机与数据边界
 
 - 最近记录在**首个非空媒体块成功转发之后**写入，不等整集传输结束：取链、`HEAD`、未转发任何媒体字节的失败 `GET` 不记录。已经开始传输后再关闭、拖动或遇到上游中断，已写入的记录仍保留；每个 HTTP 请求只记一次，不按分段或数据块重复写盘。
 - 收藏与最近观看存放在插件私有目录 `config_directory()/potplayer/library.json`（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。文件版本 2 起，最近观看条目另含观看进度字段 `position_ms`、`duration_ms`、`progress_at`（本机时间）；版本 3 起另含真实 `parent` 目录 FID，并新增独立的 `marks` 列表保存显式“已看”标记（不受 100 条最近上限影响）；`marks` 按 FID **和大小** 记录，FID 被替换成不同大小的文件时不会继承旧的已看标记。版本 4 起，最近观看条目另存真实目录名 `parent_name`：它只取自桥接**已经拉取过**的目录清单或“收藏目录”，从不使用窗口标题、从不猜测剧名、也不为此新增任何云端请求；`/v1/recent` 与 `/v1/continue` 的 `display` 因此显示“目录名 / 原文件名”，无法确认所属目录（含根目录，`parent` 为 `0`）时保留原文件名。版本 1/2/3 记录可正常读取，读取时不改写文件，仅在下次正常写入时才就地升级为版本 4，既有收藏/最近观看不受影响。
 - 显式插件退出登录（`POST /v1/auth/logout`）会一并清空这两份列表及其中的观看进度；本地清理失败时返回 `500 local_io_error`，凭证仍已失效，不误报清理成功。登录过期只要求重新扫码，不清空。跨进程重启与升级保留。
+- `/v1/watch-center`、`/v1/recent/remove`、`/v1/bookmarks/*` 与 `/v1/diagnostics*` 都只要求本地 Bearer，**不需要**夸克登录：`watch-center` 只读本地 `library.json`（不扫盘、不联网）；`recent/remove` 只删本地那一条观看记录，不动云端文件、收藏、`marks` 或书签；`bookmarks/open` 只打开本机窗口。它们都不改变视频落盘策略：无分片、无磁盘缓存、无转码、无后台扫描，也不存在向云端回传记录或报告的步骤。
 
 ## 播放流
 
@@ -207,7 +243,7 @@
 
 ### 播放进度（本机）
 
-- 播放期间组件按绑定核对当前播放器进度，并把位置写入 `library.json` 中该最近观看条目的进度字段（`position_ms`、`duration_ms`、`progress_at`）。显式标记为已看的视频既不续播也不再写入真实进度，直到标记被清除。`/v1/recent`、`/v1/continue`、`/v1/series` 会把这些字段转为只读视图；`progress_at` 本身不作为公共响应字段暴露。
+- 播放期间组件按绑定核对当前播放器进度，并把位置写入 `library.json` 中该最近观看条目的进度字段（`position_ms`、`duration_ms`、`progress_at`）。显式标记为已看的视频既不续播也不再写入真实进度，直到标记被清除。`/v1/recent`、`/v1/continue`、`/v1/series` 会把这些字段转为只读视图；其中 `progress_at` 只在 `/v1/series` 的 `latest`/`next` 单集视图里出现（用于分组页排序与判断），`/v1/recent`、`/v1/continue` 与 `/v1/watch-center` 都不暴露它。
 - 读取频率约每 2 秒一次，落盘约每 10 秒一次，并在暂停、切换集数与关闭时各写一次。保存位置不足 15 秒时不续播；剩余时长不足 `min(30 秒, 时长 2%)` 时不回跳（从 0 开始）也不计为已看完；保存时的文件大小或时长与当前明显不符时不套用旧进度。
 - 首次读到播放器位置已超过约 5 秒（例如用户手动拖过）时，尊重播放器当前位置，组件**不**把它强行拉回保存点。
 - 绑定标识为播放器窗口进程 PID 与完整逻辑 fid 地址（`https://quark.invalid/{video,play}/<fid>`）；不使用文件名、窗口标题或下载字节比例推断归属。同一 fid 被多个实例同时打开时暂停该 fid 的进度写入，实例减少后恢复。
@@ -228,7 +264,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.7.0", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.8.0", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -238,6 +274,7 @@
 - `account.validation` 取 `no_login` / `saved_unverified` / `recently_valid` / `expired`：前两者只表示“无凭证/凭证已保存但尚未验证”，`recently_valid` 只表示最近一次普通调用成功，不能证明账号当前未被限制；组件不会为此额外联网校验。
 - `transfer.totals`/`plays` 统计的是**实际转发的字节**，重复拖动同一区间会重复计入；`speed_bytes_per_second` 为最近 5 秒平均转发速率，`last_elapsed_ms` 为最近一次上游响应头耗时。均为被动统计，不发起探针、缓冲或码率估算。
 - `errors.events` 为固定（白名单）字段与固定中文 `message`，只保留最近 20 条，不含上游原文。`playback` 是本机绑定列表（含本机 `name`，仅本接口返回）；`protection` 反映与 CLI 共用的请求冷却，本地冷却状态不可读时 `available` 为 `false` 并给出固定 `instruction`。
+- 快照带字段 `bookmark_request`：当前没有待处理请求时为 `null`（**绝不**给出 `id`/`fid` 为空的请求）；有请求时为 `{"id":…,"fid":…,"name":…}`，`id`（随机唯一）与 `fid` 都是**非空字符串**，`name` 只取自本机记录（最近记录、书签，否则固定中性名），**仅**供本机 GUI 定位该视频使用。它**不会**出现在 `/v1/diagnostics/report` 的导出报告里（报告不含 FID/文件名，见下）。
 
 ### `GET /v1/diagnostics/report`
 
@@ -265,13 +302,14 @@
 
 ### 播放书签（本机）
 
-需 Bearer；纯本机读写，**不需要**夸克登录，未登录/登录过期/冷却中均可使用。书签按视频 fid 归属，只保存本机时间点、时长与备注，不含 Cookie、令牌或签名地址；状态窗口的“播放书签”按钮即调用这五个接口。
+需 Bearer；纯本机读写，**不需要**夸克登录，未登录/登录过期/冷却中均可使用。书签按视频 fid 归属，只保存本机时间点、时长与备注，不含 Cookie、令牌或签名地址。状态窗口的“播放书签”按钮，以及最近观看/追剧中心里每个视频的“播放书签”操作，都调用下面这组接口（0.8.0 新增 `/v1/bookmarks/open`，可离线按指定视频打开窗口）。
 
 - `GET /v1/bookmarks?fid=<视频 fid>` → `{"items":[{"id":"…","fid":"…","name":"…","size":123,"position_ms":0,"duration_ms":0,"note":""}]}`。`fid` 必填，最近添加在前；无书签时 `items` 为空数组。
 - `POST /v1/bookmarks/add`，请求体 `{"player_pid":1234,"fid":"…","note":"…"}`（`player_pid` 为**严格 JSON 整数**，`note` 为字符串、最长 200 个字符、**可以为空**）→ `200 {"bookmark":{…}}`。时间点与时长取自播放器的实时采样，**不信任**客户端提供的时间、名称或大小。
 - `POST /v1/bookmarks/rename`，请求体 `{"id":"…","note":"…"}`（同样可空、最长 200 字符）→ `200 {"status":"renamed"}`；`id` 不存在 → `404 not_found`。
 - `POST /v1/bookmarks/remove`，请求体 `{"id":"…"}` → `200 {"status":"removed"}`；`id` 不存在 → `404 not_found`。
 - `POST /v1/bookmarks/jump`，请求体 `{"player_pid":1234,"fid":"…","id":"…"}` → `200 {"status":"jumped"}`。
+- `POST /v1/bookmarks/open`，请求体 `{"fid":"<视频 fid>"}` → `202 {"status":"opened"}`；当本机**已有一个状态窗口进程在运行**、直接复用它时 → `202 {"status":"already_open"}`（`already_open` 只表示复用了**已运行的状态窗口进程**，**不**代表该视频的书签管理窗口已打开——GUI 会按本次请求的 `id` 重新定位并打开指定视频的书签窗口）。异步打开/复用**指定视频**的播放书签管理窗口，纯本机，**不需要**夸克登录，也不要求该视频正在播放；`fid` 缺失/空 → `400 bad_request`。窗口内可列出、重命名、删除该书签（离线可用）；**添加书签**与**跳转**仍只在该 fid 当前唯一绑定且可操作时可用（该 PID 正在播放同一文件、非多实例、且有原生读取能力），不满足时按钮不可用——与状态窗口里的行为、以及按“PID + 完整逻辑文件地址”的严格身份核对完全一致。
 
 `add`/`jump` 只对**当前正在播放同一逻辑文件**的绑定生效，并核对实时身份：该 PID 没有绑定、播放器中的文件不符、同一 fid 被多实例打开、或本机缺少原生读取能力时返回 `409 media_changed`；`add` 在位置无效（为 0 或已在结尾）时同样失败，但它始终记录当前文件的真实时间点，因此文件换了大小/时长后仍可对新文件添加书签；`jump` 额外在书签保存的大小/时长与当前文件明显不符时失败（指向旧文件的旧书签因此不可跳转）。参数、`fid`、`id` 或备注非法（含 `note` 非字符串或超过 200 字符）→ `400 bad_request`；写入路由只接受 `POST`，任何其它方法（含 `HEAD`）都只会得到 `405 method_not_allowed`，不会执行写入。`GET`/`rename`/`remove` 只读写本地文件，不访问夸克；`add`/`jump` 也不产生额外的云请求。
 

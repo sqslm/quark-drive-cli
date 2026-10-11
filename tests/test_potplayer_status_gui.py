@@ -1280,6 +1280,275 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertEqual(window._requests.get_nowait(), ("bookmarks", 1, "F1"))
 
 
+def _external_request(request_id: str = "r1", fid: str = "F1", name: str = "外部视频.mkv") -> dict:
+    return {"id": request_id, "fid": fid, "name": name}
+
+
+class ExternalBookmarkRequestTests(unittest.TestCase):
+    """The pure helpers behind opening a FID that the playback table may not show."""
+
+    def test_only_a_well_formed_request_is_accepted(self):
+        self.assertEqual(
+            status_gui.bookmark_request_of(
+                {"bookmark_request": {"id": "r1", "fid": "F1", "name": "A.mkv"}}
+            ),
+            {"id": "r1", "fid": "F1", "name": "A.mkv"},
+        )
+        # A missing or blank name falls back to the FID, never to some title.
+        for name in (None, ""):
+            request = {"id": "r1", "fid": "F1", "name": name}
+            self.assertEqual(
+                status_gui.bookmark_request_of({"bookmark_request": request}),
+                {"id": "r1", "fid": "F1", "name": "F1"},
+            )
+        for bad in (
+            None,
+            {},
+            {"bookmark_request": None},
+            {"bookmark_request": "F1"},
+            {"bookmark_request": {"fid": "F1"}},
+            {"bookmark_request": {"id": "", "fid": "F1"}},
+            {"bookmark_request": {"id": 1, "fid": "F1"}},
+            {"bookmark_request": {"id": "r1"}},
+            {"bookmark_request": {"id": "r1", "fid": ""}},
+            {"bookmark_request": {"id": "r1", "fid": 7}},
+        ):
+            self.assertIsNone(status_gui.bookmark_request_of(bad))
+
+    def test_the_action_target_needs_one_operable_binding(self):
+        def rows(*states, pid=1, fid="F1"):
+            return [
+                {"player_pid": pid + i, "fid": fid, "name": "A.mkv", "state": state}
+                for i, state in enumerate(states)
+            ]
+
+        self.assertEqual(status_gui.external_action_target(rows("playing"), "F1"), (1, "F1"))
+        self.assertEqual(status_gui.external_action_target(rows("paused"), "F1"), (1, "F1"))
+        # A binding that is not actually playing is no action target at all.
+        for state in ("waiting", "unknown", "stopped", "suspended", "mismatch", "missing"):
+            self.assertIsNone(status_gui.external_action_target(rows(state), "F1"))
+        # Only the exact FID counts and the binding must carry a real pid.
+        self.assertIsNone(status_gui.external_action_target(rows("playing"), "F2"))
+        self.assertIsNone(status_gui.external_action_target(rows("playing"), ""))
+        self.assertIsNone(
+            status_gui.external_action_target(
+                [{"player_pid": 0, "fid": "F1", "state": "playing"}], "F1"
+            )
+        )
+        self.assertIsNone(
+            status_gui.external_action_target(
+                [{"player_pid": "1", "fid": "F1", "state": "playing"}], "F1"
+            )
+        )
+
+    def test_multiple_matching_instances_are_never_guessed_apart(self):
+        two = [
+            {"player_pid": 1, "fid": "F1", "name": "A.mkv", "state": "playing"},
+            {"player_pid": 3, "fid": "F1", "name": "A.mkv", "state": "playing"},
+        ]
+        self.assertIsNone(status_gui.external_action_target(two, "F1"))
+        # One operable plus a not-operable duplicate is still exactly one candidate.
+        mixed = two[:1] + [
+            {"player_pid": 3, "fid": "F1", "name": "A.mkv", "state": "waiting"}
+        ]
+        self.assertEqual(status_gui.external_action_target(mixed, "F1"), (1, "F1"))
+
+    def test_a_suspended_sibling_blocks_an_operable_instance(self):
+        # Two same-FID instances are really active (one playing, one suspended by
+        # the same-FID conflict): the server's _suspended(fid) guard refuses
+        # add/jump with 409 media_changed, so no order may enable the action.
+        playing = {"player_pid": 1, "fid": "F1", "name": "A.mkv", "state": "playing"}
+        suspended = {"player_pid": 2, "fid": "F1", "name": "A.mkv", "state": "suspended"}
+        self.assertIsNone(status_gui.external_action_target([playing, suspended], "F1"))
+        self.assertIsNone(status_gui.external_action_target([suspended, playing], "F1"))
+        self.assertIsNone(
+            status_gui.external_action_target(
+                [playing, suspended, {"player_pid": 3, "fid": "F1", "state": "paused"}],
+                "F1",
+            )
+        )
+        # A never-streamed waiting sibling is not a live conflict: the single
+        # operable binding still acts, in either order.
+        waiting = {"player_pid": 3, "fid": "F1", "name": "A.mkv", "state": "waiting"}
+        self.assertEqual(
+            status_gui.external_action_target([playing, waiting], "F1"), (1, "F1")
+        )
+        self.assertEqual(
+            status_gui.external_action_target([waiting, playing], "F1"), (1, "F1")
+        )
+        # A suspended row for another FID, or one without a real pid, never blocks.
+        self.assertEqual(
+            status_gui.external_action_target(
+                [playing, {"player_pid": 4, "fid": "F2", "state": "suspended"}], "F1"
+            ),
+            (1, "F1"),
+        )
+        self.assertEqual(
+            status_gui.external_action_target(
+                [playing, {"player_pid": 0, "fid": "F1", "state": "suspended"}], "F1"
+            ),
+            (1, "F1"),
+        )
+
+
+class ExternalBookmarkWindowTests(unittest.TestCase):
+    """The manager bound to a request FID rather than to the playback selection."""
+
+    def _snapshot(self, window, request_id="r1"):
+        return {
+            "account": {},
+            "transfer": {"totals": {}, "plays": []},
+            "errors": {"count": 0, "events": []},
+            "playback": list(window._playback),
+            "bookmark_request": _external_request(request_id),
+        }
+
+    def test_an_external_request_opens_the_manager_without_any_playback(self):
+        window = _status_window(rows=[], selected=None)
+        window._apply_snapshot(self._snapshot(window))
+        self.assertEqual(window._external, _external_request())
+        self.assertEqual(window._requests.get_nowait(), ("bookmarks", 0, "F1"))
+        self.assertIn("外部视频.mkv", window._bookmark_header_var.value)
+        self.assertIn(status_gui._BOOKMARK_EXTERNAL_REASON, window._bookmark_header_var.value)
+        self.assertFalse(window._bookmark_add_button.enabled)
+        self.assertFalse(window._bookmark_jump_button.enabled)
+        self.assertTrue(window._requests.empty())
+
+    def test_each_request_id_runs_once_and_a_new_id_runs_again(self):
+        window = _status_window()
+        window._apply_snapshot(self._snapshot(window, "r1"))
+        self.assertEqual(window._requests.get_nowait(), ("bookmarks", 0, "F1"))
+        # The very same request surviving later polls must not re-read the list.
+        window._apply_snapshot(self._snapshot(window, "r1"))
+        window._apply_snapshot(self._snapshot(window, "r1"))
+        self.assertTrue(window._requests.empty())
+        # A different id -- even for the same FID -- retargets and reads again.
+        window._apply_snapshot(self._snapshot(window, "r2"))
+        self.assertEqual(window._requests.get_nowait(), ("bookmarks", 0, "F1"))
+        self.assertTrue(window._requests.empty())
+
+    def test_a_queued_reselect_after_a_refresh_keeps_the_external_target(self):
+        window = _status_window(selected=(1, "F1"))
+        window._external = _external_request()
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        # A rebuild restores the same row and queues <<TreeviewSelect>>, which Tk
+        # delivers *after* ``_refresh_playback`` has reset its rebuild flag.
+        window._refresh_playback()
+        self.assertEqual(window._playback_tree.selected, ("row0",))
+        self.assertFalse(window._rebuilding)
+        window._on_select()  # the queued event, delivered too late for the flag
+        self.assertEqual(window._external, _external_request())
+        self.assertEqual(window._bookmarks, [dict(BOOKMARK_ENTRY)])
+        self.assertTrue(window._requests.empty())
+
+    def test_a_periodic_snapshot_keeps_the_external_target_across_queued_events(self):
+        window = _status_window(selected=(1, "F1"))
+        window._apply_snapshot(self._snapshot(window))
+        self.assertEqual(window._requests.get_nowait(), ("bookmarks", 0, "F1"))
+        window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
+        # A later poll with the same request: no re-read, and the rebuild's
+        # queued selection event must not drop the external target or its list.
+        window._apply_snapshot(self._snapshot(window))
+        window._on_select()
+        self.assertEqual(window._external, _external_request())
+        self.assertEqual(window._bookmarks, [dict(BOOKMARK_ENTRY)])
+        self.assertTrue(window._requests.empty())
+
+    def test_an_explicit_different_row_leaves_external_mode(self):
+        window = _status_window(selected=(1, "F1"))
+        window._external = _external_request()
+        window._rows = {"row0": (1, "F1"), "row1": (2, "F2")}
+        window._playback_tree.selected = ("row1",)
+        window._on_select()
+        self.assertIsNone(window._external)
+        self.assertEqual(window._selected, (2, "F2"))
+        self.assertEqual(window._requests.get_nowait(), ("bookmarks", 2, "F2"))
+
+    def test_external_add_and_jump_use_the_one_real_pid_never_the_sentinel(self):
+        window = _status_window()
+        window._external = _external_request()
+        window._bookmark_pending = (0, "F1")
+        window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
+        window._bookmark_tree.selected = ("mark0",)
+        window._on_bookmark_select()
+        self.assertTrue(window._bookmark_add_button.enabled)
+        self.assertTrue(window._bookmark_jump_button.enabled)
+        window._simpledialog = _FakeDialog(answer="第 3 分钟")
+        window._add_bookmark()
+        self.assertEqual(window._requests.get_nowait(), ("bookmark_add", 1, "F1", "第 3 分钟"))
+        window._bookmark_pending = None
+        window._jump_bookmark()
+        self.assertEqual(window._requests.get_nowait(), ("bookmark_jump", 1, "F1", "b1"))
+
+    def test_external_mismatch_or_multi_instance_disables_add_and_jump(self):
+        cases = (
+            [{"player_pid": 1, "fid": "F2", "name": "B.mkv", "state": "playing"}],
+            [
+                {"player_pid": 1, "fid": "F1", "name": "A.mkv", "state": "playing"},
+                {"player_pid": 3, "fid": "F1", "name": "A.mkv", "state": "playing"},
+            ],
+            [{"player_pid": 1, "fid": "F1", "name": "A.mkv", "state": "waiting"}],
+        )
+        for rows in cases:
+            window = _status_window(rows=rows, selected=None)
+            window._external = _external_request()
+            window._bookmark_pending = (0, "F1")
+            window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
+            window._bookmark_tree.selected = ("mark0",)
+            window._on_bookmark_select()
+            self.assertFalse(window._bookmark_add_button.enabled)
+            self.assertFalse(window._bookmark_jump_button.enabled)
+            self.assertTrue(window._bookmark_rename_button.enabled)
+            self.assertTrue(window._bookmark_remove_button.enabled)
+            self.assertIn(status_gui._BOOKMARK_EXTERNAL_REASON, window._bookmark_header_var.value)
+            window._add_bookmark()
+            window._jump_bookmark()
+            self.assertTrue(window._requests.empty())  # no pid 0 ever reaches the bridge
+
+    def test_external_offline_rename_and_remove_use_the_sentinel(self):
+        window = _status_window(rows=[], selected=None)
+        window._external = _external_request()
+        window._bookmark_pending = (0, "F1")
+        window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
+        window._bookmark_tree.selected = ("mark0",)
+        window._on_bookmark_select()
+        window._simpledialog = _FakeDialog(answer="新备注")
+        window._rename_bookmark()
+        self.assertEqual(
+            window._requests.get_nowait(), ("bookmark_rename", 0, "F1", "b1", "新备注")
+        )
+        window._bookmark_pending = None
+        window._remove_bookmark()
+        self.assertEqual(window._requests.get_nowait(), ("bookmark_remove", 0, "F1", "b1"))
+
+    def test_late_answers_for_another_binding_are_dropped(self):
+        window = _status_window()
+        window._external = _external_request()
+        window._bookmark_pending = (0, "F1")
+        window._handle("bookmarks", (1, "F1", [dict(BOOKMARK_ENTRY)]))
+        self.assertEqual(window._bookmarks, [])
+        self.assertEqual(window._bookmark_pending, (0, "F1"))
+        window._handle("bookmark_added", (1, "F1", True))
+        self.assertEqual(window._bookmark_pending, (0, "F1"))
+        window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
+        self.assertIsNone(window._bookmark_pending)
+        self.assertIn("书签：1 条", window._bookmark_header_var.value)
+
+    def test_closing_drops_external_and_the_same_id_never_reopens(self):
+        window = _status_window()
+        window._apply_snapshot(self._snapshot(window, "r1"))
+        window._requests.get_nowait()
+        window._close_bookmarks()
+        self.assertIsNone(window._external)
+        self.assertIsNone(window._bookmark_window)
+        # The consumed id stays, so the same request never reopens the window.
+        window._apply_snapshot(self._snapshot(window, "r1"))
+        self.assertTrue(window._requests.empty())
+        window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
+        self.assertEqual(window._bookmarks, [])
+
+
 class NamingTests(unittest.TestCase):
     def test_default_export_name_has_a_sortable_timestamp(self):
         name = default_export_name(datetime(2026, 10, 10, 17, 24, 15))

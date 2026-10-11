@@ -518,6 +518,171 @@ class MonitorCase(unittest.TestCase):
             monitor._apply_flush(task)
         self.assertEqual(library.saves, [])
 
+    def test_forget_rejects_a_write_decided_before_it_and_keeps_the_new_play(self):
+        # The review's race: a write whose epoch was captured *before* the
+        # removal must never land after the row was deleted and a brand-new
+        # explicit play recorded a fresh point for the same FID/size.
+        library = RecordingLibrary(self.path)
+        self.library = library
+        library.record_recent("v1", "a.mp4", 100)
+        monitor = self.monitor()
+        decided = monitor._progress_epoch  # the delayed write's captured epoch
+        monitor.forget_fid("v1")            # the removal bumps it once
+        self.assertGreater(monitor._progress_epoch, decided)
+        library.remove_recent("v1")
+        # A new explicit play rebinds a fresh, unsuppressed binding and records.
+        library.record_recent("v1", "a.mp4", 100)
+        monitor.bind(session(sid="sess-2"), 200)
+        self.start(monitor, sid="sess-2")
+        self.player.feed(200, sample(200, position_ms=900_000))
+        monitor._poll_once()  # restore pass
+        self.clock.advance(11.0)
+        monitor._poll_once()  # write pass
+        self.assertEqual(library.progress("v1", 100)["position_ms"], 900_000)
+        library.saves.clear()
+        # The delayed decision is finally released, carrying its stale epoch.
+        self.assertFalse(monitor._save_progress("v1", 100, 50_000, 1_800_000, decided))
+        self.assertEqual(library.saves, [])
+        self.assertEqual(library.progress("v1", 100)["position_ms"], 900_000)
+
+    def test_queued_flush_from_a_dropped_pid_never_resurrects_a_forgotten_row(self):
+        # The exact queued-flush window: a last-good flush is queued for pid 100
+        # on fid v1, then the pid is re-bound to another file, so the *current*
+        # binding is a different FID and the generation check cannot reject the
+        # stale point. /v1/recent/remove then deletes v1's row and a brand-new
+        # explicit play records v1 again from a different pid. The old flush,
+        # released only afterwards, must not overwrite the fresh row.
+        library = RecordingLibrary(self.path)
+        self.library = library
+        library.record_recent("v1", "a.mp4", 100)
+        monitor = self.monitor()
+        monitor.bind(session(), 100)
+        self.start(monitor)
+        self.player.feed(100, sample(100, position_ms=50_000))
+        monitor._poll_once()  # last-good point = 50 s for pid 100 / v1
+        monitor.bind(session(fid="v2", name="b.mp4", sid="sess-2"), 100)  # queues the v1 flush
+        stale = [task for task in monitor._pending if isinstance(task, playback._Flush)]
+        self.assertEqual(len(stale), 1)
+        monitor._pending.clear()  # the worker already snapshotted this task
+        # Delete v1's history and record it again from a *different* player.
+        library.remove_recent("v1")
+        monitor.forget_fid("v1")
+        library.record_recent("v1", "a.mp4", 100)
+        monitor.bind(session(sid="sess-3"), 300)
+        self.start(monitor, sid="sess-3")
+        self.player.feed(300, sample(300, position_ms=900_000))
+        monitor._poll_once()  # restore pass
+        self.clock.advance(11.0)
+        monitor._poll_once()  # write pass -> 900 s owned by the new binding
+        self.assertEqual(library.progress("v1", 100)["position_ms"], 900_000)
+        library.saves.clear()
+        # The old flush is finally released, carrying its pre-forget epoch.
+        for task in stale:
+            monitor._apply_flush(task)
+        self.assertEqual(library.saves, [])
+        self.assertEqual(library.progress("v1", 100)["position_ms"], 900_000)
+
+    def test_bind_of_a_session_marked_history_removed_is_never_tracked(self):
+        # Review's /v1/play race: new_session returns the session under the
+        # history lock, then remove_history marks it and deletes the row before
+        # the delayed monitor.bind runs. A registered-before-delete session bound
+        # afterwards must not be tracked, so its stream can neither write
+        # progress nor restore against a later explicit play's record.
+        library = RecordingLibrary(self.path)
+        self.library = library
+        library.record_recent("v1", "a.mp4", 100)
+        monitor = self.monitor()
+        old = session(sid="sess-old")
+        old.history_removed = True  # marked by remove_history before this bind
+        monitor.bind(old, 100)  # the delayed bind of the stale session
+        self.start(monitor, sid="sess-old")  # its stream really starts
+        self.player.feed(100, sample(100, position_ms=50_000))
+        monitor._poll_once()
+        self.assertEqual(monitor.snapshot(), [])  # not tracked at all
+        self.assertEqual(self.player.sample_calls, 0)  # the old pid is never sampled
+        library.remove_recent("v1")
+        monitor._poll_once()
+        self.assertIsNone(library.progress("v1", 100))  # the deleted row stays gone
+        # A brand-new explicit play is a fresh, unmarked session; its started
+        # stream records the row again and it records normally.
+        library.record_recent("v1", "a.mp4", 100)
+        monitor.bind(session(sid="sess-new"), 200)
+        self.start(monitor, sid="sess-new")
+        self.player.feed(200, sample(200, position_ms=900_000))
+        monitor._poll_once()
+        self.clock.advance(11.0)
+        monitor._poll_once()
+        self.assertEqual(library.progress("v1", 100)["position_ms"], 900_000)
+
+    def test_forget_leaves_other_bindings_and_the_bookmark_barrier_alone(self):
+        library = RecordingLibrary(self.path)
+        self.library = library
+        library.record_recent("v2", "b.mp4", 100)
+        library.save_progress("v2", 100, 60_000, 1_800_000)
+        monitor = self.monitor()
+        monitor.bind(session(fid="v2", name="b.mp4", sid="s2"), 300)
+        self.start(monitor, sid="s2")
+        storage_epoch = monitor._storage_epoch
+        progress_epoch = monitor._progress_epoch
+        monitor.forget_fid("v1")  # nothing is bound to v1
+        # Forgetting one video must not supersede a bookmark capture of another.
+        self.assertEqual(monitor._storage_epoch, storage_epoch)
+        self.assertGreater(monitor._progress_epoch, progress_epoch)
+        # The unrelated binding records normally after the forget.
+        self.player.feed(300, FakeSample(300, logical("v2"), 90_000, 1_800_000, 2))
+        monitor._poll_once()  # restore pass
+        self.clock.advance(11.0)
+        monitor._poll_once()  # write pass
+        self.assertEqual(library.progress("v2", 100)["position_ms"], 90_000)
+
+    def test_forget_drains_a_write_that_already_passed_the_check(self):
+        class GatedLibrary(RecordingLibrary):
+            def __init__(self, path):
+                super().__init__(path)
+                self.entered = threading.Event()
+                self.resume = threading.Event()
+
+            def save_progress(self, fid, size, position_ms, duration_ms):
+                if fid == "v1" and position_ms == 50_000:
+                    self.entered.set()
+                    self.resume.wait(5)
+                return super().save_progress(fid, size, position_ms, duration_ms)
+
+        library = GatedLibrary(self.path)
+        self.library = library
+        library.record_recent("v1", "a.mp4", 100)
+        monitor = self.monitor()
+        monitor.bind(session(), 100)
+        self.start(monitor)
+        generation = monitor._bindings[100].generation
+        written = threading.Event()
+
+        def writer():
+            monitor._write(100, generation, "v1", 100, 50_000, 1_800_000)
+            written.set()
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        self.assertTrue(library.entered.wait(2))  # blocked, holding the barrier
+
+        removed = threading.Event()
+
+        def remover():
+            monitor.forget_fid("v1")
+            library.remove_recent("v1")
+            removed.set()
+
+        remover_thread = threading.Thread(target=remover)
+        remover_thread.start()
+        # The removal cannot delete before the in-flight write leaves the barrier.
+        self.assertFalse(removed.wait(0.2))
+        library.resume.set()
+        self.assertTrue(written.wait(2))
+        self.assertTrue(removed.wait(2))
+        thread.join(2)
+        remover_thread.join(2)
+        self.assertIsNone(library.progress("v1", 100))  # deleted last, never resurrected
+
     # -- same file / clear / restart -------------------------------------
 
     def test_same_fid_in_two_players_suspends_both(self):

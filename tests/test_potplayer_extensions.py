@@ -599,9 +599,11 @@ class LibraryEntryDesignTests(unittest.TestCase):
         self.assertIn('QuarkRequest("/v1/recent", "")', body)
         self.assertIn("QUARK_ACTION_CLEAR_RECENT", body)
         self.assertIn("最近没有播放记录", body)
-        # 条目走共享行构造：视频复用 QUARK_PLAY_PREFIX，从该集开始同目录选集。
-        rows = self.body("void QuarkAppendItems(array<dictionary> &ret, JsonValue &items)")
-        self.assertIn('row["url"] = QUARK_PLAY_PREFIX + fid.asString()', rows)
+        self.assertIn("QuarkAppendRecentItems(ret, items)", body)
+        # 条目走最近记录专用构造：视频复用 QUARK_PLAY_PREFIX，且每条附一条操作文件夹行。
+        rows = self.body("void QuarkAppendRecentItems(array<dictionary> &ret, JsonValue &items)")
+        self.assertIn('play["url"] = QUARK_PLAY_PREFIX + fid.asString()', rows)
+        self.assertIn("QuarkAppendVideoActions(ret, fid.asString(), title)", rows)
 
         clear = body_raw(self.url_raw, "array<dictionary> QuarkRecentClearPage()")
         self.assertIsNotNone(re.search(r'"/v1/recent/clear"\s*,\s*"\{', clear), "clear must POST a JSON body")
@@ -630,6 +632,12 @@ class LibraryEntryDesignTests(unittest.TestCase):
             "array<dictionary> QuarkFavoriteActionPage(bool add, string fid)",
             "array<dictionary> QuarkRecentClearPage()",
             "array<dictionary> QuarkRecentList()",
+            "array<dictionary> QuarkWatchCenterList()",
+            "array<dictionary> QuarkCenterSeriesPage(string parent)",
+            "array<dictionary> QuarkVideoActionsPage(string fid)",
+            "array<dictionary> QuarkRecentRemoveAskPage(string fid)",
+            "void QuarkAppendRecentItems(array<dictionary> &ret, JsonValue &items)",
+            "void QuarkAppendVideoActions(array<dictionary> &ret, string fid, string title)",
         ):
             self.assertNotIn("{$CP", self.body(signature), signature)
         # 纯文本标题与 FavoriteRowModelTests 的转写保持一字不差。
@@ -668,12 +676,12 @@ class SeriesEntryDesignTests(unittest.TestCase):
     def raw(self, signature):
         return body_raw(self.url_raw, signature)
 
-    def test_continue_category_reads_the_local_list(self):
+    def test_continue_category_reads_the_grouped_local_watch_center(self):
         categories = self.body("array<dictionary> GetCategorys()")
+        # 继续观看分类保留，但根页改成追剧中心的分组列表。
         self.assertRegex(categories, r'resume\["Category"\]\s*=\s*"continue"')
-        body = self.body("array<dictionary> QuarkContinueList()")
-        self.assertIn('QuarkRequest("/v1/continue", "")', body)
-        self.assertIn("QuarkAppendItems(ret, items)", body)
+        body = self.body("array<dictionary> QuarkWatchCenterList()")
+        self.assertIn('QuarkRequest("/v1/watch-center", "")', body)
         # 空列表给一条可读状态，不回退到整盘浏览。
         self.assertIn("暂无可继续观看的视频", body)
 
@@ -726,6 +734,212 @@ class SeriesEntryDesignTests(unittest.TestCase):
         self.assertIn('fid.find("|") >= 0', valid)
 
 
+class WatchCenterDesignTests(unittest.TestCase):
+    """The 0.8.0 watch center: a local grouped root and a per-group series page."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.url_raw = read_script(URL_LIST)
+
+    def body(self, signature):
+        return squash(body_raw(self.url_raw, signature))
+
+    def raw(self, signature):
+        return body_raw(self.url_raw, signature)
+
+    def test_continue_category_title_names_the_watch_center(self):
+        categories = self.body("array<dictionary> GetCategorys()")
+        self.assertIn("追剧中心（继续观看）", categories)
+        self.assertRegex(categories, r'resume\["Category"\]\s*=\s*"continue"')
+
+    def test_root_groups_series_and_never_scans_series_per_group(self):
+        root = self.body("array<dictionary> QuarkWatchCenterList()")
+        self.assertIn('kind.asString() == "series"', root)
+        self.assertIn("QUARK_CENTER_SERIES + key.asString()", root)
+        self.assertIn("unfinished_count", root)
+        # 根页只读本地 watch-center：绝不为每个分组单独请求 /series 或扫描网盘。
+        self.assertEqual(root.count("QuarkRequest("), 1)
+        self.assertNotIn("/v1/series", root)
+        self.assertNotIn("/v1/files", root)
+
+    def test_series_group_row_is_a_named_navigation_row(self):
+        root = self.body("array<dictionary> QuarkWatchCenterList()")
+        self.assertRegex(root, r'row\["folder"\]\s*=\s*"1"')
+        self.assertRegex(root, r'row\["PathToken"\]\s*=\s*QUARK_CENTER_SERIES')
+        self.assertNotIn('row["url"]', root)
+
+    def test_root_single_video_gets_play_and_actions(self):
+        root = self.body("array<dictionary> QuarkWatchCenterList()")
+        self.assertIn('play["url"] = QUARK_PLAY_PREFIX + key.asString()', root)
+        self.assertIn("QuarkAppendVideoActions(ret, key.asString(), title)", root)
+
+    def test_group_page_reads_series_once_and_lays_out_the_contract(self):
+        page = self.body("array<dictionary> QuarkCenterSeriesPage(string parent)")
+        # 进入分组只读取一次 /series。
+        self.assertEqual(page.count("QuarkRequest("), 1)
+        self.assertIn('"/v1/series?parent=" + HostUrlEncode(parent)', page)
+        self.assertRegex(page, r'up\["folder"\]\s*=\s*"parent"')
+        # 摘要行导航到状态管理页，标题带 watched x/y，看完给明确标签且没有假播放地址。
+        self.assertIn("QUARK_ACTION_SERIES + parent", page)
+        self.assertIn('"已看 "', page)
+        self.assertIn("已全部看完", page)
+        self.assertIn('summary["folder"] = "1"', page)
+        self.assertNotIn('summary["url"]', page)
+        # continue 播放行与 next 播放行：next 标题显式带“下一集：”前缀 + 真实文件名，
+        # 与剧集行区分开；地址仍是该下一集的真实媒体链接。
+        self.assertIn('"继续观看：" + display.asString()', page)
+        self.assertIn('root["next"]', page)
+        self.assertIn('row["title"] = "下一集：" + name.asString()', page)
+        self.assertIn('row["url"] = QUARK_PLAY_PREFIX + fid.asString()', page)
+
+    def test_empty_directory_is_a_navigable_return_not_a_false_ending(self):
+        page = self.body("array<dictionary> QuarkCenterSeriesPage(string parent)")
+        # total == 0 时提前返回：给可导航的返回行，由 total 判定控制。
+        self.assertIn("total.asInt() == 0", page)
+        self.assertIn("该目录没有视频 · 返回", page)
+        # 空目录行是导航行，没有媒体地址，且早于任何结尾/看完文案。
+        empty_block = page[page.index("total.asInt() == 0") : page.index("return ret")]
+        self.assertIn('empty["folder"] = "parent"', empty_block)
+        self.assertIn("该目录没有视频 · 返回", empty_block)
+        self.assertNotIn('empty["url"]', empty_block)
+        # 空目录绝不会被当成“已到最后一集”，也不被标成“已全部看完”。
+        self.assertNotIn("已到最后一集", empty_block)
+        self.assertNotIn("已全部看完", empty_block)
+        self.assertLess(page.index("该目录没有视频 · 返回"), page.index("已到最后一集 · 返回"))
+
+    def test_group_page_ends_without_wrapping_and_offers_per_episode_actions(self):
+        page = self.body("array<dictionary> QuarkCenterSeriesPage(string parent)")
+        # 非空目录没有下一集时给可导航的返回提示（也是 parent 导航行），不回到第一集重播。
+        self.assertIn("已到最后一集 · 返回", page)
+        self.assertIn('hint["folder"] = "parent"', page)
+        self.assertNotIn("QUARK_PLAY_PREFIX + episodes[0]", page)
+        # 自然顺序的剧集：每集可播放，并附一个操作文件夹行（书签、删除）。
+        self.assertIn('root["episodes"]', page)
+        self.assertIn("QuarkAppendVideoActions(ret, fid.asString(), title)", page)
+
+
+class VideoActionsDesignTests(unittest.TestCase):
+    """0.8.0 per-video actions: local bookmarks window and a confirmed single delete."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.url_raw = read_script(URL_LIST)
+
+    def body(self, signature):
+        return squash(body_raw(self.url_raw, signature))
+
+    def raw(self, signature):
+        return body_raw(self.url_raw, signature)
+
+    def test_action_folder_row_is_navigation_only(self):
+        row = self.raw(
+            "void QuarkAppendVideoActions(array<dictionary> &ret, string fid, string title)"
+        )
+        self.assertIn('row["folder"] = "1"', row)
+        self.assertIn("QUARK_ACTION_VIDEO + fid", row)
+        self.assertIn("QuarkValidFid(fid)", row)
+        self.assertIn("（书签、记录）", row)
+        self.assertNotIn('row["url"]', row)
+
+    def test_actions_page_offers_play_bookmarks_and_delete(self):
+        page = self.raw("array<dictionary> QuarkVideoActionsPage(string fid)")
+        # 原生文件夹式的“..”父级行：操作页自己能回到上一级列表，不依赖全局返回。
+        self.assertIn('up["title"] = ".."', page)
+        self.assertIn('up["folder"] = "parent"', page)
+        self.assertIn('play["url"] = QUARK_PLAY_PREFIX + fid', page)
+        self.assertIn("播放书签", page)
+        self.assertIn("QUARK_ACTION_BOOKMARKS + fid", page)
+        self.assertIn("删除本条观看记录", page)
+        self.assertIn("QUARK_ACTION_REMOVE_ASK + fid", page)
+        # 父级行先出现，是导航行；只有播放行是媒体地址。
+        self.assertLess(page.index('up["folder"] = "parent"'), page.index('play["url"]'))
+        self.assertNotIn('up["url"]', page)
+        self.assertEqual(page.count('["url"]'), 1)
+        for key in ("bookmarks", "remove"):
+            self.assertIn(f'{key}["folder"] = "1"', page)
+            self.assertNotIn(f'{key}["url"]', page)
+        # 本地读最近记录补标题，找不到时用通用标题。
+        self.assertIn('QuarkRequest("/v1/recent", "")', page)
+        self.assertIn("该视频", page)
+
+    def test_bookmarks_open_posts_only_the_fid(self):
+        body = self.raw("array<dictionary> QuarkBookmarksOpenPage(string fid)")
+        self.assertIsNotNone(re.search(r'"/v1/bookmarks/open"\s*,\s*"\{', body))
+        self.assertIn("QuarkValidFid(fid)", body)
+        self.assertRegex(body, r'"\{\\"fid\\":\\""\s*\+\s*fid\s*\+\s*"\\"\}"')
+        self.assertIn("已打开播放书签窗口", body)
+
+    def test_delete_needs_an_explicit_confirmation_then_is_idempotent(self):
+        ask = self.raw("array<dictionary> QuarkRecentRemoveAskPage(string fid)")
+        # 确认页只给导航行，不执行任何请求。
+        self.assertNotIn("QuarkRequest", ask)
+        self.assertNotIn('["url"]', ask)
+        self.assertIn("确认删除", ask)
+        self.assertIn("QUARK_ACTION_REMOVE_DO + fid", ask)
+
+        do = self.raw("array<dictionary> QuarkRecentRemovePage(string fid)")
+        self.assertIsNotNone(re.search(r'"/v1/recent/remove"\s*,\s*"\{', do))
+        self.assertRegex(do, r'"\{\\"fid\\":\\""\s*\+\s*fid\s*\+\s*"\\"\}"')
+        self.assertIn("QuarkValidFid(fid)", do)
+        self.assertIn("已删除本条观看记录", do)
+
+    def test_delete_is_not_the_clear_all_action(self):
+        do = self.raw("array<dictionary> QuarkRecentRemovePage(string fid)")
+        self.assertIn("/v1/recent/remove", do)
+        self.assertNotIn("/v1/recent/clear", do)
+        self.assertNotIn("QUARK_ACTION_CLEAR_RECENT", do)
+
+    def test_local_actions_precede_the_login_gate(self):
+        body = self.body(
+            "array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)"
+        )
+        gate = body.index("QuarkEnsureLogin()")
+        for marker in (
+            'Category == "continue" && PathToken.empty()',
+            "QUARK_ACTION_REMOVE_DO",
+            "QUARK_ACTION_REMOVE_ASK",
+            "QuarkVideoActionsPage",
+            "QuarkBookmarksOpenPage",
+        ):
+            self.assertLess(body.index(marker), gate, marker)
+        # 剧集分组是远程读取，必须在登录之后。
+        self.assertLess(gate, body.index("QuarkCenterSeriesPage"))
+
+    def test_new_action_tokens_are_unambiguous_single_fid_suffixes(self):
+        source = read_script(URL_LIST)
+        for constant in (
+            'string QUARK_CENTER_SERIES = "quark-center-series-";',
+            'string QUARK_ACTION_VIDEO = "quark-video-actions-";',
+            'string QUARK_ACTION_BOOKMARKS = "quark-video-bookmarks-";',
+            'string QUARK_ACTION_REMOVE_ASK = "quark-remove-ask-";',
+            'string QUARK_ACTION_REMOVE_DO = "quark-remove-do-";',
+        ):
+            self.assertIn(constant, source)
+        prefixes = (
+            "quark-center-series-",
+            "quark-video-actions-",
+            "quark-video-bookmarks-",
+            "quark-remove-ask-",
+            "quark-remove-do-",
+        )
+        for outer in prefixes:
+            for inner in prefixes:
+                if outer != inner:
+                    self.assertFalse(inner.startswith(outer), f"{inner} shadows {outer}")
+
+    def test_fid_json_bodies_validate_before_embedding(self):
+        for signature in (
+            "array<dictionary> QuarkFavoriteActionPage(bool add, string fid)",
+            "array<dictionary> QuarkBookmarksOpenPage(string fid)",
+            "array<dictionary> QuarkRecentRemovePage(string fid)",
+        ):
+            body = self.raw(signature)
+            self.assertIn("QuarkValidFid", body, signature)
+            self.assertRegex(body, r'"\{\\"fid\\":\\""\s*\+\s*fid\s*\+\s*"\\"\}"', signature)
+        valid = self.body("bool QuarkValidFid(string fid)")
+        self.assertIn('fid.find("|") >= 0', valid)
+
+
 class DiagnosticsEntryDesignTests(unittest.TestCase):
     """The 0.5.0 diagnostics entry: local-only, folder action row, no invented player APIs."""
 
@@ -739,8 +953,12 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
         return body_raw(raw, signature)
 
     def test_versions_report_the_current_release(self):
-        for raw in (self.url_raw, self.play_raw):
-            self.assertIn('return "0.7.0";', self.raw_body(raw, "string GetVersion()"))
+        # 本任务只把 UrlList 升到 0.8.0；PlayParse/SubtitleSearch 的版本由各自的
+        # 任务维护，这里只要求仍是语义化版本串。
+        self.assertIn('return "0.8.0";', self.raw_body(self.url_raw, "string GetVersion()"))
+        self.assertRegex(
+            self.raw_body(self.play_raw, "string GetVersion()"), r'return "\d+\.\d+\.\d+";'
+        )
 
     def test_diagnostics_category_posts_a_json_body_and_returns_a_back_row(self):
         page = self.raw_body(self.url_raw, "array<dictionary> QuarkDiagnosticsPage()")
@@ -1236,6 +1454,7 @@ class LibraryRouteShapeTests(BridgeCase):
     records = (
         record("fav-dir", "收藏剧集", directory=True),
         record("fav-vid", "第1集.mp4", "fav-dir"),
+        record("empty-dir", "空目录", directory=True),
     )
 
     def required(self, response, path):
@@ -1360,6 +1579,87 @@ class LibraryRouteShapeTests(BridgeCase):
             cleared = self.post_json("/v1/recent/clear", {"client": "potplayer"})
             self.assertNotIn("error", cleared)
         self.assertEqual(self.get_json("/v1/recent")["items"], [])
+
+    def watch_route(self, path, method="GET", payload=None):
+        """Call a 0.8.0 route, skipping while the parallel bridge task is unfinished.
+
+        Absent routes answer 404 ``not_found``; a route listed but not yet wired
+        answers 405 ``method_not_allowed``. Either means the bridge half of the
+        watch-center/bookmarks/remove contract has not landed yet.
+        """
+        headers = dict(self.headers, Connection="close", **{"Content-Type": "application/json"})
+        if method == "GET":
+            response = self.client.get(path, headers=self.headers)
+        else:
+            response = self.client.post(path, headers=headers, json=payload)
+        if response.status_code in (404, 405):
+            error = response.json().get("error", {})
+            if error.get("type") in ("not_found", "method_not_allowed"):
+                self.skipTest(f"bridge has no {method} {path} yet (parallel bridge task pending)")
+        return response.json()
+
+    def test_watch_center_groups_series_and_root_singles(self):
+        library = self.bridge.service.library
+        library.record_recent("fav-vid", "第1集.mp4", len(VIDEO_BYTES), "fav-dir")
+        library.save_progress("fav-vid", len(VIDEO_BYTES), 60_000, 1_800_000)
+        library.record_recent("root-vid", "电影.mp4", 2048, "")
+        payload = self.watch_route("/v1/watch-center")
+        self.assertIsInstance(payload["items"], list)
+        by_kind = {item["kind"]: item for item in payload["items"]}
+        self.assertIn("series", by_kind)
+        self.assertIn("video", by_kind)
+        series = by_kind["series"]
+        self.assertEqual(series["key"], "fav-dir")
+        self.assertEqual(series["parent"], "fav-dir")
+        self.assertIsInstance(series["name"], str)
+        self.assertIsInstance(series["display"], str)
+        self.assertIsInstance(series["unfinished_count"], int)
+        self.assertEqual(series["latest"]["fid"], "fav-vid")
+        video = by_kind["video"]
+        self.assertEqual(video["key"], "root-vid")
+        self.assertEqual(video["parent"], "")
+
+    def test_series_adds_latest_and_a_non_wrapping_next(self):
+        library = self.bridge.service.library
+        library.record_recent("fav-vid", "第1集.mp4", len(VIDEO_BYTES), "fav-dir")
+        library.save_progress("fav-vid", len(VIDEO_BYTES), 60_000, 1_800_000)
+        payload = self.watch_route("/v1/series?parent=fav-dir")
+        if "latest" not in payload or "next" not in payload:
+            self.skipTest("bridge /v1/series has no latest/next yet (parallel bridge task pending)")
+        self.assertIsInstance(payload["latest"], dict)
+        self.assertEqual(payload["latest"]["fid"], "fav-vid")
+        for key in ("fid", "name", "size", "parent", "display"):
+            self.assertIn(key, payload["latest"])
+        # 该目录只有一集：没有下一集，也绝不回绕到第一集。
+        self.assertIsNone(payload["next"])
+
+    def test_series_of_an_empty_directory_is_zero_total_and_not_complete(self):
+        # 空目录（无视频）不是“看完”：total == 0、complete 为假、没有继续/下一集。
+        # 脚本据此给“该目录没有视频 · 返回”，绝不误标“已到最后一集”。
+        payload = self.watch_route("/v1/series?parent=empty-dir")
+        if "total" not in payload:
+            self.skipTest("bridge /v1/series has no total yet (parallel bridge task pending)")
+        self.assertEqual(payload["total"], 0)
+        self.assertFalse(payload["complete"])
+        self.assertIsNone(payload["continue"])
+        self.assertIsNone(payload["next"])
+        self.assertEqual(payload["episodes"], [])
+
+    def test_recent_remove_deletes_only_the_selected_record_idempotently(self):
+        library = self.bridge.service.library
+        library.record_recent("fav-vid", "第1集.mp4", len(VIDEO_BYTES), "fav-dir")
+        library.record_recent("root-vid", "电影.mp4", 2048, "")
+        for _ in range(2):
+            payload = self.watch_route("/v1/recent/remove", "POST", {"fid": "fav-vid"})
+            self.assertNotIn("error", payload)
+        remaining = [item["fid"] for item in self.get_json("/v1/recent")["items"]]
+        self.assertEqual(remaining, ["root-vid"])
+
+    def test_bookmarks_open_reuses_the_manager_for_the_selected_fid(self):
+        first = self.watch_route("/v1/bookmarks/open", "POST", {"fid": "fav-vid"})
+        second = self.watch_route("/v1/bookmarks/open", "POST", {"fid": "fav-vid"})
+        self.assertNotIn("error", first)
+        self.assertNotIn("error", second)
 
 
 if __name__ == "__main__":

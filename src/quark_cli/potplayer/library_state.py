@@ -452,6 +452,23 @@ class Library:
                 document["recent"] = []
                 self._store(document)
 
+    def remove_recent(self, fid: str) -> bool:
+        """Delete one video's recent row and saved resume point in place.
+
+        Only that FID's row is dropped: every other recent row, all favorites,
+        the manual watched marks and the local playback bookmarks stay untouched.
+        Removing an absent FID changes nothing, so a caller can answer
+        idempotently. ``True`` means a row was really deleted.
+        """
+        with self._lock:
+            document = self._document()
+            kept = [entry for entry in document["recent"] if entry["fid"] != fid]
+            if len(kept) == len(document["recent"]):
+                return False
+            document["recent"] = kept
+            self._store(document)
+            return True
+
     def clear(self) -> None:
         """Explicit logout drops both lists; a missing file is already clear."""
         with self._lock:

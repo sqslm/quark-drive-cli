@@ -85,6 +85,10 @@ class PlaySession:
     created: float
     last_used: float
     etag: str | None = None
+    #: Set by ``Sessions.remove_history`` once ``/v1/recent/remove`` dropped this
+    #: FID's history, so a later range GET on the *same* session cannot record it
+    #: again. A brand-new session (a new explicit ``/v1/play``) starts ``False``.
+    history_removed: bool = False
 
 
 @dataclass(frozen=True)
@@ -173,6 +177,18 @@ class Sessions:
     def forget(self, session: str) -> None:
         with self._lock:
             self._items.pop(session, None)
+
+    def remove_history(self, fid: str) -> None:
+        """Mark every live session of ``fid`` so it can never record history again.
+
+        Bounded by the session registry itself: a fresh session from a new
+        explicit ``/v1/play`` is never marked, so no unbounded tombstone list is
+        kept and a re-play records normally.
+        """
+        with self._lock:
+            for entry in self._items.values():
+                if entry.fid == fid:
+                    entry.history_removed = True
 
 
 class _Upstream:
