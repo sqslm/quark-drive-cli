@@ -21,7 +21,7 @@ from unittest.mock import patch
 import httpx
 
 from quark_cli.downloader import worker as worker_module
-from quark_cli.downloader.core import DOWNLOAD_ACTION, Entry
+from quark_cli.downloader.core import DOWNLOAD_ACTION, SEARCH_ACTION, Entry, Location, download_plan
 from quark_cli.downloader.worker import (
     Browse,
     Download,
@@ -30,10 +30,12 @@ from quark_cli.downloader.worker import (
     Finished,
     Listing,
     Progress,
+    Search,
+    SearchResults,
     Stopped,
     Worker,
 )
-from quark_cli.errors import AuthenticationError, UsageError
+from quark_cli.errors import AuthenticationError, RemoteError, UsageError
 from quark_cli.transfer import DownloadStopped
 from quark_cli.transfer_progress import ProgressEvent
 
@@ -54,14 +56,18 @@ class FakeBackend:
     persisted, without a progress event and without publishing anything.
     """
 
-    def __init__(self, *, listing=(), listing_error=None, result=None, error=None, gate=None):
+    def __init__(self, *, listing=(), listing_error=None, search=(), search_error=None,
+                 result=None, error=None, gate=None):
         self.listing_rows = list(listing)
         self.listing_error = listing_error
+        self.search_rows = list(search)
+        self.search_error = search_error
         self.result = result
         self.error = error
         self.gate = gate
         self.downloads = []
         self.stops = []
+        self.searches = []
         self._lock = threading.Lock()
 
     def listing(self, fid):
@@ -69,6 +75,13 @@ class FakeBackend:
             if self.listing_error is not None:
                 raise self.listing_error
         return list(self.listing_rows)
+
+    def search(self, fid, query):
+        with self._lock:
+            self.searches.append((fid, query))
+            if self.search_error is not None:
+                raise self.search_error
+        return list(self.search_rows)
 
     def download(self, request, progress, should_stop=None):
         self.downloads.append(request)
@@ -125,6 +138,33 @@ class WorkerTests(unittest.TestCase):
         backend.listing_rows = [_row("f", "f.bin", size=1)]
         worker.submit(Browse("0"))
         self.assertIsInstance(worker.events.get(timeout=5), Listing)
+
+    def test_search_returns_one_results_event_and_never_a_download_outcome(self):
+        hit = Entry("f", "报告.txt", False, 4, path="/下载/报告.txt", location=(("0", "我的网盘"), ("a", "下载")))
+        backend = FakeBackend(search=[hit])
+        worker = self._worker(backend)
+        worker.submit(Search("0", "报告"))
+        event = worker.events.get(timeout=5)
+        self.assertIsInstance(event, SearchResults)
+        self.assertEqual((event.fid, event.query, event.entries), ("0", "报告", (hit,)))
+        with self.assertRaises(queue.Empty):
+            worker.events.get_nowait()
+        self.assertEqual(backend.searches, [("0", "报告")])
+
+    def test_search_failure_is_one_line_and_the_worker_keeps_serving(self):
+        backend = FakeBackend(search_error=RuntimeError("boom secret=private"))
+        worker = self._worker(backend)
+        worker.submit(Search("0", "报告"))
+        failed = worker.events.get(timeout=5)
+        self.assertIsInstance(failed, Failed)
+        self.assertEqual(failed.action, SEARCH_ACTION)
+        self.assertEqual(failed.message, "搜索失败：发生未预期的错误")
+        self.assertNotIn("private", failed.message)
+
+        backend.search_error = None
+        backend.search_rows = [_row("f", "f.bin", size=1)]
+        worker.submit(Search("0", "f"))
+        self.assertIsInstance(worker.events.get(timeout=5), SearchResults)
 
     def test_download_reports_progress_then_the_completion_line(self):
         backend = FakeBackend(result={"fid": "fid-1", "path": "out.bin", "size": 10})
@@ -358,6 +398,90 @@ class DriveBackendTests(unittest.TestCase):
         with self.assertRaises(AuthenticationError) as caught:
             backend.listing("0")
         self.assertIn("QUARK_COOKIE", str(caught.exception))
+
+    @staticmethod
+    def _search_fixture() -> DriveFixture:
+        return DriveFixture(
+            [
+                item("dir-a", "下载", directory=True),
+                item("dir-b", "下载备份", directory=True),
+                item("sub", "子目录", "dir-a", directory=True),
+                item("dir-c", "报告目录", "dir-a", directory=True),
+                item("f1", "报告.txt", "dir-a", size=3),
+                item("f2", "报告.txt", "dir-b", size=5),
+                item("f3", "REPORT.md", "sub", size=7),
+                item("f4", "其他.bin", "dir-a", size=9),
+            ]
+        )
+
+    def test_search_finds_every_subfolder_hit_with_directories_first(self):
+        backend = DriveBackend(lambda: COOKIE, transport=self._search_fixture().transport())
+        rows = backend.search("0", "报告")
+        self.assertEqual(
+            [(row.name, row.fid, row.directory, row.path, row.size) for row in rows],
+            [
+                ("报告目录", "dir-c", True, "/下载/报告目录", None),
+                ("报告.txt", "f1", False, "/下载/报告.txt", 3),
+                ("报告.txt", "f2", False, "/下载备份/报告.txt", 5),
+            ],
+        )
+        self.assertEqual(rows[0].location, (("0", "我的网盘"), ("dir-a", "下载"), ("dir-c", "报告目录")))
+        self.assertEqual(rows[1].location, (("0", "我的网盘"), ("dir-a", "下载")))
+        self.assertEqual(rows[2].location, (("0", "我的网盘"), ("dir-b", "下载备份")))
+
+    def test_search_matches_case_fold_and_reports_the_full_location_chain(self):
+        backend = DriveBackend(lambda: COOKIE, transport=self._search_fixture().transport())
+        rows = backend.search("0", "report")
+        self.assertEqual([(row.name, row.path) for row in rows], [("REPORT.md", "/下载/子目录/REPORT.md")])
+        self.assertEqual(rows[0].location, (("0", "我的网盘"), ("dir-a", "下载"), ("sub", "子目录")))
+
+    def test_search_is_scoped_to_the_given_folder_and_never_matches_that_folder_itself(self):
+        backend = DriveBackend(lambda: COOKIE, transport=self._search_fixture().transport())
+        rows = backend.search("dir-a", "报告")
+        self.assertEqual([row.path for row in rows], ["/下载/报告目录", "/下载/报告.txt"])
+        # ``dir-a`` is named 下载, but the searched folder's own name is not a hit.
+        self.assertEqual(backend.search("dir-a", "下载"), [])
+        self.assertEqual([row.path for row in backend.search("dir-b", "报告")], ["/下载备份/报告.txt"])
+
+    def test_search_refuses_an_empty_keyword(self):
+        backend = DriveBackend(lambda: COOKIE, transport=self._search_fixture().transport())
+        for query in ("", "   "):
+            with self.subTest(query=query), self.assertRaises(UsageError):
+                backend.search("0", query)
+
+    def test_search_still_refuses_a_cycle_and_an_inconsistent_listing(self):
+        cycle = DriveFixture([item("dup", "A", directory=True), item("dup", "B", directory=True)])
+        backend = DriveBackend(lambda: COOKIE, transport=cycle.transport())
+        with self.assertRaises(RemoteError):
+            backend.search("0", "a")
+
+        inconsistent = DriveFixture(
+            [item("dir-a", "下载", directory=True), item("other", "别处", directory=True)]
+        )
+        inconsistent.list_overrides["dir-a"] = [item("x", "坏.bin", "other", size=1)]
+        backend = DriveBackend(lambda: COOKIE, transport=inconsistent.transport())
+        with self.assertRaises(RemoteError):
+            backend.search("0", "坏")
+
+    def test_a_hit_location_restores_the_real_folder_and_downloads_under_its_own_name(self):
+        backend = DriveBackend(lambda: COOKIE, transport=self._search_fixture().transport())
+        file_hit = backend.search("0", "report")[0]
+        location = Location()
+        location.replace(file_hit.location)
+        self.assertEqual((location.fid, location.title), ("sub", "/下载/子目录"))
+        self.assertTrue(location.up())
+        self.assertEqual((location.fid, location.title), ("dir-a", "/下载"))
+        self.assertTrue(location.up())
+        self.assertEqual((location.fid, location.title), ("0", "/"))
+
+        file_plan = download_plan(str(self.output), file_hit)
+        self.assertEqual(file_plan.target, self.output / "REPORT.md")
+        self.assertFalse(file_plan.recursive)
+
+        directory_hit = backend.search("0", "报告目录")[0]
+        directory_plan = download_plan(str(self.output), directory_hit)
+        self.assertEqual(directory_plan.target, self.output / "报告目录")
+        self.assertTrue(directory_plan.recursive)
 
     def _request(self, fid: str, target: Path, *, recursive: bool = False, name: str) -> Download:
         return Download(fid=fid, target=str(target), recursive=recursive, overwrite=False, name=name)

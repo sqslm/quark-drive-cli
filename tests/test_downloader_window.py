@@ -19,15 +19,37 @@ from quark_cli.auth import LoginCancelled
 from quark_cli.downloader.app import (
     CLOSE_BUSY_STATUS,
     IDLE_STATUS,
+    KIND_CHOICES,
     LOGIN_HINT,
+    NO_MATCH_RESULT_TEXT,
+    OPEN_FOLDER_ACTION,
+    SEARCH_HINT,
+    SEARCHING_STATUS,
     STOPPING_STATUS,
     WINDOW_TITLE,
     DownloaderWindow,
     default_login_window,
+    match_text,
 )
-from quark_cli.downloader.core import DOWNLOAD_ACTION, ROOT_FID, Entry
-from quark_cli.downloader.worker import Browse, Download, Failed, Finished, Listing, Progress, Stopped
-from quark_cli.errors import AuthenticationError, RemoteError
+from quark_cli.downloader.core import (
+    DOWNLOAD_ACTION,
+    ROOT_FID,
+    SEARCH_ACTION,
+    Entry,
+    describe_error,
+)
+from quark_cli.downloader.worker import (
+    Browse,
+    Download,
+    Failed,
+    Finished,
+    Listing,
+    Progress,
+    Search,
+    SearchResults,
+    Stopped,
+)
+from quark_cli.errors import AuthenticationError, LocalIOError, RemoteError
 from quark_cli.potplayer.login_gui import QrLoginWindow
 
 
@@ -44,6 +66,12 @@ def _tk_available() -> bool:
 
 
 _TK = _tk_available()
+
+#: The filter labels the window offers, in the order the combobox shows them.
+KIND_ALL, KIND_FILES, KIND_DIRECTORIES = (label for label, _kind in KIND_CHOICES)
+
+#: The ``kind`` each label asks for, as :meth:`DownloaderWindow._kind` reads it back.
+KIND_CODE = dict(KIND_CHOICES)
 
 
 def _tk_root() -> Any:
@@ -66,14 +94,22 @@ def _no_cookie() -> str:
 
 
 class _FakeVar:
+    """A ``tk.StringVar`` stand-in that also runs the write traces of its users."""
+
     def __init__(self, value: str = "") -> None:
         self.value = value
+        self.traces: list[Any] = []
 
     def set(self, value: str) -> None:
         self.value = value
+        for callback in self.traces:
+            callback("write", "", "write")
 
     def get(self) -> str:
         return self.value
+
+    def trace_add(self, _mode: str, callback: Any) -> None:
+        self.traces.append(callback)
 
 
 class _FakeTree:
@@ -103,6 +139,18 @@ class _FakeButton:
     def configure(self, **options: Any) -> None:
         if "state" in options:
             self.state = options["state"]
+
+
+class _FakeCombo(_FakeButton):
+    """A ``ttk.Combobox`` stand-in: it records its state and its bindings."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bindings: dict[str, Any] = {}
+        self.state = "readonly"
+
+    def bind(self, sequence: str, callback: Any) -> None:
+        self.bindings[sequence] = callback
 
 
 class _FakeRoot:
@@ -174,6 +222,9 @@ class _Backend:
     def listing(self, fid: str) -> list[Entry]:
         return list(self.rows)
 
+    def search(self, fid: str, query: str) -> list[Entry]:
+        return [entry for entry in self.rows if query.casefold() in entry.name.casefold()]
+
     def download(self, request: Download, progress: Any, should_stop: Any = None) -> dict:
         return {"fid": request.fid, "path": request.target, "size": 0}
 
@@ -200,23 +251,44 @@ class WindowCase(unittest.TestCase):
         window._status_var = _FakeVar()
         window._location_var = _FakeVar()
         window._output_var = _FakeVar()
+        window._search_var = _FakeVar()
+        window._kind_var = _FakeVar(KIND_ALL)
+        window._count_var = _FakeVar()
+        # ``_build`` ties the keyword box to the local filter; the fake widgets
+        # repeat that here, so setting the variable behaves like typing. The real
+        # wiring is covered by the Tk smoke tests.
+        window._search_var.trace_add("write", window._on_filter_change)
         window._progress = _FakeBar()
         window._log = _FakeLog()
+        window._kind_combo = _FakeCombo()
         for name in (
             "_up_button",
             "_refresh_button",
             "_login_button",
             "_output_button",
+            "_open_folder_button",
             "_download_button",
             "_stop_button",
+            "_search_button",
+            "_search_tree_button",
+            "_return_button",
         ):
             setattr(window, name, _FakeButton())
+        window._keyword_entry = _FakeButton()
         self.addCleanup(window._worker.stop)
         return window
 
     @staticmethod
     def _submitted(window: DownloaderWindow) -> Any:
         return window._worker._requests.get_nowait()
+
+    def _listing(self, window: DownloaderWindow, *entries: Entry) -> None:
+        """Deliver one folder listing of the root, as the worker would."""
+        window._handle(Listing(ROOT_FID, entries))
+
+    @staticmethod
+    def _results(window: DownloaderWindow, query: str, *entries: Entry, fid: str = ROOT_FID) -> None:
+        window._handle(SearchResults(fid=fid, query=query, entries=entries))
 
 
 class CloseTests(WindowCase):
@@ -282,9 +354,10 @@ class RenderingTests(WindowCase):
         window._handle(Listing("0", (Entry("d", "目录", True, None), Entry("f", "f.bin", False, 4))))
         self.assertEqual(
             window._tree.rows,
-            [("row0", "目录", ("目录", "—")), ("row1", "f.bin", ("文件", "4 B"))],
+            [("row0", "目录", ("", "目录", "—")), ("row1", "f.bin", ("", "文件", "4 B"))],
         )
         self.assertEqual(window._status_var.value, IDLE_STATUS)
+        self.assertEqual(window._count_var.value, match_text(2, 2))
 
     def test_progress_switches_the_bar_and_finished_fills_it(self):
         window = self._window()
@@ -566,6 +639,616 @@ class NavigationTests(WindowCase):
             self._submitted(window)
 
 
+class MatchTextTests(unittest.TestCase):
+    def test_counts_and_the_no_match_hint(self):
+        self.assertEqual(match_text(0, 0), "共 0 项，显示 0 项")
+        self.assertEqual(match_text(10, 10), "共 10 项，显示 10 项")
+        self.assertEqual(match_text(10, 3), "共 10 项，显示 3 项")
+        self.assertEqual(match_text(10, 0), "无匹配项（共 10 项）")
+
+
+class SearchTests(WindowCase):
+    """Submitting a search, and what its answer does to the table."""
+
+    def test_the_subdirectories_button_searches_the_folder_shown(self):
+        window = self._window()
+        self._listing(window, Entry("d", "目录", True, None))
+        window._search_var.set("  报告  ")
+
+        window.search_subdirectories()
+        self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告"))
+        self.assertTrue(window._searching)
+        self.assertEqual(window._status_var.value, SEARCHING_STATUS)
+        # One request at a time: nothing else is submitted while it is in flight.
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+    def test_the_plain_button_searches_the_whole_drive_from_wherever_it_is(self):
+        window = self._window()
+        self._listing(window, Entry("d", "目录", True, None))
+        window._tree.selection_ids = ("row0",)
+        window._on_activate(None)
+        self._submitted(window)
+        self.assertEqual(window._location.fid, "d")
+        window._search_var.set("报告")
+
+        window.search()
+        self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告"))
+
+        window._handle(Failed(SEARCH_ACTION, "搜索失败：上游连接失败"))
+        window.search_subdirectories()
+        self.assertEqual(self._submitted(window), Search(fid="d", query="报告"))
+
+    def test_a_blank_keyword_only_hints_and_submits_nothing(self):
+        window = self._window()
+        window._search_var.set("   ")
+
+        window.search_subdirectories()
+        self.assertEqual(window._status_var.value, SEARCH_HINT)
+        self.assertFalse(window._searching)
+        self.assertIsNone(window._origin)
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+    def test_results_replace_the_table_and_show_the_drive_path(self):
+        window = self._window()
+        self._listing(window, Entry("f", "旧.bin", False, 4))
+        window._search_var.set("报告")
+        window.search_subdirectories()
+        self._submitted(window)
+
+        window._handle(
+            SearchResults(
+                fid=ROOT_FID,
+                query="报告",
+                entries=(
+                    Entry("m", "报告.bin", False, 4, "/我的网盘/文档/报告.bin", (("0", "我的网盘"), ("d", "文档"))),
+                    Entry("d2", "报告目录", True, None, "/我的网盘/报告目录", (("0", "我的网盘"), ("d2", "报告目录"))),
+                ),
+            )
+        )
+
+        self.assertEqual(
+            window._tree.rows,
+            [
+                ("row0", "报告.bin", ("/我的网盘/文档/报告.bin", "文件", "4 B")),
+                ("row1", "报告目录", ("/我的网盘/报告目录", "目录", "—")),
+            ],
+        )
+        self.assertEqual(window._status_var.value, IDLE_STATUS)
+        self.assertEqual(window._count_var.value, match_text(2, 2))
+        self.assertFalse(window._searching)
+        self.assertEqual(window._search, Search(fid=ROOT_FID, query="报告"))
+        # A search session is running, so it can be left again; the buttons that
+        # ask for a request are usable now that none is in flight.
+        self.assertEqual(window._return_button.state, "normal")
+        self.assertEqual(window._search_button.state, "normal")
+        self.assertEqual(window._keyword_entry.state, "normal")
+
+    def test_an_empty_result_leaves_an_empty_table_and_asks_nothing_new(self):
+        window = self._window()
+        # An empty folder keeps reporting its own counts...
+        self._listing(window)
+        self.assertEqual(window._count_var.value, match_text(0, 0))
+
+        window._search_var.set("报告")
+        window.search_subdirectories()
+        self._submitted(window)
+
+        # ...while a search that matched nothing says so outright.
+        window._handle(SearchResults(fid=ROOT_FID, query="报告", entries=()))
+        self.assertEqual(window._tree.rows, [])
+        self.assertEqual(window._count_var.value, NO_MATCH_RESULT_TEXT)
+        self.assertEqual(window._status_var.value, IDLE_STATUS)
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+    def test_a_failed_search_reports_leaves_the_list_and_the_folder_usable(self):
+        window = self._window()
+        # The keyword box also filters the rows the window holds, so a row that
+        # survives it is what tells the failure apart from a clobbered table.
+        self._listing(window, Entry("f", "报告a.bin", False, 4))
+        window._search_var.set("报告")
+        window.search_subdirectories()
+        self._submitted(window)
+
+        window._handle(Failed(SEARCH_ACTION, "搜索失败：上游连接失败"))
+
+        self.assertEqual(window._status_var.value, "搜索失败：上游连接失败")
+        self.assertFalse(window._searching)
+        self.assertEqual([row[1] for row in window._tree.rows], ["报告a.bin"])
+        self.assertEqual(window._search_button.state, "normal")
+        # Nothing of the search reached the table, so there is no search session
+        # to return from; the window simply refreshes the folder it shows.
+        self.assertIsNone(window._origin)
+        self.assertEqual(window._return_button.state, "disabled")
+        window.refresh()
+        self.assertEqual(self._submitted(window), Browse(ROOT_FID))
+
+    def test_an_answer_to_an_older_question_is_dropped(self):
+        window = self._window()
+        self._listing(window, Entry("f", "报告旧.bin", False, 4))
+        window._search_var.set("报告")
+        window.search_subdirectories()
+        self._submitted(window)
+
+        # Another keyword, another folder: neither answer belongs to the request
+        # the window is waiting for.
+        window._handle(SearchResults(fid=ROOT_FID, query="别的词", entries=(Entry("x", "别的.bin", False, 4),)))
+        window._handle(SearchResults(fid="d", query="报告", entries=(Entry("y", "别处.bin", False, 4),)))
+        self.assertTrue(window._searching)
+        self.assertEqual([row[1] for row in window._tree.rows], ["报告旧.bin"])
+
+        window._handle(
+            SearchResults(
+                fid=ROOT_FID,
+                query="报告",
+                entries=(Entry("m", "报告.bin", False, 4, "/我的网盘/报告.bin", (("0", "我的网盘"),)),),
+            )
+        )
+        self.assertFalse(window._searching)
+        self.assertEqual([row[1] for row in window._tree.rows], ["报告.bin"])
+
+    def test_a_late_listing_cannot_replace_the_search_results(self):
+        window = self._window()
+        window._search_var.set("报告")
+        window.search_subdirectories()
+        self._submitted(window)
+        window._handle(
+            SearchResults(
+                fid=ROOT_FID,
+                query="报告",
+                entries=(Entry("m", "报告.bin", False, 4, "/我的网盘/报告.bin", (("0", "我的网盘"),)),),
+            )
+        )
+
+        # The folder's own listing arrives after the search was answered: the
+        # table shows the search, so the folder rows are stale and dropped.
+        self._listing(window, Entry("f", "旧.bin", False, 4))
+        self.assertEqual([row[1] for row in window._tree.rows], ["报告.bin"])
+        self.assertEqual(window._status_var.value, IDLE_STATUS)
+
+    def test_a_listing_that_arrives_while_the_search_runs_is_ignored(self):
+        window = self._window()
+        self._listing(window, Entry("f", "报告旧.bin", False, 4))
+        window._search_var.set("报告")
+        window.search_subdirectories()
+        self._submitted(window)
+
+        # The listing of the folder the search started from arrives while that
+        # search is still unanswered: it must neither fill the table nor end the
+        # search state, or the window would sit un-busy on rows the user never
+        # asked for and a second search could be submitted over this one.
+        window._handle(Listing(ROOT_FID, (Entry("x", "别的.bin", False, 4),)))
+        self.assertTrue(window._searching)
+        self.assertEqual(window._status_var.value, SEARCHING_STATUS)
+        self.assertEqual([row[1] for row in window._tree.rows], ["报告旧.bin"])
+        self.assertEqual(window._search_button.state, "disabled")
+
+        window._handle(
+            SearchResults(
+                fid=ROOT_FID,
+                query="报告",
+                entries=(Entry("m", "报告.bin", False, 4, "/我的网盘/报告.bin", (("0", "我的网盘"),)),),
+            )
+        )
+        self.assertFalse(window._searching)
+        self.assertEqual([row[1] for row in window._tree.rows], ["报告.bin"])
+
+    def test_refreshing_search_results_runs_the_same_search_again(self):
+        window = self._window()
+        window._search_var.set("报告")
+        window.search_subdirectories()
+        self._submitted(window)
+        window._handle(
+            SearchResults(
+                fid=ROOT_FID,
+                query="报告",
+                entries=(Entry("m", "报告.bin", False, 4, "/我的网盘/报告.bin", (("0", "我的网盘"),)),),
+            )
+        )
+
+        window.refresh()
+        self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告"))
+        self.assertEqual(window._status_var.value, SEARCHING_STATUS)
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+        window._handle(
+            SearchResults(
+                fid=ROOT_FID,
+                query="报告",
+                entries=(Entry("m2", "报告2.bin", False, 4, "/我的网盘/报告2.bin", (("0", "我的网盘"),)),),
+            )
+        )
+        self.assertEqual([row[1] for row in window._tree.rows], ["报告2.bin"])
+
+    def test_a_search_in_flight_freezes_the_search_navigation_and_the_filters(self):
+        window = self._window()
+        self._listing(window, Entry("d", "报告目录", True, None))
+        with tempfile.TemporaryDirectory() as folder:
+            window._output_dir = folder
+            window._tree.selection_ids = ("row0",)
+            window._sync_controls()
+            window._search_var.set("报告")
+            window.search_subdirectories()
+            self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告"))
+            self.assertEqual(window._search_button.state, "disabled")
+            self.assertEqual(window._search_tree_button.state, "disabled")
+            self.assertEqual(window._return_button.state, "disabled")
+            self.assertEqual(window._up_button.state, "disabled")
+            self.assertEqual(window._refresh_button.state, "disabled")
+            self.assertEqual(window._download_button.state, "disabled")
+            self.assertEqual(window._keyword_entry.state, "disabled")
+            self.assertEqual(window._kind_combo.state, "disabled")
+            self.assertEqual(window._open_folder_button.state, "normal")
+
+            window.search()
+            window.search_subdirectories()
+            window.go_up()
+            window.refresh()
+            window.leave_search()
+            window.start_download()
+            window._on_activate(None)
+            # Editing a filter while the search runs changes neither the table
+            # nor the queue.
+            window._search_var.set("别的词")
+            window._kind_var.set(KIND_DIRECTORIES)
+            window._on_filter_change()
+            with self.assertRaises(queue.Empty):
+                self._submitted(window)
+            self.assertEqual([row[1] for row in window._tree.rows], ["报告目录"])
+            self.assertEqual(window._location.fid, ROOT_FID)
+
+    def test_a_download_freezes_the_search_and_the_filters(self):
+        window = self._window()
+        with tempfile.TemporaryDirectory() as folder:
+            window._output_dir = folder
+            window._search_var.set("报告")
+            window.search_subdirectories()
+            self._submitted(window)
+            window._handle(
+                SearchResults(
+                    fid=ROOT_FID,
+                    query="报告",
+                    entries=(
+                        Entry("m", "报告.bin", False, 4, "/我的网盘/报告.bin", (("0", "我的网盘"),)),
+                        Entry("n", "报告2.bin", False, 4, "/我的网盘/报告2.bin", (("0", "我的网盘"),)),
+                    ),
+                )
+            )
+            window._tree.selection_ids = ("row0", "row1")
+            window.start_download()
+            self.assertEqual(
+                self._submitted(window),
+                Download(
+                    fid="m",
+                    target=str(Path(folder) / "报告.bin"),
+                    recursive=False,
+                    overwrite=False,
+                    name="报告.bin",
+                ),
+            )
+            self.assertEqual(window._search_button.state, "disabled")
+            self.assertEqual(window._keyword_entry.state, "disabled")
+            self.assertEqual(window._kind_combo.state, "disabled")
+            self.assertEqual(window._return_button.state, "disabled")
+            self.assertEqual(window._open_folder_button.state, "disabled")
+
+            window.search()
+            window.search_subdirectories()
+            window.leave_search()
+            window._search_var.set("别的词")
+            window._kind_var.set(KIND_DIRECTORIES)
+            window._on_filter_change()
+            with self.assertRaises(queue.Empty):
+                self._submitted(window)
+            self.assertEqual([row[1] for row in window._tree.rows], ["报告.bin", "报告2.bin"])
+            self.assertIsNotNone(window._batch)
+            self.assertEqual(window._batch.total, 2)
+
+    def test_a_folder_result_opens_its_real_folder_and_returns_to_the_search_folder(self):
+        window = self._window()
+        window._search_var.set("报告")
+        window.search_subdirectories()
+        self._submitted(window)
+        window._handle(
+            SearchResults(
+                fid=ROOT_FID,
+                query="报告",
+                entries=(
+                    Entry(
+                        "d2",
+                        "报告目录",
+                        True,
+                        None,
+                        "/我的网盘/文档/报告目录",
+                        (("0", "我的网盘"), ("d", "文档"), ("d2", "报告目录")),
+                    ),
+                ),
+            )
+        )
+        window._tree.selection_ids = ("row0",)
+
+        window._on_activate(None)
+        self.assertEqual(
+            (window._location.fid, window._location_var.value), ("d2", "/文档/报告目录")
+        )
+        self.assertEqual(self._submitted(window), Browse("d2"))
+
+        window._handle(Listing("d2", (Entry("f", "x.bin", False, 4),)))
+        self.assertEqual([row[1] for row in window._tree.rows], ["x.bin"])
+
+        # 返回上级 walks the real parents of the folder that was entered, not the
+        # search's own chain.
+        window.go_up()
+        self.assertEqual((window._location.fid, window._location_var.value), ("d", "/文档"))
+        self.assertEqual(self._submitted(window), Browse("d"))
+
+        # 返回目录 ends the search and shows the folder it started from.
+        window.leave_search()
+        self.assertEqual((window._location.fid, window._location_var.value), (ROOT_FID, "/"))
+        self.assertEqual(self._submitted(window), Browse(ROOT_FID))
+        self.assertEqual(window._return_button.state, "disabled")
+        window.refresh()
+        self.assertEqual(self._submitted(window), Browse(ROOT_FID))
+
+    def test_two_results_with_one_name_download_to_the_same_target_in_order(self):
+        window = self._window()
+        with tempfile.TemporaryDirectory() as folder:
+            window._output_dir = folder
+            window._search_var.set("报告")
+            window.search_subdirectories()
+            self._submitted(window)
+            window._handle(
+                SearchResults(
+                    fid=ROOT_FID,
+                    query="报告",
+                    entries=(
+                        Entry("m1", "报告.bin", False, 4, "/我的网盘/A/报告.bin", (("0", "我的网盘"), ("a", "A"))),
+                        Entry("m2", "报告.bin", False, 4, "/我的网盘/B/报告.bin", (("0", "我的网盘"), ("b", "B"))),
+                    ),
+                )
+            )
+            window._tree.selection_ids = ("row1", "row0")
+
+            window.start_download()
+            # The name stays the name the library knows: both matches are asked
+            # for the same local target, in table order, and the library's
+            # existing refusal decides the second one.
+            self.assertEqual(
+                self._submitted(window),
+                Download(
+                    fid="m1",
+                    target=str(Path(folder) / "报告.bin"),
+                    recursive=False,
+                    overwrite=False,
+                    name="报告.bin",
+                ),
+            )
+            window._handle(Failed(DOWNLOAD_ACTION, "下载失败：目标文件已存在；使用 --overwrite 显式覆盖"))
+            self.assertEqual(
+                self._submitted(window),
+                Download(
+                    fid="m2",
+                    target=str(Path(folder) / "报告.bin"),
+                    recursive=False,
+                    overwrite=False,
+                    name="报告.bin",
+                ),
+            )
+            window._handle(Finished(DOWNLOAD_ACTION, "已下载 报告.bin：4 B"))
+            self.assertFalse(window._downloading)
+            self.assertEqual(window._status_var.value, "下载结束：共 2 项，成功 1 项，失败 1 项")
+
+
+class FilterTests(WindowCase):
+    """The keyword box and the type box re-render what the window already holds."""
+
+    ROWS = (
+        Entry("d", "文档", True, None),
+        Entry("f1", "报告.PDF", False, 4),
+        Entry("f2", "Report.txt", False, 8),
+    )
+
+    def _labels(self, window: DownloaderWindow) -> list[str]:
+        return [row[1] for row in window._tree.rows]
+
+    def test_the_keyword_filters_case_insensitively_without_a_request(self):
+        window = self._window()
+        self._listing(window, *self.ROWS)
+        self.assertEqual(self._labels(window), ["文档", "报告.PDF", "Report.txt"])
+
+        window._search_var.set("report")
+        self.assertEqual(self._labels(window), ["Report.txt"])
+        self.assertEqual(window._count_var.value, match_text(3, 1))
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+    def test_the_type_box_and_the_keyword_combine_and_relax_again(self):
+        window = self._window()
+        self._listing(window, *self.ROWS)
+
+        window._search_var.set("报告")
+        self.assertEqual(self._labels(window), ["报告.PDF"])
+        window._kind_var.set(KIND_DIRECTORIES)
+        window._on_filter_change()
+        self.assertEqual(self._labels(window), [])
+        self.assertEqual(window._count_var.value, match_text(3, 0))
+
+        window._kind_var.set(KIND_FILES)
+        window._on_filter_change()
+        self.assertEqual(self._labels(window), ["报告.PDF"])
+
+        window._search_var.set("")
+        self.assertEqual(self._labels(window), ["报告.PDF", "Report.txt"])
+
+        window._kind_var.set(KIND_ALL)
+        window._on_filter_change()
+        self.assertEqual(self._labels(window), ["文档", "报告.PDF", "Report.txt"])
+        self.assertEqual(window._count_var.value, match_text(3, 3))
+
+    def test_the_filters_apply_to_search_results_and_restore_all_of_them(self):
+        window = self._window()
+        window._search_var.set("报告")
+        window.search_subdirectories()
+        self._submitted(window)
+        window._handle(
+            SearchResults(
+                fid=ROOT_FID,
+                query="报告",
+                entries=(
+                    Entry("m", "报告.bin", False, 4, "/我的网盘/报告.bin", (("0", "我的网盘"),)),
+                    Entry("d", "报告目录", True, None, "/我的网盘/报告目录", (("0", "我的网盘"), ("d", "报告目录"))),
+                ),
+            )
+        )
+        self.assertEqual(self._labels(window), ["报告.bin", "报告目录"])
+
+        window._kind_var.set(KIND_DIRECTORIES)
+        window._on_filter_change()
+        self.assertEqual(self._labels(window), ["报告目录"])
+        self.assertEqual(window._count_var.value, match_text(2, 1))
+
+        window._kind_var.set(KIND_ALL)
+        window._on_filter_change()
+        self.assertEqual(self._labels(window), ["报告.bin", "报告目录"])
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+    def test_following_a_folder_drops_the_local_filters_and_a_refresh_keeps_them(self):
+        window = self._window()
+        self._listing(
+            window, Entry("d", "报告目录", True, None), Entry("f", "报告.bin", False, 4)
+        )
+
+        window._search_var.set("报告")
+        window._kind_var.set(KIND_DIRECTORIES)
+        window._on_filter_change()
+        self.assertEqual([row[1] for row in window._tree.rows], ["报告目录"])
+
+        # Refreshing the folder keeps what the user filtered by.
+        window.refresh()
+        self.assertEqual(self._submitted(window), Browse(ROOT_FID))
+        self.assertEqual((window._keyword(), window._kind()), ("报告", KIND_CODE[KIND_DIRECTORIES]))
+
+        # Entering a folder drops both filters: the folder opened shows in full.
+        window._tree.selection_ids = ("row0",)
+        window._on_activate(None)
+        self.assertEqual(self._submitted(window), Browse("d"))
+        self.assertEqual((window._keyword(), window._kind()), ("", KIND_CODE[KIND_ALL]))
+        window._handle(
+            Listing("d", (Entry("x", "x.bin", False, 4), Entry("y", "报告y.bin", False, 8)))
+        )
+        self.assertEqual([row[1] for row in window._tree.rows], ["x.bin", "报告y.bin"])
+
+        # 返回上级 drops them too, and shows the parent in full.
+        window._search_var.set("x")
+        window.go_up()
+        self.assertEqual(self._submitted(window), Browse(ROOT_FID))
+        self.assertEqual((window._keyword(), window._kind()), ("", KIND_CODE[KIND_ALL]))
+        self._listing(window, Entry("d2", "目录", True, None), Entry("f2", "f.bin", False, 4))
+        self.assertEqual([row[1] for row in window._tree.rows], ["目录", "f.bin"])
+
+        # 返回目录 drops them as well, so the folder the search started from is
+        # shown in full again.
+        window._search_var.set("f")
+        window._kind_var.set(KIND_FILES)
+        window._on_filter_change()
+        window.search_subdirectories()
+        self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="f"))
+        self._results(
+            window,
+            "f",
+            Entry("f", "f.bin", False, 4, "/我的网盘/f.bin", (("0", "我的网盘"),)),
+        )
+        self.assertEqual([row[1] for row in window._tree.rows], ["f.bin"])
+
+        window.leave_search()
+        self.assertEqual(self._submitted(window), Browse(ROOT_FID))
+        self.assertEqual((window._keyword(), window._kind()), ("", KIND_CODE[KIND_ALL]))
+        self._listing(window, Entry("d3", "目录", True, None), Entry("f3", "f.bin", False, 4))
+        self.assertEqual([row[1] for row in window._tree.rows], ["目录", "f.bin"])
+
+
+class OpenFolderTests(WindowCase):
+    """``打开保存目录``: only on a click, only a folder that still exists."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.output = Path(temporary.name)
+
+    def _window(self, **options: Any) -> DownloaderWindow:
+        self.opened: list[str] = []
+        options.setdefault("folder_opener", self.opened.append)
+        return super()._window(**options)
+
+    def test_a_valid_folder_is_opened_without_touching_the_status(self):
+        window = self._window()
+        window._sync_controls()
+        self.assertEqual(window._open_folder_button.state, "disabled")
+
+        window._output_dir = str(self.output)
+        window._sync_controls()
+        self.assertEqual(window._open_folder_button.state, "normal")
+
+        window.open_output_folder()
+        self.assertEqual(self.opened, [str(self.output)])
+        self.assertEqual(window._status_var.value, "")
+
+    def test_it_is_unavailable_for_a_folder_that_disappeared_or_was_never_chosen(self):
+        window = self._window()
+        window.open_output_folder()
+        self.assertEqual(self.opened, [])
+
+        window._output_dir = str(self.output / "missing")
+        window._sync_controls()
+        window.open_output_folder()
+        self.assertEqual(self.opened, [])
+        self.assertEqual(
+            window._status_var.value,
+            describe_error(LocalIOError("本地输出目录不存在或不是目录"), OPEN_FOLDER_ACTION),
+        )
+
+    def test_a_download_freezes_it_until_the_batch_is_over(self):
+        window = self._window()
+        window._output_dir = str(self.output)
+        window._sync_controls()
+        window._downloading = True
+        window._sync_controls()
+        self.assertEqual(window._open_folder_button.state, "disabled")
+
+        window.open_output_folder()
+        self.assertEqual(self.opened, [])
+
+        window._downloading = False
+        window._sync_controls()
+        self.assertEqual(window._open_folder_button.state, "normal")
+
+    def test_a_failing_opener_becomes_one_safe_line(self):
+        window = self._window()
+        window._output_dir = str(self.output)
+
+        def boom(_path: str) -> None:
+            raise OSError(123, "The system cannot find the drive specified", str(self.output))
+
+        window._folder_opener = boom
+        window.open_output_folder()
+        self.assertEqual(
+            window._status_var.value,
+            describe_error(OSError(123, "x"), OPEN_FOLDER_ACTION),
+        )
+        self.assertNotIn(str(self.output), window._status_var.value)
+
+        def crash(_path: str) -> None:
+            raise RuntimeError("boom")
+
+        window._folder_opener = crash
+        window.open_output_folder()
+        self.assertEqual(window._status_var.value, f"{OPEN_FOLDER_ACTION}失败：发生未预期的错误")
+
+
 class StartupTests(WindowCase):
     def test_an_existing_login_browses_the_root(self):
         window = self._window()
@@ -835,6 +1518,59 @@ class WindowSmokeTests(unittest.TestCase):
         self.assertEqual(observed.get("selectmode"), "extended")
         self.assertEqual(observed.get("stop_text"), "停止下载")
         self.assertEqual(observed.get("stop_state"), "disabled")
+
+    def test_the_keyword_box_filters_the_real_table_and_the_save_folder_opens(self):
+        import tempfile
+
+        rows = [Entry("f1", "报告.bin", False, 4), Entry("f2", "其他.bin", False, 8)]
+        opened: list[str] = []
+        root = _tk_root()
+        window = DownloaderWindow(
+            cookie=lambda: "sid=test",
+            backend_factory=lambda loader: _Backend(rows),
+            root_factory=lambda: root,
+            folder_opener=opened.append,
+        )
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        observed: dict = {}
+
+        def snapshot_and_close() -> None:
+            children = window._tree.get_children()
+            if not children:
+                root.after(50, snapshot_and_close)
+                return
+            observed["path_heading"] = str(window._tree.heading("path", "text"))
+            observed["search_text"] = str(window._search_button.cget("text"))
+            observed["subtree_text"] = str(window._search_tree_button.cget("text"))
+            observed["return_text"] = str(window._return_button.cget("text"))
+            observed["kinds"] = list(window._kind_combo.cget("values"))
+            observed["open_state"] = str(window._open_folder_button.cget("state"))
+
+            # Typing in the keyword box filters the rows already in the table.
+            window._keyword_entry.insert(0, "报告")
+            observed["filtered"] = [window._tree.item(iid, "text") for iid in window._tree.get_children()]
+            observed["counts"] = window._count_var.get()
+
+            window._output_dir = temporary.name
+            window._sync_controls()
+            observed["open_state_after"] = str(window._open_folder_button.cget("state"))
+            window.open_output_folder()
+            window.close()
+
+        root.after(50, snapshot_and_close)
+        window.run()
+
+        self.assertEqual(observed.get("path_heading"), "路径")
+        self.assertEqual(observed.get("search_text"), "搜索全盘")
+        self.assertEqual(observed.get("subtree_text"), "搜索子目录")
+        self.assertEqual(observed.get("return_text"), "返回目录")
+        self.assertEqual(observed.get("kinds"), [KIND_ALL, KIND_FILES, KIND_DIRECTORIES])
+        self.assertEqual(observed.get("open_state"), "disabled")
+        self.assertEqual(observed.get("filtered"), ["报告.bin"])
+        self.assertEqual(observed.get("counts"), match_text(2, 1))
+        self.assertEqual(observed.get("open_state_after"), "normal")
+        self.assertEqual(opened, [temporary.name])
 
 
 if __name__ == "__main__":

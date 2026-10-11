@@ -20,6 +20,25 @@ while this window's own ``mainloop`` keeps running. It stores the CLI's own
 Cookie (``auth.credential_path()``), so both front-ends share one login and there
 is no second credential file to keep in sync.
 
+Searching and filtering stay local until the user asks for a request: the
+keyword box and the type box re-render the rows the window already holds through
+:func:`~quark_cli.downloader.core.filter_entries`, and only ``搜索全盘`` (the
+whole drive) or ``搜索子目录`` (the folder shown and everything below it)
+submits a :class:`~quark_cli.downloader.worker.Search`. One search is in flight
+at a time: an answer is applied only while its fid and keyword still match the
+request the window submitted, so a late answer can never fill the table with the
+rows of an older question. A search result carries the drive path of the match
+and the folder chain it lives in, so double-clicking a result folder jumps
+straight to that real folder and ``返回上级`` walks its real parents again;
+``返回目录`` ends the search and returns to the folder the search started from.
+Following a different folder — entering one, ``返回上级``, ``返回目录`` — drops
+both local filters, because the keyword box is also the query that would hide
+the rows of the folder just opened; ``刷新`` keeps them and re-runs the search
+the table shows. A search that matched nothing says so in the count line, while
+an empty folder keeps reporting its real counts. ``打开保存目录`` opens the
+frozen save folder on the user's click, through an injectable opener, so no test
+needs a desktop.
+
 Nothing here creates a window at import time: the widget references are plain
 attributes, so the rendering methods are covered by tests with stand-in widgets.
 """
@@ -27,8 +46,10 @@ attributes, so the rendering methods are covered by tests with stand-in widgets.
 from __future__ import annotations
 
 import contextlib
+import copy
+import os
 import queue
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +59,7 @@ from ..potplayer.login_gui import QrLoginWindow
 from .core import (
     DOWNLOAD_ACTION,
     ROOT_FID,
+    SEARCH_ACTION,
     Batch,
     Entry,
     Location,
@@ -46,6 +68,7 @@ from .core import (
     describe_error,
     display_text,
     download_plan,
+    filter_entries,
     item_status,
     output_folder,
 )
@@ -59,6 +82,8 @@ from .worker import (
     Finished,
     Listing,
     Progress,
+    Search,
+    SearchResults,
     Stopped,
     Worker,
 )
@@ -69,6 +94,39 @@ IDLE_STATUS = "请选择一个或多个文件或目录，然后点击「下载�
 LOGIN_HINT = "尚未登录：请点击「扫码登录」，用手机夸克 App 扫码"
 CLOSE_BUSY_STATUS = "正在下载：请等待当前下载完成后再关闭窗口"
 STOPPING_STATUS = "正在停止：当前项目将在已保存的检查点结束，请稍候"
+SEARCHING_STATUS = "正在搜索……"
+SEARCH_HINT = "请输入搜索关键词"
+#: The count line's text when a search matched nothing at all; an empty folder
+#: still reports its real counts through :func:`match_text`.
+NO_MATCH_RESULT_TEXT = "未找到匹配项"
+OPEN_FOLDER_ACTION = "打开保存目录"
+
+#: The type filter's labels and the ``kind`` each one asks
+#: :func:`~quark_cli.downloader.core.filter_entries` for.
+KIND_CHOICES: tuple[tuple[str, str], ...] = (
+    ("全部", "all"),
+    ("仅文件", "files"),
+    ("仅目录", "directories"),
+)
+
+
+def match_text(total: int, visible: int) -> str:
+    """The row counts, or the hint the local filters left an empty table with."""
+    if visible == 0 and total:
+        return f"无匹配项（共 {total} 项）"
+    return f"共 {total} 项，显示 {visible} 项"
+
+
+def default_folder_opener(path: str) -> None:
+    """Open one existing folder with the desktop's own file manager.
+
+    The path is handed to the shell-directory API as it is: no command line is
+    assembled from it, so a folder name cannot change how it is interpreted.
+    """
+    startfile = getattr(os, "startfile", None)
+    if startfile is None:
+        raise LocalIOError("当前系统不支持打开保存目录")
+    startfile(path)
 
 
 def _set_state(widget: Any, state: str) -> None:
@@ -100,7 +158,8 @@ class DownloaderWindow:
     ``cookie`` supplies the current Cookie on every request, so a login performed
     while the window is open is picked up without any session bookkeeping; by
     default it is :func:`quark_cli.auth.get_cookie` with the CLI's own precedence
-    and saved Cookie.
+    and saved Cookie. ``folder_opener`` opens the save folder for ``打开保存目录``
+    and defaults to :func:`default_folder_opener`, so tests never need a desktop.
     """
 
     def __init__(
@@ -111,14 +170,28 @@ class DownloaderWindow:
         login_window_factory: Callable[[Any], Any] | None = None,
         root_factory: Callable[[], Any] | None = None,
         transport: Any = None,
+        folder_opener: Callable[[str], None] | None = None,
     ) -> None:
         self._cookie = get_cookie if cookie is None else cookie
         factory = backend_factory or (lambda loader: DriveBackend(loader, transport=transport))
         self._worker = Worker(factory(self._cookie))
         self._login_window_factory = login_window_factory or default_login_window
         self._root_factory = root_factory
+        self._folder_opener = folder_opener or default_folder_opener
         self._location = Location()
         self._entries: dict[str, Entry] = {}
+        # The rows the window holds, before the local filters: re-rendering
+        # always starts from this complete list, never from an already filtered
+        # one, so clearing a filter restores every row.
+        self._rows: list[Entry] = []
+        # The search whose rows the table shows, and the search that is actually
+        # in flight; they are equal while the table shows what was asked for.
+        self._search: Search | None = None
+        self._pending: Search | None = None
+        # The folder the search started from, kept so ``返回目录`` can restore it
+        # even after the user walked away into a result folder.
+        self._origin: Location | None = None
+        self._searching = False
         self._output_dir = ""
         self._batch: Batch | None = None
         self._downloading = False
@@ -132,10 +205,19 @@ class DownloaderWindow:
         self._status_var: Any = None
         self._location_var: Any = None
         self._output_var: Any = None
+        self._search_var: Any = None
+        self._kind_var: Any = None
+        self._count_var: Any = None
+        self._keyword_entry: Any = None
+        self._kind_combo: Any = None
         self._up_button: Any = None
         self._refresh_button: Any = None
+        self._search_button: Any = None
+        self._search_tree_button: Any = None
+        self._return_button: Any = None
         self._login_button: Any = None
         self._output_button: Any = None
+        self._open_folder_button: Any = None
         self._download_button: Any = None
         self._stop_button: Any = None
         self._pump_id: str | None = None
@@ -189,11 +271,45 @@ class DownloaderWindow:
             side="left", fill="x", expand=True, padx=(6, 0)
         )
 
-        tree = self._tree = tk.ttk.Treeview(root, columns=("type", "size"), show="tree headings", selectmode="extended")
+        # The keyword box filters the rows the window already holds as it is
+        # typed, and doubles as the query of the two search buttons.
+        find = tk.Frame(root)
+        find.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(find, text="关键词").pack(side="left")
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", self._on_filter_change)
+        self._keyword_entry = tk.Entry(find, textvariable=self._search_var, width=22)
+        self._keyword_entry.pack(side="left", padx=(4, 6))
+        self._search_button = tk.Button(find, text="搜索全盘", width=8, command=self.search)
+        self._search_tree_button = tk.Button(
+            find, text="搜索子目录", width=10, command=self.search_subdirectories
+        )
+        self._return_button = tk.Button(find, text="返回目录", width=10, command=self.leave_search)
+        for button in (self._search_button, self._search_tree_button, self._return_button):
+            button.pack(side="left", padx=(0, 6))
+        tk.Label(find, text="类型").pack(side="left")
+        self._kind_var = tk.StringVar(value=KIND_CHOICES[0][0])
+        self._kind_combo = tk.ttk.Combobox(
+            find,
+            textvariable=self._kind_var,
+            values=[label for label, _kind in KIND_CHOICES],
+            state="readonly",
+            width=6,
+        )
+        self._kind_combo.bind("<<ComboboxSelected>>", self._on_filter_change)
+        self._kind_combo.pack(side="left", padx=(4, 6))
+        self._count_var = tk.StringVar(value=match_text(0, 0))
+        tk.Label(find, textvariable=self._count_var, anchor="e").pack(side="right")
+
+        tree = self._tree = tk.ttk.Treeview(
+            root, columns=("path", "type", "size"), show="tree headings", selectmode="extended"
+        )
         tree.heading("#0", text="名称")
+        tree.heading("path", text="路径")
         tree.heading("type", text="类型")
         tree.heading("size", text="大小")
-        tree.column("#0", width=440, anchor="w")
+        tree.column("#0", width=280, anchor="w")
+        tree.column("path", width=280, anchor="w")
         tree.column("type", width=80, anchor="center", stretch=False)
         tree.column("size", width=120, anchor="e", stretch=False)
         tree.pack(fill="both", expand=True, padx=12, pady=6)
@@ -214,6 +330,10 @@ class DownloaderWindow:
         actions.pack(fill="x", padx=12, pady=(4, 4))
         self._output_button = tk.Button(actions, text="选择保存目录", width=12, command=self.choose_output)
         self._output_button.pack(side="left", padx=(0, 6))
+        self._open_folder_button = tk.Button(
+            actions, text="打开保存目录", width=12, command=self.open_output_folder, state="disabled"
+        )
+        self._open_folder_button.pack(side="left", padx=(0, 6))
         self._output_var = tk.StringVar(value="未选择本地保存目录")
         tk.Label(actions, textvariable=self._output_var, anchor="w").pack(side="left", fill="x", expand=True, padx=6)
         self._download_button = tk.Button(actions, text="下载选中", width=10, command=self.start_download)
@@ -261,10 +381,19 @@ class DownloaderWindow:
         self._status_var = None
         self._location_var = None
         self._output_var = None
+        self._search_var = None
+        self._kind_var = None
+        self._count_var = None
+        self._keyword_entry = None
+        self._kind_combo = None
         self._up_button = None
         self._refresh_button = None
+        self._search_button = None
+        self._search_tree_button = None
+        self._return_button = None
         self._login_button = None
         self._output_button = None
+        self._open_folder_button = None
         self._download_button = None
         self._stop_button = None
         self._worker.stop()
@@ -287,14 +416,38 @@ class DownloaderWindow:
             self._handle(event)
 
     def _handle(self, event: Any) -> None:
-        if isinstance(event, Listing):
+        if isinstance(event, SearchResults):
+            # One search is in flight at a time; an answer to an older question
+            # (another fid, another keyword) is dropped instead of filling the
+            # table with rows the window did not ask for.
+            pending = self._pending
+            if not self._searching or pending is None:
+                return
+            if event.fid != pending.fid or event.query != pending.query:
+                return
+            self._searching = False
+            self._pending = None
+            self._search = pending
+            self._rows = list(event.entries)
+            self._apply_filter()
+            self._set_status(IDLE_STATUS)
+            self._sync_controls()
+        elif isinstance(event, Listing):
             # Navigating again before this answer arrived makes it stale: only
             # the folder the window is actually showing may fill the table, or
-            # the rows would contradict the location line.
-            if event.fid != self._location.fid:
+            # the rows would contradict the location line. A search in flight or
+            # on screen speaks for the folder it started from too, so no folder
+            # listing may fill the table while either holds: it would both
+            # replace the rows and end the search state before its own answer.
+            if (
+                self._searching
+                or self._search is not None
+                or event.fid != self._location.fid
+            ):
                 return
             self._render_listing(event)
             self._set_status(IDLE_STATUS)
+            self._sync_controls()
         elif isinstance(event, Progress):
             self._set_status(self._item_line(event.text))
             self._show_progress(event.fraction)
@@ -310,35 +463,99 @@ class DownloaderWindow:
             self._stop_progress(0.0)
             self._start_next()
         elif isinstance(event, Failed):
-            # A failed listing says nothing about a transfer that is already
-            # running: the window may have submitted the download from an older
-            # list while the browse was still in flight, so ending the download
-            # state here would unlock :meth:`close` under a live download. Only
-            # the download's own failure ends it; a browse failure just reports.
+            # A failed listing or search says nothing about a transfer that is
+            # already running: the window may have submitted the download from an
+            # older list while the request was still in flight, so ending the
+            # download state here would unlock :meth:`close` under a live
+            # download. Only the download's own failure ends it; anything else
+            # just reports and leaves the table as it is.
             if event.action == DOWNLOAD_ACTION:
                 self._settle(Outcome.FAILED, event.message)
                 self._stop_progress(0.0)
                 self._start_next()
-            else:
-                self._set_status(event.message)
-                self._sync_controls()
+                return
+            if event.action == SEARCH_ACTION:
+                self._searching = False
+                self._pending = None
+                if self._search is None:
+                    # Nothing of this search reached the table, so there is no
+                    # search session left to return from either.
+                    self._origin = None
+            self._set_status(event.message)
+            self._sync_controls()
 
     # -- actions ---------------------------------------------------------
 
     def go_up(self) -> None:
-        if self._downloading:
+        if self._busy():
             return
         if not self._location.up():
             self._set_status("已经在最上层目录")
             return
+        # Walking out of a result folder ends the search listing: the table
+        # follows the real folder again from here on.
+        self._search = None
+        self._clear_filters()
         self._show_location()
         self._open(self._location.fid)
 
     def refresh(self) -> None:
+        """Re-read the folder shown, or re-run the search the table shows."""
+        request = self._search
+        if request is None:
+            self._open(self._location.fid)
+            return
+        if self._busy():
+            return
+        self._pending = request
+        self._searching = True
+        self._set_status(SEARCHING_STATUS)
+        self._sync_controls()
+        self._worker.submit(request)
+
+    def search(self) -> None:
+        """Search the whole drive for the keyword in the filter box."""
+        self._submit_search(ROOT_FID)
+
+    def search_subdirectories(self) -> None:
+        """Search the folder shown and every folder below it (the root is all)."""
+        self._submit_search(self._location.fid)
+
+    def leave_search(self) -> None:
+        """Leave the search: show the folder the search started from."""
+        if self._busy() or self._origin is None:
+            return
+        origin, self._origin = self._origin, None
+        self._search = None
+        self._rows = []
+        self._render_rows(())
+        self._show_counts(0)
+        self._clear_filters()
+        self._sync_controls()
+        self._location = origin
+        self._show_location()
         self._open(self._location.fid)
 
+    def _submit_search(self, fid: str) -> None:
+        """Ask for one search of ``fid``; a keyword that is blank asks for none."""
+        if self._busy():
+            return
+        query = self._keyword()
+        if not query:
+            self._set_status(SEARCH_HINT)
+            return
+        # A search never moves the location, so the snapshot is the folder the
+        # window shows; it survives walking into a result folder, which is what
+        # ``返回目录`` restores.
+        self._origin = copy.deepcopy(self._location)
+        self._pending = Search(fid=fid, query=query)
+        self._searching = True
+        self._set_status(SEARCHING_STATUS)
+        self._sync_controls()
+        self._worker.submit(self._pending)
+
     def choose_output(self) -> None:
-        if self._downloading:
+        if self._frozen():
             return
         import tkinter.filedialog as filedialog
 
@@ -353,13 +570,33 @@ class DownloaderWindow:
         self._output_var.set(display_text(chosen))
         self._sync_controls()
 
+    def open_output_folder(self) -> None:
+        """Open the frozen save folder in the file manager, on the user's click.
+
+        The folder is validated again here, so a save folder that was moved or
+        deleted since it was chosen becomes a readable line instead of an error
+        from the desktop's own API. Opening a folder says nothing about the
+        download in progress, so a successful open leaves the progress line alone.
+        """
+        if self._frozen() or not self._output_dir:
+            return
+        try:
+            folder = output_folder(self._output_dir)
+        except (QuarkError, OSError) as error:
+            self._set_status(describe_error(error, OPEN_FOLDER_ACTION))
+            return
+        try:
+            self._folder_opener(str(folder))
+        except Exception as error:
+            self._set_status(describe_error(error, OPEN_FOLDER_ACTION))
+
     def start_download(self) -> None:
         """Freeze the selection and the output folder, then serve it in list order.
 
         Planning stays per item: an entry whose name the library refuses fails
         alone in the log and the rest of the selection continues.
         """
-        if self._downloading:
+        if self._busy():
             return
         entries = self._selected_entries()
         if not entries:
@@ -449,7 +686,7 @@ class DownloaderWindow:
         self._sync_controls()
 
     def login(self) -> None:
-        if self._downloading or self._logging_in:
+        if self._busy():
             return
         self._logging_in = True
         self._sync_controls()
@@ -473,13 +710,74 @@ class DownloaderWindow:
     # -- rendering -------------------------------------------------------
 
     def _render_listing(self, listing: Listing) -> None:
+        self._rows = list(listing.entries)
+        self._apply_filter()
+
+    def _apply_filter(self) -> None:
+        """Re-render the complete list the window holds through the local filters.
+
+        Filtering always starts from :attr:`_rows`, never from the rows already
+        on screen, so relaxing a filter brings back every row it had hidden.
+        """
+        rows = filter_entries(self._rows, query=self._keyword(), kind=self._kind())
+        self._render_rows(rows)
+        self._show_counts(len(rows))
+
+    def _render_rows(self, rows: Iterable[Entry]) -> None:
+        """Show exactly these rows; the table order is the download order."""
         tree = self._tree
         tree.delete(*tree.get_children())
         self._entries = {}
-        for index, entry in enumerate(listing.entries):
+        for index, entry in enumerate(rows):
             iid = f"row{index}"
             self._entries[iid] = entry
-            tree.insert("", "end", iid=iid, text=entry.label, values=(entry.type_label, entry.size_label))
+            tree.insert(
+                "",
+                "end",
+                iid=iid,
+                text=entry.label,
+                values=(display_text(entry.path), entry.type_label, entry.size_label),
+            )
+
+    def _show_counts(self, visible: int) -> None:
+        if self._count_var is None:
+            return
+        if self._search is not None and not self._rows:
+            # A search that matched nothing says so instead of reporting the
+            # zero counts an empty folder reports.
+            self._count_var.set(NO_MATCH_RESULT_TEXT)
+            return
+        self._count_var.set(match_text(len(self._rows), visible))
+
+    def _keyword(self) -> str:
+        return self._search_var.get().strip() if self._search_var is not None else ""
+
+    def _kind(self) -> str:
+        label = self._kind_var.get() if self._kind_var is not None else KIND_CHOICES[0][0]
+        for text, kind in KIND_CHOICES:
+            if text == label:
+                return kind
+        return KIND_CHOICES[0][1]
+
+    def _on_filter_change(self, *_event: Any) -> None:
+        """A filter changed: re-render the rows already held, without a request."""
+        if self._busy():
+            return
+        self._apply_filter()
+        self._sync_controls()
+
+    def _clear_filters(self) -> None:
+        """Drop both local filters so a folder just opened is shown in full.
+
+        The keyword box is also the query of the search buttons, so a filter left
+        over from elsewhere would hide the rows of the folder that follows. The
+        write trace of the keyword box re-renders the rows the window holds;
+        :meth:`refresh` deliberately does not clear anything.
+        """
+        if self._kind_var is not None:
+            self._kind_var.set(KIND_CHOICES[0][0])
+        if self._search_var is not None:
+            self._search_var.set("")
 
     def _show_location(self) -> None:
         if self._location_var is not None:
@@ -542,17 +840,42 @@ class DownloaderWindow:
         bar.configure(value=value)
 
     def _sync_controls(self) -> None:
-        busy = self._downloading or self._logging_in
-        state = "disabled" if busy else "normal"
-        for button in (self._up_button, self._refresh_button):
-            _set_state(button, state)
-        _set_state(self._login_button, "disabled" if self._downloading else "normal")
-        _set_state(self._output_button, state)
+        """One rule per control: what a request in flight may still change."""
+        busy = self._busy()
+        frozen = self._frozen()
+        free = "disabled" if busy else "normal"
+        for button in (
+            self._up_button,
+            self._refresh_button,
+            self._search_button,
+            self._search_tree_button,
+        ):
+            _set_state(button, free)
+        _set_state(
+            self._return_button,
+            "normal" if self._origin is not None and not busy else "disabled",
+        )
+        _set_state(self._keyword_entry, free)
+        _set_state(self._kind_combo, "disabled" if busy else "readonly")
+        _set_state(self._login_button, free)
+        _set_state(self._output_button, "disabled" if frozen else "normal")
+        _set_state(
+            self._open_folder_button,
+            "disabled" if frozen or not self._output_dir else "normal",
+        )
         _set_state(self._stop_button, "normal" if self._downloading and not self._stop_requested else "disabled")
         ready = not busy and bool(self._output_dir) and bool(self._selected_entries())
         _set_state(self._download_button, "normal" if ready else "disabled")
 
     # -- helpers ---------------------------------------------------------
+
+    def _busy(self) -> bool:
+        """Whether a request in flight freezes the list, the filters and the click."""
+        return self._downloading or self._searching or self._logging_in
+
+    def _frozen(self) -> bool:
+        """Whether the save folder may not change: a batch or a login holds it."""
+        return self._downloading or self._logging_in
 
     def _credential_available(self) -> bool:
         try:
@@ -562,8 +885,10 @@ class DownloaderWindow:
         return True
 
     def _open(self, fid: str) -> None:
-        if self._downloading:
+        """Browse a real folder; the table stops showing search results."""
+        if self._busy():
             return
+        self._search = None
         self._set_status("正在读取目录……")
         self._worker.submit(Browse(fid))
 
@@ -602,16 +927,24 @@ class DownloaderWindow:
         self._sync_controls()
 
     def _on_activate(self, event: Any) -> None:
-        # The tree stays clickable during a download, so entering a folder has
-        # to be refused here too; otherwise the location line and the table
-        # would disagree, because ``_open`` refuses to browse while busy.
-        if self._downloading:
+        # The tree stays clickable during a request in flight, so entering a
+        # folder has to be refused here too; otherwise the location line and the
+        # table would disagree, because ``_open`` refuses to browse while busy.
+        if self._busy():
             return
         row = self._activated_row(event)
         entry = self._entries.get(row) if row is not None else self._selected()
         if entry is None or not entry.directory:
             return
-        self._location.enter(entry.fid, entry.name)
+        if entry.location:
+            # A search result knows the folder chain it lives in, so the window
+            # moves straight to that real folder instead of guessing a parent.
+            self._location.replace(entry.location)
+        else:
+            self._location.enter(entry.fid, entry.name)
+        # The folder just entered is shown in full: a keyword left over from the
+        # table that was left behind would hide its rows.
+        self._clear_filters()
         self._show_location()
         self._open(entry.fid)
 

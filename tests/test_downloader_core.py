@@ -12,6 +12,7 @@ from pathlib import Path
 
 from quark_cli.downloader.core import (
     ROOT_FID,
+    ROOT_NAME,
     Batch,
     Entry,
     Location,
@@ -22,6 +23,7 @@ from quark_cli.downloader.core import (
     download_plan,
     entries,
     entry_of,
+    filter_entries,
     item_status,
     output_folder,
     progress_fraction,
@@ -79,6 +81,44 @@ class EntryTests(unittest.TestCase):
         self.assertEqual([row.name for row in rows], ["alpha", "Zeta", "A.txt", "b.txt"])
         self.assertEqual([row.directory for row in rows], [True, True, False, False])
 
+    def test_a_plain_listing_row_carries_no_search_location(self):
+        entry = entry_of(_record(7, "报告.PDF", size=4))
+        self.assertEqual((entry.path, entry.location), ("", ()))
+
+
+class FilterTests(unittest.TestCase):
+    @staticmethod
+    def _rows() -> list[Entry]:
+        return [
+            entry_of(_record("d1", "报告 目录", directory=True)),
+            entry_of(_record("f1", "年度报告.txt", size=1)),
+            entry_of(_record("f2", "Report.md", size=2)),
+            entry_of(_record("f3", "其他.bin", size=3)),
+        ]
+
+    def test_query_is_stripped_and_matched_case_insensitively(self):
+        rows = self._rows()
+        self.assertEqual([entry.fid for entry in filter_entries(rows, "  报告  ")], ["d1", "f1"])
+        self.assertEqual([entry.fid for entry in filter_entries(rows, "report")], ["f2"])
+
+    def test_kind_narrows_the_same_rows_without_reordering_them(self):
+        rows = self._rows()
+        self.assertEqual([entry.fid for entry in filter_entries(rows, "报告", "directories")], ["d1"])
+        self.assertEqual([entry.fid for entry in filter_entries(rows, "报告", "files")], ["f1"])
+        self.assertEqual([entry.fid for entry in filter_entries(rows, "", "directories")], ["d1"])
+        self.assertEqual([entry.fid for entry in filter_entries(rows)], ["d1", "f1", "f2", "f3"])
+
+    def test_the_input_order_survives_even_when_it_is_not_the_listing_order(self):
+        rows = [
+            entry_of(_record("f1", "报告.txt", size=1)),
+            entry_of(_record("d1", "报告 目录", directory=True)),
+        ]
+        self.assertEqual([entry.fid for entry in filter_entries(rows, "报告")], ["f1", "d1"])
+
+    def test_an_unknown_kind_is_a_usage_error(self):
+        with self.assertRaises(UsageError):
+            filter_entries(self._rows(), "报告", "folders")
+
 
 class LocationTests(unittest.TestCase):
     def test_navigation_is_a_chain_of_the_folders_entered(self):
@@ -103,6 +143,34 @@ class LocationTests(unittest.TestCase):
     def test_enter_rejects_a_malformed_fid(self):
         with self.assertRaises(RemoteError):
             Location().enter("../escape", "坏")
+
+    def test_replace_restores_a_full_chain_and_navigates_from_it(self):
+        location = Location()
+        location.enter("stale", "旧")
+        location.replace(((ROOT_FID, ROOT_NAME), ("a", "下载"), ("b", "子目录")))
+        self.assertEqual((location.fid, location.title), ("b", "/下载/子目录"))
+        self.assertTrue(location.up())
+        self.assertEqual((location.fid, location.title), ("a", "/下载"))
+        location.replace(((ROOT_FID, ROOT_NAME),))
+        self.assertEqual((location.fid, location.title), (ROOT_FID, "/"))
+        self.assertFalse(location.up())
+
+    def test_replace_refuses_a_chain_that_is_not_rooted_or_is_malformed(self):
+        location = Location()
+        location.enter("child", "子")
+        for chain in (
+            (),
+            (("a", "下载"),),
+            ((ROOT_FID, "别的根"),),
+            ((ROOT_FID, ROOT_NAME), (ROOT_FID, "重复根")),
+            ((ROOT_FID, ROOT_NAME), ("b", "")),
+            ((ROOT_FID, ROOT_NAME), "not-a-pair"),
+        ):
+            with self.subTest(chain=chain), self.assertRaises(UsageError):
+                location.replace(chain)
+        with self.assertRaises(RemoteError):
+            location.replace(((ROOT_FID, ROOT_NAME), ("../escape", "坏")))
+        self.assertEqual((location.fid, location.title), ("child", "/子"), "a refused chain must not move the window")
 
 
 class PlanTests(unittest.TestCase):

@@ -22,22 +22,28 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 import httpx
 
 from ..client import QuarkClient
+from ..errors import RemoteError, UsageError
 from ..files import Files
+from ..paths import RemotePaths, is_directory
 from ..recursive import RecursiveTransfer
 from ..transfer import DownloadStopped, Transfer
 from ..transfer_progress import ProgressEvent
 from .core import (
     BROWSE_ACTION,
     DOWNLOAD_ACTION,
+    ROOT_FID,
+    ROOT_NAME,
+    SEARCH_ACTION,
     Entry,
     describe_error,
     entries,
+    entry_of,
     progress_fraction,
     progress_text,
     summary_text,
@@ -49,6 +55,14 @@ class Browse:
     """Read one folder's complete listing."""
 
     fid: str
+
+
+@dataclass(frozen=True)
+class Search:
+    """Find every name matching ``query`` under ``fid`` and its subfolders."""
+
+    fid: str
+    query: str
 
 
 @dataclass(frozen=True)
@@ -65,6 +79,15 @@ class Download:
 @dataclass(frozen=True)
 class Listing:
     fid: str
+    entries: tuple[Entry, ...]
+
+
+@dataclass(frozen=True)
+class SearchResults:
+    """Every hit of one :class:`Search`, each carrying its own drive location."""
+
+    fid: str
+    query: str
     entries: tuple[Entry, ...]
 
 
@@ -103,6 +126,8 @@ class Backend(Protocol):
 
     def listing(self, fid: str) -> list[Entry]: ...
 
+    def search(self, fid: str, query: str) -> list[Entry]: ...
+
     def download(
         self,
         request: Download,
@@ -112,7 +137,7 @@ class Backend(Protocol):
 
 
 class DriveBackend:
-    """Browsing and downloading through the project library, one client per request.
+    """Browsing, searching and downloading through the project library, one client per request.
 
     A client is built per request from the current credential, so a login
     performed while the window is open is picked up without any session
@@ -140,6 +165,65 @@ class DriveBackend:
             payload = Files(client).list_all(fid)
         return entries(payload["data"]["list"])
 
+    def search(self, fid: str, query: str) -> list[Entry]:
+        """Find matches by name under ``fid``, each with its verified location.
+
+        The walk is the library's existing bounded subtree traversal, so paging,
+        repeated/cyclic FIDs and malformed names are refused by the same rules as
+        every other consumer. The scanned folder itself (depth 0) is never a hit:
+        "search inside" means its contents. Same-name objects in different
+        folders are all kept, each sorted directories-first and then by absolute
+        path, and every hit carries the real ``(fid, name)`` chain of the folder
+        that holds it, taken from the verified ancestry above ``fid`` and the
+        directories the walk actually visited — never a guessed or re-searched
+        parent.
+        """
+        keyword = query.strip()
+        if not keyword:
+            raise UsageError("请先输入搜索关键词")
+        needle = keyword.casefold()
+        with self._client() as client:
+            paths = RemotePaths(Files(client))
+            directories = self._search_directories(paths, fid)
+            found: list[Entry] = []
+            for record in paths.walk(fid):
+                name = record.get("file_name")
+                directory = is_directory(record)
+                if directory and record["path"] != "/":
+                    directories[record["path"]] = (record["fid"], name)
+                if record["depth"] == 0 or not isinstance(name, str):
+                    continue
+                if needle not in name.casefold():
+                    continue
+                containing = record["path"] if directory else _parent_path(record["path"])
+                found.append(
+                    replace(
+                        entry_of(record),
+                        path=record["path"],
+                        location=_directory_chain(directories, containing),
+                    )
+                )
+        found.sort(key=lambda entry: (not entry.directory, entry.path.casefold()))
+        return found
+
+    @staticmethod
+    def _search_directories(paths: RemotePaths, fid: str) -> dict[str, tuple[str, str]]:
+        """Verified ``path -> (fid, name)`` of every folder at or above ``fid``.
+
+        The folders above the searched one come from the library's ancestry walk,
+        which checks each parent against its actual child listing, so the prefix
+        of every hit's location is established by data, not by a name lookup.
+        """
+        directories: dict[str, tuple[str, str]] = {"/": (ROOT_FID, ROOT_NAME)}
+        path = ""
+        for obj in reversed(paths.ancestry(fid)[:-1]):
+            name = (obj.item or {}).get("file_name")
+            if not isinstance(name, str) or not name:
+                raise RemoteError("无法确认搜索结果所在目录")
+            path = f"{path}/{name}"
+            directories[path] = (obj.fid, name)
+        return directories
+
     def download(
         self,
         request: Download,
@@ -160,8 +244,33 @@ class DriveBackend:
             return transfer.download(request.fid, request.target, **options)
 
 
+def _parent_path(path: str) -> str:
+    """The folder that holds ``path``; ``/`` for an object in the drive root."""
+    cut = path.rfind("/")
+    return path[:cut] if cut > 0 else "/"
+
+
+def _directory_chain(directories: Mapping[str, tuple[str, str]], path: str) -> tuple[tuple[str, str], ...]:
+    """The root-down ``(fid, name)`` chain of one drive folder path.
+
+    Every component must already be known from a verified ancestry or from a
+    visited walk directory; a missing one means the walk and the path disagree,
+    so it is reported instead of inventing a parent FID.
+    """
+    chain: list[tuple[str, str]] = [directories["/"]]
+    names = [] if path == "/" else path[1:].split("/")
+    current = ""
+    for name in names:
+        current = f"{current}/{name}"
+        try:
+            chain.append(directories[current])
+        except KeyError:
+            raise RemoteError("无法确认搜索结果所在目录") from None
+    return tuple(chain)
+
+
 class Worker:
-    """Serialize :class:`Browse`/:class:`Download` work onto one daemon thread."""
+    """Serialize :class:`Browse`/:class:`Search`/:class:`Download` work onto one daemon thread."""
 
     def __init__(self, backend: Backend, *, events: "queue.Queue[Any]" | None = None) -> None:
         self._backend = backend
@@ -193,7 +302,7 @@ class Worker:
         self._requests.put(None)
         thread.join(timeout)
 
-    def submit(self, request: Browse | Download) -> None:
+    def submit(self, request: Browse | Search | Download) -> None:
         self._requests.put(request)
 
     def request_stop(self) -> None:
@@ -216,6 +325,8 @@ class Worker:
                 return
             if isinstance(request, Browse):
                 self._browse(request)
+            elif isinstance(request, Search):
+                self._search(request)
             else:
                 self._download(request)
 
@@ -228,6 +339,17 @@ class Worker:
             self.events.put(Failed(BROWSE_ACTION, describe_error(error, BROWSE_ACTION)))
             return
         self.events.put(Listing(request.fid, tuple(listing)))
+
+    def _search(self, request: Search) -> None:
+        try:
+            found = self._backend.search(request.fid, request.query)
+        except Exception as error:
+            # A failed search is reported like any other read failure: it never
+            # turns into a download completion or a stop, and the worker keeps
+            # serving the next request.
+            self.events.put(Failed(SEARCH_ACTION, describe_error(error, SEARCH_ACTION)))
+            return
+        self.events.put(SearchResults(request.fid, request.query, tuple(found)))
 
     def _download(self, request: Download) -> None:
         def report(event: ProgressEvent) -> None:

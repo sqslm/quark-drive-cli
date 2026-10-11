@@ -19,7 +19,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from ..errors import LocalIOError, QuarkError, RemoteError
+from ..errors import LocalIOError, QuarkError, RemoteError, UsageError
 from ..paths import is_directory, valid_fid
 from ..potplayer.status_gui import format_bytes, format_speed
 from ..transfer import safe_transfer_name
@@ -33,6 +33,9 @@ UNKNOWN_BYTES = "—"
 
 BROWSE_ACTION = "浏览"
 DOWNLOAD_ACTION = "下载"
+SEARCH_ACTION = "搜索"
+
+SEARCH_KINDS = ("all", "files", "directories")
 
 
 def display_text(value: Any) -> str:
@@ -50,12 +53,21 @@ class Entry:
     ``name`` is the remote name exactly as the API returned it: it is the name
     the local file gets, so it is validated when the download is planned rather
     than sanitized for display here.
+
+    ``path`` and ``location`` are filled in by search results only: an ordinary
+    folder listing leaves them at their defaults, because a listing row already
+    knows the folder it was read from. ``path`` is the drive absolute path of the
+    remote object and ``location`` is the full ``(fid, name)`` chain from the
+    root down to (and including) the folder that holds it, so the window can
+    show where a hit lives and jump there without re-deriving a parent FID.
     """
 
     fid: str
     name: str
     directory: bool
     size: int | None = None
+    path: str = ""
+    location: tuple[tuple[str, str], ...] = ()
 
     @property
     def label(self) -> str:
@@ -94,6 +106,32 @@ def entries(records: Iterable[Mapping[str, Any]]) -> list[Entry]:
     return rows
 
 
+def filter_entries(rows: Iterable[Entry], query: str = "", kind: str = "all") -> list[Entry]:
+    """Local narrowing of an already-read list: name substring and object kind.
+
+    The query is stripped and matched case-insensitively as a substring of the
+    remote name; an empty query narrows by kind only. Input order is kept, so the
+    window can filter a listing or a set of search hits without re-sorting it.
+    ``kind`` is one of :data:`SEARCH_KINDS`; anything else is a usage error
+    rather than a silently ignored filter.
+    """
+    if kind not in SEARCH_KINDS:
+        raise UsageError("筛选类型必须是 all、files 或 directories")
+    if not isinstance(query, str):
+        raise UsageError("搜索关键词必须是文本")
+    needle = query.strip().casefold()
+    selected: list[Entry] = []
+    for entry in rows:
+        if kind == "files" and entry.directory:
+            continue
+        if kind == "directories" and not entry.directory:
+            continue
+        if needle and needle not in entry.name.casefold():
+            continue
+        selected.append(entry)
+    return selected
+
+
 class Location:
     """Which folder the window shows, built from the folders it entered.
 
@@ -124,6 +162,29 @@ class Location:
             return False
         self._chain.pop()
         return True
+
+    def replace(self, chain: Iterable[tuple[str, str]]) -> None:
+        """Jump to a folder described by a full root-down ``(fid, name)`` chain.
+
+        Search results carry the real chain of the folder they were found in, so
+        the window restores that exact place instead of guessing a parent FID: a
+        chain that does not start at the drive root, or that carries a malformed
+        FID or a repeated root, is refused and leaves the current folder alone.
+        """
+        try:
+            items = [(fid, name) for fid, name in chain]
+        except (TypeError, ValueError):
+            raise UsageError("定位链必须是 (FID, 名称) 序列") from None
+        if not items or items[0] != (ROOT_FID, ROOT_NAME):
+            raise UsageError("定位链必须从网盘根开始")
+        rest: list[tuple[str, str]] = []
+        for fid, name in items[1:]:
+            if not isinstance(name, str) or not name:
+                raise UsageError("定位链包含无效名称")
+            if valid_fid(fid) == ROOT_FID:
+                raise UsageError("定位链包含重复的网盘根")
+            rest.append((fid, name))
+        self._chain = [(ROOT_FID, ROOT_NAME), *rest]
 
     def reset(self) -> None:
         del self._chain[1:]
