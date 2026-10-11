@@ -20,12 +20,13 @@ from quark_cli.downloader.app import (
     CLOSE_BUSY_STATUS,
     IDLE_STATUS,
     LOGIN_HINT,
+    STOPPING_STATUS,
     WINDOW_TITLE,
     DownloaderWindow,
     default_login_window,
 )
-from quark_cli.downloader.core import ROOT_FID, Entry
-from quark_cli.downloader.worker import Browse, Download, Failed, Finished, Listing, Progress
+from quark_cli.downloader.core import DOWNLOAD_ACTION, ROOT_FID, Entry
+from quark_cli.downloader.worker import Browse, Download, Failed, Finished, Listing, Progress, Stopped
 from quark_cli.errors import AuthenticationError, RemoteError
 from quark_cli.potplayer.login_gui import QrLoginWindow
 
@@ -146,6 +147,24 @@ class _FakeBar:
         self.running = False
 
 
+class _FakeLog:
+    """Records the per-item lines a real ``tk.Text`` would show; no Tk involved."""
+
+    def __init__(self) -> None:
+        self.content = ""
+        self.state = "disabled"
+
+    def configure(self, **options: Any) -> None:
+        if "state" in options:
+            self.state = options["state"]
+
+    def insert(self, _index: Any, text: str) -> None:
+        self.content += text
+
+    def see(self, _index: Any) -> None:
+        pass
+
+
 class _Backend:
     """A backend that answers immediately; the window tests never start the thread."""
 
@@ -155,7 +174,7 @@ class _Backend:
     def listing(self, fid: str) -> list[Entry]:
         return list(self.rows)
 
-    def download(self, request: Download, progress: Any) -> dict:
+    def download(self, request: Download, progress: Any, should_stop: Any = None) -> dict:
         return {"fid": request.fid, "path": request.target, "size": 0}
 
 
@@ -182,7 +201,15 @@ class WindowCase(unittest.TestCase):
         window._location_var = _FakeVar()
         window._output_var = _FakeVar()
         window._progress = _FakeBar()
-        for name in ("_up_button", "_refresh_button", "_login_button", "_output_button", "_download_button"):
+        window._log = _FakeLog()
+        for name in (
+            "_up_button",
+            "_refresh_button",
+            "_login_button",
+            "_output_button",
+            "_download_button",
+            "_stop_button",
+        ):
             setattr(window, name, _FakeButton())
         self.addCleanup(window._worker.stop)
         return window
@@ -352,6 +379,136 @@ class DownloadTests(WindowCase):
         self.assertEqual(window._download_button.state, "normal")
         window.refresh()
         self.assertEqual(self._submitted(window), Browse("0"))
+
+    def test_a_multi_selection_downloads_in_display_order_and_survives_a_failure(self):
+        window = self._window()
+        window._output_dir = str(self.output)
+        window._handle(
+            Listing(
+                "0",
+                (
+                    Entry("f1", "a.bin", False, 4),
+                    Entry("f2", "b.bin", False, 4),
+                    Entry("f3", "c.bin", False, 4),
+                ),
+            )
+        )
+        # The rows were clicked bottom-up; only the table's order reaches the worker.
+        window._tree.selection_ids = ("row2", "row0", "row1")
+
+        window.start_download()
+        self.assertEqual(
+            self._submitted(window),
+            Download(fid="f1", target=str(self.output / "a.bin"), recursive=False, overwrite=False, name="a.bin"),
+        )
+        # One at a time: nothing else is submitted while an item is in flight.
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+        conflict = "下载失败：目标文件已存在；使用 --overwrite 显式覆盖"
+        window._handle(Failed(DOWNLOAD_ACTION, conflict))
+        self.assertEqual(
+            self._submitted(window),
+            Download(fid="f2", target=str(self.output / "b.bin"), recursive=False, overwrite=False, name="b.bin"),
+        )
+        window._handle(Finished(DOWNLOAD_ACTION, "已下载 b.bin：4 B"))
+        self.assertEqual(
+            self._submitted(window),
+            Download(fid="f3", target=str(self.output / "c.bin"), recursive=False, overwrite=False, name="c.bin"),
+        )
+        window._handle(Failed(DOWNLOAD_ACTION, conflict))
+
+        self.assertFalse(window._downloading)
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+        self.assertEqual(window._status_var.value, "下载结束：共 3 项，成功 1 项，失败 2 项")
+        self.assertEqual(
+            window._log.content,
+            f"（1/3）{conflict}\n（2/3）已下载 b.bin：4 B\n（3/3）{conflict}\n",
+        )
+
+
+class StopTests(WindowCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.output = Path(temporary.name)
+
+    def _select_three(self, window: DownloaderWindow) -> None:
+        window._handle(
+            Listing(
+                "0",
+                (
+                    Entry("f1", "a.bin", False, 4),
+                    Entry("f2", "b.bin", False, 4),
+                    Entry("f3", "c.bin", False, 4),
+                ),
+            )
+        )
+        window._tree.selection_ids = ("row0", "row1", "row2")
+
+    def test_stopping_drops_the_pending_items_and_stays_busy_until_the_item_ends(self):
+        window = self._window()
+        root = window._root = _FakeRoot()
+        window._output_dir = str(self.output)
+        self._select_three(window)
+        window.start_download()
+        self.assertEqual(
+            self._submitted(window),
+            Download(fid="f1", target=str(self.output / "a.bin"), recursive=False, overwrite=False, name="a.bin"),
+        )
+        self.assertEqual(window._stop_button.state, "normal")
+
+        window.stop_download()
+        self.assertTrue(window._worker._stop.is_set())
+        self.assertEqual(window._stop_button.state, "disabled")
+        self.assertEqual(window._status_var.value, STOPPING_STATUS)
+        # The items that had not started are gone and the window is still busy:
+        # neither closing nor a second batch may start under the item that is
+        # being ended at its checkpoint.
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+        window.close()
+        self.assertFalse(root.destroyed)
+        self.assertEqual(window._status_var.value, STOPPING_STATUS)
+        window.start_download()
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+        window._handle(Stopped(DOWNLOAD_ACTION, "下载已停止：安全检查点已保留"))
+        self.assertFalse(window._downloading)
+        self.assertIsNone(window._batch)
+        self.assertEqual(window._status_var.value, "已停止：成功 0 项，1 项已停止（检查点已保留），2 项未开始")
+        self.assertEqual(
+            window._log.content,
+            "已请求停止：2 项未开始已取消；当前项目将在检查点结束\n（1/3）下载已停止：安全检查点已保留\n",
+        )
+
+    def test_the_same_selection_can_be_submitted_again_after_a_stop(self):
+        window = self._window()
+        window._root = _FakeRoot()
+        window._output_dir = str(self.output)
+        self._select_three(window)
+        window.start_download()
+        self._submitted(window)
+
+        window.stop_download()
+        window._handle(Stopped(DOWNLOAD_ACTION, "下载已停止：安全检查点已保留"))
+
+        window.start_download()
+        self.assertFalse(window._worker._stop.is_set())
+        self.assertEqual(
+            self._submitted(window),
+            Download(fid="f1", target=str(self.output / "a.bin"), recursive=False, overwrite=False, name="a.bin"),
+        )
+        for name in ("a.bin", "b.bin"):
+            window._handle(Finished(DOWNLOAD_ACTION, f"已下载 {name}：4 B"))
+            self._submitted(window)
+        window._handle(Finished(DOWNLOAD_ACTION, "已下载 c.bin：4 B"))
+        self.assertFalse(window._downloading)
+        self.assertEqual(window._status_var.value, "全部下载完成：共 3 项")
+        window.close()
+        self.assertIsNone(window._root)
 
 
 class NavigationTests(WindowCase):
@@ -597,7 +754,7 @@ class WindowSmokeTests(unittest.TestCase):
         gate = threading.Event()
 
         class _SlowDownloadBackend(_Backend):
-            def download(self, request: Download, progress: Any) -> dict:
+            def download(self, request: Download, progress: Any, should_stop: Any = None) -> dict:
                 if not gate.wait(15):
                     raise AssertionError("the test never released the download")
                 return {"fid": request.fid, "path": request.target, "size": 4}
@@ -639,7 +796,9 @@ class WindowSmokeTests(unittest.TestCase):
 
         self.assertTrue(observed.get("alive"), "the window closed under a running download")
         self.assertEqual(observed.get("status"), CLOSE_BUSY_STATUS)
-        self.assertEqual(observed.get("done_status"), "已下载 f.bin：4 B")
+        # The item's own line goes to the per-item log; the status line closes
+        # the click, so it reports the batch, not the single item.
+        self.assertEqual(observed.get("done_status"), "全部下载完成：共 1 项")
 
     def test_the_login_window_is_a_modal_child_of_the_downloader_window(self):
         import tkinter
@@ -654,6 +813,28 @@ class WindowSmokeTests(unittest.TestCase):
             child.destroy()
         finally:
             root.destroy()
+
+    def test_the_window_offers_a_multi_selection_and_a_stop_control(self):
+        root = _tk_root()
+        window = DownloaderWindow(
+            cookie=lambda: "sid=test",
+            backend_factory=lambda loader: _Backend(),
+            root_factory=lambda: root,
+        )
+        observed: dict = {}
+
+        def snapshot_and_close() -> None:
+            observed["selectmode"] = str(window._tree.cget("selectmode"))
+            observed["stop_text"] = str(window._stop_button.cget("text"))
+            observed["stop_state"] = str(window._stop_button.cget("state"))
+            window.close()
+
+        root.after(100, snapshot_and_close)
+        window.run()
+
+        self.assertEqual(observed.get("selectmode"), "extended")
+        self.assertEqual(observed.get("stop_text"), "停止下载")
+        self.assertEqual(observed.get("stop_state"), "disabled")
 
 
 if __name__ == "__main__":

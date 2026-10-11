@@ -18,7 +18,7 @@ from .files import Files
 from .paths import RemotePaths, Scope, is_directory, valid_fid
 from .shares import ShareSaver, _optional_created_fid
 from .state import StateLock, config_directory, read_json, secure_directory, write_json
-from .transfer import DEFAULT_DOWNLOAD_CONNECTIONS, Transfer, safe_transfer_name
+from .transfer import DEFAULT_DOWNLOAD_CONNECTIONS, DownloadStopped, Transfer, safe_transfer_name
 
 
 def local_name(name: str) -> str:
@@ -519,8 +519,21 @@ class RecursiveTransfer:
                     raise UsageError("下载目标已存在，默认不覆盖")
 
     def download_tree(self, fid, output, *, resume=False, overwrite=False, limit_rate=None, progress=None, scope=None,
-                      connections=DEFAULT_DOWNLOAD_CONNECTIONS):
+                      connections=DEFAULT_DOWNLOAD_CONNECTIONS, should_stop=None):
+        """Download one remote tree serially, at a durable point per file.
+
+        ``should_stop`` is asked before the tree is walked, again before every
+        node, and by each file's own transfer: a true answer raises
+        :class:`DownloadStopped` with the tree ledger still holding every
+        completed file, so a later ``resume=True`` continues instead of starting
+        over. It needs ``resume=True``, the same rule a single file download
+        has: the durable checkpoints are what make stopping safe.
+        """
         from .transfer_progress import RateLimiter
+        if should_stop is not None and not resume:
+            raise UsageError("停止下载需要 resume=True 的持久化检查点")
+        if should_stop is not None and should_stop():
+            raise DownloadStopped("下载已停止：尚未传输任何数据")
         limiter = RateLimiter(limit_rate)
         output = Path(output).absolute()
         _safe_path(output)
@@ -561,6 +574,11 @@ class RecursiveTransfer:
             try:
                 for node in nodes:
                     relative, identity = node["path"], node["identity"]
+                    if should_stop is not None and should_stop():
+                        # Durable point: every file finished so far is recorded in
+                        # the tree ledger, and the one in flight keeps its own
+                        # download checkpoint when it is asked to stop.
+                        raise DownloadStopped("目录下载已停止：已完成的项目已保留，再次提交可继续")
                     path = output / relative
                     _safe_path(path)
                     boundaries.check(identity["fid"])
@@ -572,7 +590,7 @@ class RecursiveTransfer:
                         write_json(state_path, document)
                         self.transfer.download(identity["fid"], path, resume=resume, overwrite=overwrite, limiter=limiter,
                                                progress=self._progress(progress, relative, done, total), scope=boundaries if boundaries.scopes else None,
-                                               connections=connections)
+                                               connections=connections, should_stop=should_stop)
                         self._file(identity, boundaries)
                         hashes = _hashes(path)
                         if path.stat().st_size != identity["size"]:

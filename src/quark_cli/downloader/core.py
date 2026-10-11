@@ -1,9 +1,10 @@
 """Headless rules behind the standalone downloader window.
 
-Nothing here imports Tkinter. Listing rows, folder navigation, the local target
-of a download, progress text and the user-facing error line are plain values, so
-they are covered by tests without a display. The window in
-:mod:`quark_cli.downloader.app` only renders what these functions return.
+Nothing here imports Tkinter. Listing rows, folder navigation, the frozen
+selection of one click, the local target of a download, progress text and the
+user-facing error line are plain values, so they are covered by tests without a
+display. The window in :mod:`quark_cli.downloader.app` only renders what these
+functions return.
 
 Byte and rate formatting is the same rule the PotPlayer status window uses
 (``status_gui.format_bytes``/``format_speed``): one unit convention for every
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -136,6 +138,16 @@ class Plan:
     recursive: bool
 
 
+def output_folder(output_dir: str) -> Path:
+    """Validate the chosen output folder once, before any item is planned."""
+    if not output_dir.strip():
+        raise LocalIOError("请先选择本地输出目录")
+    folder = Path(output_dir).expanduser()
+    if not folder.is_dir():
+        raise LocalIOError("本地输出目录不存在或不是目录")
+    return folder
+
+
 def download_plan(output_dir: str, entry: Entry) -> Plan:
     """Validate the chosen output folder and name the local target.
 
@@ -143,12 +155,111 @@ def download_plan(output_dir: str, entry: Entry) -> Plan:
     like ``quark download --recursive``. The name is checked with the library's
     own Windows-safe rule; unsafe names fail before any request is made.
     """
-    if not output_dir.strip():
-        raise LocalIOError("请先选择本地输出目录")
-    folder = Path(output_dir).expanduser()
-    if not folder.is_dir():
-        raise LocalIOError("本地输出目录不存在或不是目录")
+    folder = output_folder(output_dir)
     return Plan(entry.fid, folder / safe_transfer_name(entry.name), entry.directory)
+
+
+class Outcome(Enum):
+    """How the item in flight ended, as the worker reported it.
+
+    ``STOPPED`` is its own outcome: a transfer the user ended at a persisted
+    checkpoint neither published a file (not a success) nor failed (not an
+    error), so counting it either way would misreport the click.
+    """
+
+    DONE = "done"
+    FAILED = "failed"
+    STOPPED = "stopped"
+
+
+class Batch:
+    """One click's frozen selection: the entries in list order, one at a time.
+
+    The item in flight stays :attr:`current` until the worker reports its
+    outcome, so :meth:`take` never hands out the same entry twice and a stop
+    between two items can neither lose nor double-count one. Planning stays per
+    item: an entry the library refuses fails alone while the rest continue.
+    Counting is by outcome, so the closing line can always name what really
+    happened to every selected entry.
+    """
+
+    def __init__(self, output_dir: str, entries: Iterable[Entry]) -> None:
+        self.output_dir = output_dir
+        self.entries = tuple(entries)
+        self._pending = list(self.entries)
+        self.current: Entry | None = None
+        self.succeeded = 0
+        self.failed = 0
+        self.stopped = 0
+        self.skipped = 0
+
+    @property
+    def total(self) -> int:
+        """How many entries this click selected."""
+        return len(self.entries)
+
+    @property
+    def position(self) -> int:
+        """The 1-based number of the item in flight, or of the next one."""
+        return self.succeeded + self.failed + self.stopped + 1
+
+    def take(self) -> Entry | None:
+        """The next entry in list order, or ``None`` while one is already out."""
+        if self.current is not None or not self._pending:
+            return None
+        self.current = self._pending.pop(0)
+        return self.current
+
+    def settle(self, outcome: Outcome) -> None:
+        """Count the item in flight by how it ended; the worker reported it."""
+        if self.current is None:
+            return
+        if outcome is Outcome.DONE:
+            self.succeeded += 1
+        elif outcome is Outcome.STOPPED:
+            self.stopped += 1
+        else:
+            self.failed += 1
+        self.current = None
+
+    def clear(self) -> int:
+        """Drop every entry not yet started; the item in flight stays current.
+
+        The dropped entries stay counted as skipped, so a stop still reports how
+        many were cancelled even though they are gone from the queue.
+        """
+        dropped = len(self._pending)
+        self._pending.clear()
+        self.skipped += dropped
+        return dropped
+
+
+def item_status(position: int, total: int, text: str) -> str:
+    """One batch line: which item of how many, then the item's own text."""
+    return f"（{position}/{total}）{text}"
+
+
+def batch_summary(*, succeeded: int, failed: int, stopped: int, skipped: int) -> str:
+    """The closing line of one click: totals, and what a stop left behind.
+
+    A stop is named only when it did something: an item ended at its checkpoint
+    or one was cancelled before it started. A stop that arrived after the last
+    item had already published changed nothing, so the click is reported as the
+    completion it turned out to be, and a click that only failed is never
+    reported as completed.
+    """
+    if stopped or skipped:
+        parts = [f"成功 {succeeded} 项"]
+        if failed:
+            parts.append(f"失败 {failed} 项")
+        if stopped:
+            parts.append(f"{stopped} 项已停止（检查点已保留）")
+        if skipped:
+            parts.append(f"{skipped} 项未开始")
+        return "已停止：" + "，".join(parts)
+    if failed:
+        return f"下载结束：共 {succeeded + failed} 项，成功 {succeeded} 项，失败 {failed} 项"
+    return f"全部下载完成：共 {succeeded} 项"
 
 
 def progress_text(event: ProgressEvent) -> str:

@@ -5,6 +5,13 @@ Every network call and every byte of a download runs on the worker thread of
 renders the events that come back on a queue, so a folder listing or a file
 transfer never blocks the window.
 
+One click downloads the whole multi-selection: the entries are frozen in the
+order the table shows them, served one at a time, and every outcome is appended
+to the item log while the status line follows the item in flight. ``停止下载``
+drops the items that have not started and asks the worker to end the one in
+flight at the checkpoint the library already persisted, so the same selection
+can be submitted again to continue.
+
 The login panel is the shared
 :class:`~quark_cli.potplayer.login_gui.QrLoginWindow`, opened as a modal child of
 this window: ``Toplevel``, served by a nested event loop that ends with the
@@ -31,12 +38,18 @@ from ..potplayer.login_gui import QrLoginWindow
 from .core import (
     DOWNLOAD_ACTION,
     ROOT_FID,
+    Batch,
     Entry,
     Location,
+    Outcome,
+    batch_summary,
     describe_error,
     display_text,
     download_plan,
+    item_status,
+    output_folder,
 )
+
 from .worker import (
     Backend,
     Browse,
@@ -46,14 +59,16 @@ from .worker import (
     Finished,
     Listing,
     Progress,
+    Stopped,
     Worker,
 )
 
 WINDOW_TITLE = "夸克网盘下载器"
 POLL_MILLISECONDS = 120
-IDLE_STATUS = "请选择一个文件或目录，然后点击「下载选中」"
+IDLE_STATUS = "请选择一个或多个文件或目录，然后点击「下载选中」"
 LOGIN_HINT = "尚未登录：请点击「扫码登录」，用手机夸克 App 扫码"
 CLOSE_BUSY_STATUS = "正在下载：请等待当前下载完成后再关闭窗口"
+STOPPING_STATUS = "正在停止：当前项目将在已保存的检查点结束，请稍候"
 
 
 def _set_state(widget: Any, state: str) -> None:
@@ -80,7 +95,7 @@ def default_login_window(root: Any) -> QrLoginWindow:
 
 
 class DownloaderWindow:
-    """Browse the drive and download one file or one folder tree.
+    """Browse the drive and download the selected files or folder trees.
 
     ``cookie`` supplies the current Cookie on every request, so a login performed
     while the window is open is picked up without any session bookkeeping; by
@@ -105,11 +120,14 @@ class DownloaderWindow:
         self._location = Location()
         self._entries: dict[str, Entry] = {}
         self._output_dir = ""
+        self._batch: Batch | None = None
         self._downloading = False
+        self._stop_requested = False
         self._logging_in = False
         self._indeterminate = False
         self._root: Any = None
         self._tree: Any = None
+        self._log: Any = None
         self._progress: Any = None
         self._status_var: Any = None
         self._location_var: Any = None
@@ -119,6 +137,7 @@ class DownloaderWindow:
         self._login_button: Any = None
         self._output_button: Any = None
         self._download_button: Any = None
+        self._stop_button: Any = None
         self._pump_id: str | None = None
 
     # -- lifecycle -------------------------------------------------------
@@ -140,22 +159,23 @@ class DownloaderWindow:
             self._shutdown()
 
     def close(self) -> None:
-        """Close the window (Tk thread only), refused while a download runs.
+        """Close the window (Tk thread only), refused while a batch is running.
 
-        A download is not cancellable and must not be cut off by the process
-        exiting underneath it: the window stays up with a hint until the
-        transfer ends, then the usual close works.
+        A stopped batch is not over: the worker still owes the outcome of the
+        item it is ending at its checkpoint, and the process must not exit under
+        a transfer that is still writing to the library's part file. The window
+        therefore stays up until that outcome arrives, then the usual close works.
         """
         if self._downloading:
-            self._set_status(CLOSE_BUSY_STATUS)
+            self._set_status(STOPPING_STATUS if self._stop_requested else CLOSE_BUSY_STATUS)
             return
         self._shutdown()
 
     def _build(self, tk: Any) -> None:
         root = self._root
         root.title(WINDOW_TITLE)
-        root.geometry("820x560")
-        root.minsize(660, 420)
+        root.geometry("860x620")
+        root.minsize(700, 520)
 
         toolbar = tk.Frame(root)
         toolbar.pack(fill="x", padx=12, pady=(12, 6))
@@ -169,7 +189,7 @@ class DownloaderWindow:
             side="left", fill="x", expand=True, padx=(6, 0)
         )
 
-        tree = self._tree = tk.ttk.Treeview(root, columns=("type", "size"), show="tree headings", selectmode="browse")
+        tree = self._tree = tk.ttk.Treeview(root, columns=("type", "size"), show="tree headings", selectmode="extended")
         tree.heading("#0", text="名称")
         tree.heading("type", text="类型")
         tree.heading("size", text="大小")
@@ -185,6 +205,11 @@ class DownloaderWindow:
         self._progress = tk.ttk.Progressbar(bar, mode="determinate", maximum=100.0)
         self._progress.pack(fill="x")
 
+        # One line per finished item: the status line only ever describes the item
+        # in flight, so this is where per-item successes and failures accumulate.
+        self._log = tk.Text(root, height=5, wrap="word", state="disabled")
+        self._log.pack(fill="x", padx=12, pady=(0, 4))
+
         actions = tk.Frame(root)
         actions.pack(fill="x", padx=12, pady=(4, 4))
         self._output_button = tk.Button(actions, text="选择保存目录", width=12, command=self.choose_output)
@@ -193,6 +218,10 @@ class DownloaderWindow:
         tk.Label(actions, textvariable=self._output_var, anchor="w").pack(side="left", fill="x", expand=True, padx=6)
         self._download_button = tk.Button(actions, text="下载选中", width=10, command=self.start_download)
         self._download_button.pack(side="right")
+        self._stop_button = tk.Button(
+            actions, text="停止下载", width=10, command=self.stop_download, state="disabled"
+        )
+        self._stop_button.pack(side="right", padx=(0, 6))
 
         self._status_var = tk.StringVar(value=IDLE_STATUS)
         tk.Label(root, textvariable=self._status_var, anchor="w", wraplength=780, justify="left").pack(
@@ -227,6 +256,7 @@ class DownloaderWindow:
             with contextlib.suppress(Exception):
                 root.destroy()
         self._tree = None
+        self._log = None
         self._progress = None
         self._status_var = None
         self._location_var = None
@@ -236,6 +266,7 @@ class DownloaderWindow:
         self._login_button = None
         self._output_button = None
         self._download_button = None
+        self._stop_button = None
         self._worker.stop()
 
     # -- event loop ------------------------------------------------------
@@ -265,13 +296,19 @@ class DownloaderWindow:
             self._render_listing(event)
             self._set_status(IDLE_STATUS)
         elif isinstance(event, Progress):
-            self._set_status(event.text)
+            self._set_status(self._item_line(event.text))
             self._show_progress(event.fraction)
         elif isinstance(event, Finished):
-            self._downloading = False
+            self._settle(Outcome.DONE, event.summary)
             self._stop_progress(100.0)
-            self._set_status(event.summary)
-            self._sync_controls()
+            self._start_next()
+        elif isinstance(event, Stopped):
+            # The library ended the item at a checkpoint it had already
+            # persisted; the rest of the selection was cleared when the stop was
+            # asked for, so the batch closes here unless an item is still owed.
+            self._settle(Outcome.STOPPED, event.message)
+            self._stop_progress(0.0)
+            self._start_next()
         elif isinstance(event, Failed):
             # A failed listing says nothing about a transfer that is already
             # running: the window may have submitted the download from an older
@@ -279,10 +316,12 @@ class DownloaderWindow:
             # state here would unlock :meth:`close` under a live download. Only
             # the download's own failure ends it; a browse failure just reports.
             if event.action == DOWNLOAD_ACTION:
-                self._downloading = False
+                self._settle(Outcome.FAILED, event.message)
                 self._stop_progress(0.0)
-            self._set_status(event.message)
-            self._sync_controls()
+                self._start_next()
+            else:
+                self._set_status(event.message)
+                self._sync_controls()
 
     # -- actions ---------------------------------------------------------
 
@@ -315,33 +354,99 @@ class DownloaderWindow:
         self._sync_controls()
 
     def start_download(self) -> None:
+        """Freeze the selection and the output folder, then serve it in list order.
+
+        Planning stays per item: an entry whose name the library refuses fails
+        alone in the log and the rest of the selection continues.
+        """
         if self._downloading:
             return
-        entry = self._selected()
-        if entry is None:
+        entries = self._selected_entries()
+        if not entries:
             self._set_status("请先在列表中选择一个文件或目录")
             return
         try:
-            plan = download_plan(self._output_dir, entry)
+            folder = output_folder(self._output_dir)
         except (QuarkError, OSError) as error:
             self._set_status(describe_error(error, DOWNLOAD_ACTION))
             return
+        self._batch = Batch(str(folder), entries)
+        self._stop_requested = False
         self._downloading = True
         self._indeterminate = False
-        self._stop_progress(0.0)
-        self._set_status(f"正在下载 {entry.label}……")
+        # The stop flag belongs to the batch that was running; it is dropped
+        # here, before this batch's first item is submitted to the worker.
+        self._worker.clear_stop()
         self._sync_controls()
-        self._worker.submit(
-            Download(
-                fid=plan.fid,
-                target=str(plan.target),
-                recursive=plan.recursive,
-                # Downloads never replace an existing file: the library refuses it
-                # and the refusal is shown as a readable conflict message.
-                overwrite=False,
-                name=entry.name,
+        self._start_next()
+
+    def stop_download(self) -> None:
+        """Stop the batch: drop what has not started, end the item in flight safely.
+
+        The worker confirms with :class:`~quark_cli.downloader.worker.Stopped`
+        (or with the item's own outcome, if it finished first). Until then the
+        window stays busy, so closing and a new submission are both refused and
+        the process never exits under a transfer that is still writing.
+        """
+        if not self._downloading or self._stop_requested:
+            return
+        self._stop_requested = True
+        cancelled = self._batch.clear() if self._batch is not None else 0
+        self._worker.request_stop()
+        pending = f"{cancelled} 项未开始已取消；" if cancelled else ""
+        self._append_log(f"已请求停止：{pending}当前项目将在检查点结束")
+        self._set_status(STOPPING_STATUS)
+        self._sync_controls()
+
+    def _start_next(self) -> None:
+        """Submit the next selected item, log the unplannable ones, or end the batch."""
+        batch = self._batch
+        if batch is None:
+            # No batch is running, so nothing may keep the window busy: the
+            # outcome was already reported by :meth:`_settle`.
+            self._finish_batch()
+            return
+        while True:
+            item = None if self._stop_requested else batch.take()
+            if item is None:
+                self._finish_batch()
+                return
+            try:
+                plan = download_plan(batch.output_dir, item)
+            except (QuarkError, OSError) as error:
+                self._settle(Outcome.FAILED, describe_error(error, DOWNLOAD_ACTION))
+                continue
+            self._stop_progress(0.0)
+            self._set_status(self._item_line(f"正在下载 {item.label}……"))
+            self._worker.submit(
+                Download(
+                    fid=plan.fid,
+                    target=str(plan.target),
+                    recursive=plan.recursive,
+                    # Downloads never replace an existing file: the library refuses it
+                    # and the refusal is shown as a readable conflict message.
+                    overwrite=False,
+                    name=item.name,
+                )
             )
-        )
+            return
+
+    def _finish_batch(self) -> None:
+        """Close the click: report what became of every selected entry."""
+        batch = self._batch
+        self._batch = None
+        self._stop_requested = False
+        self._downloading = False
+        if batch is not None:
+            self._set_status(
+                batch_summary(
+                    succeeded=batch.succeeded,
+                    failed=batch.failed,
+                    stopped=batch.stopped,
+                    skipped=batch.skipped,
+                )
+            )
+        self._sync_controls()
 
     def login(self) -> None:
         if self._downloading or self._logging_in:
@@ -384,6 +489,32 @@ class DownloaderWindow:
         if self._status_var is not None:
             self._status_var.set(display_text(text))
 
+    def _item_line(self, text: str) -> str:
+        """One line about the item in flight: its place in the click, then the text."""
+        batch = self._batch
+        if batch is None:
+            return text
+        return item_status(batch.position, batch.total, text)
+
+    def _append_log(self, text: str) -> None:
+        """Record one finished item; the log is the per-item outcome list."""
+        log = self._log
+        if log is None:
+            return
+        log.configure(state="normal")
+        log.insert("end", display_text(text) + "\n")
+        log.see("end")
+        log.configure(state="disabled")
+
+    def _settle(self, outcome: Outcome, message: str) -> None:
+        """Log the outcome of the item in flight and count it in the batch."""
+        batch = self._batch
+        if batch is None:
+            self._set_status(message)
+            return
+        self._append_log(item_status(batch.position, batch.total, message))
+        batch.settle(outcome)
+
     def _show_progress(self, fraction: float | None) -> None:
         bar = self._progress
         if bar is None:
@@ -417,7 +548,8 @@ class DownloaderWindow:
             _set_state(button, state)
         _set_state(self._login_button, "disabled" if self._downloading else "normal")
         _set_state(self._output_button, state)
-        ready = not busy and bool(self._output_dir) and self._selected() is not None
+        _set_state(self._stop_button, "normal" if self._downloading and not self._stop_requested else "disabled")
+        ready = not busy and bool(self._output_dir) and bool(self._selected_entries())
         _set_state(self._download_button, "normal" if ready else "disabled")
 
     # -- helpers ---------------------------------------------------------
@@ -435,24 +567,48 @@ class DownloaderWindow:
         self._set_status("正在读取目录……")
         self._worker.submit(Browse(fid))
 
-    def _selected(self) -> Entry | None:
+    def _selected_entries(self) -> list[Entry]:
+        """Every selected row, in the order the table shows them.
+
+        The rows keep their listing order in :attr:`_entries`, so a batch is
+        planned and downloaded in display order no matter in which order the
+        rows were clicked.
+        """
         if self._tree is None:
+            return []
+        chosen = set(self._tree.selection())
+        if not chosen:
+            return []
+        return [entry for iid, entry in self._entries.items() if iid in chosen]
+
+    def _selected(self) -> Entry | None:
+        chosen = self._selected_entries()
+        return chosen[0] if chosen else None
+
+    def _activated_row(self, event: Any) -> str | None:
+        """The row a double-click landed on, or ``None`` when it cannot be told.
+
+        A multi-selection can span several rows, so entering the folder of the
+        *first* selected row would follow a different row than the one clicked.
+        """
+        identify = getattr(self._tree, "identify_row", None)
+        y = getattr(event, "y", None)
+        if identify is None or not isinstance(y, int):
             return None
-        selection = self._tree.selection()
-        if not selection:
-            return None
-        return self._entries.get(selection[0])
+        iid = identify(y)
+        return iid if isinstance(iid, str) and iid else None
 
     def _on_selection(self, _event: Any) -> None:
         self._sync_controls()
 
-    def _on_activate(self, _event: Any) -> None:
+    def _on_activate(self, event: Any) -> None:
         # The tree stays clickable during a download, so entering a folder has
         # to be refused here too; otherwise the location line and the table
         # would disagree, because ``_open`` refuses to browse while busy.
         if self._downloading:
             return
-        entry = self._selected()
+        row = self._activated_row(event)
+        entry = self._entries.get(row) if row is not None else self._selected()
         if entry is None or not entry.directory:
             return
         self._location.enter(entry.fid, entry.name)

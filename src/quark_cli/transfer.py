@@ -50,6 +50,19 @@ UPLOAD_READBACK_ATTEMPTS = 6
 UPLOAD_READBACK_INTERVAL = 0.5
 
 
+class DownloadStopped(QuarkError):
+    """A download the caller asked to stop ended at a durable checkpoint.
+
+    Raised only through the ``should_stop`` hook, and only where a resumed
+    download has already persisted the progress it ends at: the ledger and its
+    part file stay exactly as written, nothing is reset or deleted, and no
+    partial target is published. The same request with ``resume=True`` continues
+    from that checkpoint.
+    """
+
+    label = "download_stopped"
+
+
 def _data(payload: Mapping[str, Any], operation: str) -> Any:
     if "data" not in payload:
         raise RemoteError(f"{operation}响应缺少 data 字段")
@@ -878,12 +891,26 @@ class Transfer:
     def download(self, fid: str, output: str | Path, *, overwrite: bool = False, resume: bool = False,
                  limit_rate: int | None = None, progress: Callable[[ProgressEvent], None] | None = None,
                  scope: Scope | None = None, limiter: RateLimiter | None = None,
-                 connections: int = DEFAULT_DOWNLOAD_CONNECTIONS) -> dict[str, Any]:
+                 connections: int = DEFAULT_DOWNLOAD_CONNECTIONS,
+                 should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
+        """Stream one file to ``output`` and publish it atomically.
+
+        ``should_stop`` is an optional caller hook, asked before the first byte
+        and before every chunk of the body: a true answer raises
+        :class:`DownloadStopped`, leaving the resumed state exactly at the bytes
+        the ledger has already confirmed. A body that is already complete is
+        published rather than reported as stopped. The hook is honored only with
+        ``resume=True``, where that durable checkpoint exists.
+        """
         fid = valid_fid(fid)
         if fid == "0":
             raise UsageError("FID 无效")
         if type(connections) is not int or not 1 <= connections <= MAX_DOWNLOAD_CONNECTIONS:
             raise UsageError(f"下载并发连接数必须是 1 到 {MAX_DOWNLOAD_CONNECTIONS} 之间的整数")
+        if should_stop is not None and not resume:
+            raise UsageError("停止下载需要 resume=True 的持久化检查点")
+        if should_stop is not None and should_stop():
+            raise DownloadStopped("下载已停止：尚未传输任何数据")
         target = safe_local_path(output)
         if not target.parent.is_dir():
             raise LocalIOError("下载目标目录不存在")
@@ -1029,6 +1056,13 @@ class Transfer:
                                     continue
                                 if (length is not None and received + len(block) > length) or (expected is not None and written + len(block) > expected):
                                     raise RemoteError("下载正文超过声明长度；检查点已保留")
+                                if should_stop is not None and should_stop():
+                                    # The part file holds exactly the prefix the ledger
+                                    # has confirmed and this block is not written yet,
+                                    # so ending here is an ordinary resumable prefix —
+                                    # and a body that is already complete is published
+                                    # instead of being reported as stopped.
+                                    raise DownloadStopped("下载已停止：已保留安全检查点，再次提交可继续")
                                 pacing.consume(len(block))
                                 sink.write(block)
                                 digest.update(block)

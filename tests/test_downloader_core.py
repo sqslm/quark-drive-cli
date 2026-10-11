@@ -12,12 +12,18 @@ from pathlib import Path
 
 from quark_cli.downloader.core import (
     ROOT_FID,
+    Batch,
+    Entry,
     Location,
+    Outcome,
+    batch_summary,
     describe_error,
     display_text,
     download_plan,
     entries,
     entry_of,
+    item_status,
+    output_folder,
     progress_fraction,
     progress_text,
     summary_text,
@@ -100,6 +106,13 @@ class LocationTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
+    def test_the_output_folder_is_validated_once_for_the_whole_click(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertEqual(output_folder(folder), Path(folder))
+            for output in ("", "   ", str(Path(folder) / "missing"), str(Path(folder) / "f.bin")):
+                with self.subTest(output=output), self.assertRaises(LocalIOError):
+                    output_folder(output)
+
     def test_output_folder_must_be_chosen_and_exist(self):
         with tempfile.TemporaryDirectory() as folder:
             file_entry = entry_of(_record("f", "报告.PDF", size=4))
@@ -127,6 +140,85 @@ class PlanTests(unittest.TestCase):
             for name in ("a<b.bin", "trailing.", "trailing ", "CON"):
                 with self.subTest(name=name), self.assertRaises(UsageError):
                     download_plan(folder, entry_of(_record("f", name, size=4)))
+
+
+class BatchTests(unittest.TestCase):
+    @staticmethod
+    def _entries(*names: str) -> list[Entry]:
+        return [entry_of(_record(str(index), name, size=4)) for index, name in enumerate(names)]
+
+    def test_entries_are_served_in_list_order_one_at_a_time(self):
+        batch = Batch("C:/out", self._entries("b.bin", "a.bin", "c.bin"))
+        self.assertEqual(batch.total, 3)
+        self.assertEqual((batch.position, batch.skipped, batch.succeeded, batch.failed), (1, 0, 0, 0))
+
+        self.assertEqual(batch.take().name, "b.bin")
+        self.assertIsNone(batch.take(), "a second item must not overtake the one in flight")
+        self.assertEqual(batch.position, 1)
+        batch.settle(Outcome.DONE)
+        self.assertEqual((batch.position, batch.skipped, batch.succeeded), (2, 0, 1))
+
+        self.assertEqual(batch.take().name, "a.bin")
+        batch.settle(Outcome.FAILED)
+        self.assertEqual((batch.position, batch.failed, batch.skipped), (3, 1, 0))
+
+        self.assertEqual(batch.take().name, "c.bin")
+        batch.settle(Outcome.DONE)
+        self.assertEqual((batch.succeeded, batch.failed, batch.skipped), (2, 1, 0))
+        self.assertIsNone(batch.take())
+
+    def test_a_stopped_item_is_counted_as_neither_a_success_nor_a_failure(self):
+        batch = Batch("C:/out", self._entries("one.bin", "two.bin"))
+        batch.take()
+        batch.settle(Outcome.STOPPED)
+        self.assertEqual((batch.succeeded, batch.failed, batch.stopped), (0, 0, 1))
+        # The stopped item keeps its place in the click, so the next one is 2/2.
+        self.assertEqual((batch.position, batch.take().name), (2, "two.bin"))
+
+    def test_clear_drops_only_what_has_not_started_and_keeps_the_count(self):
+        batch = Batch("C:/out", self._entries("one.bin", "two.bin", "three.bin"))
+        self.assertEqual(batch.take().name, "one.bin")
+        self.assertEqual(batch.clear(), 2)
+        self.assertEqual(batch.skipped, 2)
+        self.assertEqual(batch.current.name, "one.bin")
+        self.assertIsNone(batch.take())
+        self.assertEqual(batch.clear(), 0, "clearing twice must not double-count")
+        batch.settle(Outcome.FAILED)
+        self.assertEqual((batch.succeeded, batch.failed, batch.skipped), (0, 1, 2))
+
+    def test_settling_without_an_item_in_flight_counts_nothing(self):
+        batch = Batch("C:/out", self._entries("one.bin"))
+        batch.settle(Outcome.DONE)
+        self.assertEqual((batch.succeeded, batch.failed, batch.stopped, batch.skipped, batch.position), (0, 0, 0, 0, 1))
+
+    def test_summary_lines_report_totals_and_what_a_stop_left_untouched(self):
+        self.assertEqual(
+            batch_summary(succeeded=3, failed=0, stopped=0, skipped=0), "全部下载完成：共 3 项"
+        )
+        self.assertEqual(
+            batch_summary(succeeded=1, failed=2, stopped=0, skipped=0),
+            "下载结束：共 3 项，成功 1 项，失败 2 项",
+        )
+        self.assertEqual(
+            batch_summary(succeeded=1, failed=1, stopped=1, skipped=2),
+            "已停止：成功 1 项，失败 1 项，1 项已停止（检查点已保留），2 项未开始",
+        )
+        # Only the last item was in flight, so only it was stopped.
+        self.assertEqual(
+            batch_summary(succeeded=2, failed=0, stopped=1, skipped=0),
+            "已停止：成功 2 项，1 项已停止（检查点已保留）",
+        )
+        # A stop that dropped nothing and stopped nothing is the completion it
+        # turned out to be; a click that failed is never reported as completed.
+        self.assertEqual(
+            batch_summary(succeeded=2, failed=0, stopped=0, skipped=0), "全部下载完成：共 2 项"
+        )
+        self.assertEqual(
+            batch_summary(succeeded=0, failed=1, stopped=0, skipped=0), "下载结束：共 1 项，成功 0 项，失败 1 项"
+        )
+
+    def test_item_status_names_the_place_in_the_click(self):
+        self.assertEqual(item_status(2, 5, "报告.bin：1 B / 2 B"), "（2/5）报告.bin：1 B / 2 B")
 
 
 class ProgressTests(unittest.TestCase):
