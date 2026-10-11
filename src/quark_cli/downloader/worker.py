@@ -1,7 +1,8 @@
 """One background thread that browses and downloads for the window.
 
-The window never performs I/O: it puts a :class:`Browse` or :class:`Download`
-request on a queue and receives :class:`Listing`, :class:`Progress`,
+The window never performs I/O: it puts a :class:`Browse`, a :class:`BrowseShare`
+(a share folder, read-only), a :class:`Search` or a :class:`Download` request on
+a queue and receives :class:`Listing`, :class:`ShareListing`, :class:`Progress`,
 :class:`Finished`, :class:`Failed` or :class:`Stopped` events back. Requests are
 served one at a time, so a download can never race a folder listing or another
 download, and every library error becomes one readable line instead of an
@@ -32,6 +33,7 @@ from ..errors import RemoteError, UsageError
 from ..files import Files
 from ..paths import RemotePaths, is_directory
 from ..recursive import RecursiveTransfer
+from ..shares import ShareSaver
 from ..transfer import DownloadStopped, Transfer
 from ..transfer_progress import ProgressEvent
 from .core import (
@@ -48,6 +50,9 @@ from .core import (
     progress_text,
     summary_text,
 )
+from .share import ShareDownloader, ShareSource
+
+SHARE_BROWSE_ACTION = "读取分享"
 
 
 @dataclass(frozen=True)
@@ -55,6 +60,14 @@ class Browse:
     """Read one folder's complete listing."""
 
     fid: str
+
+
+@dataclass(frozen=True)
+class BrowseShare:
+    """Read one folder of a share link, without saving anything."""
+
+    source: ShareSource
+    path: str = "/"
 
 
 @dataclass(frozen=True)
@@ -67,18 +80,42 @@ class Search:
 
 @dataclass(frozen=True)
 class Download:
-    """Download one file, or one folder tree, to an already-planned target."""
+    """Download one file, or one folder tree, to an already-planned target.
+
+    ``share_source`` is set only for a selection inside a share link: the item
+    is transferred into a temporary drive folder and downloaded from there, and
+    the temporary copy is removed again when the request ends. ``fid`` then
+    identifies the item inside the share and ``share_path`` is the share folder
+    that holds it. An ordinary account download leaves both at their defaults
+    and behaves exactly as before.
+    """
 
     fid: str
     target: str
     recursive: bool
     overwrite: bool
     name: str
+    share_source: ShareSource | None = None
+    share_path: str = "/"
 
 
 @dataclass(frozen=True)
 class Listing:
     fid: str
+    entries: tuple[Entry, ...]
+
+
+@dataclass(frozen=True)
+class ShareListing:
+    """One folder of a share link, as rows the window can show.
+
+    ``path`` is the share folder that was read and every row's ``path`` is its
+    absolute path inside the share. ``location`` stays empty: share rows live in
+    the share's own namespace, not in the account's folder chain.
+    """
+
+    source: ShareSource
+    path: str
     entries: tuple[Entry, ...]
 
 
@@ -126,6 +163,8 @@ class Backend(Protocol):
 
     def listing(self, fid: str) -> list[Entry]: ...
 
+    def share_listing(self, source: ShareSource, path: str) -> list[Entry]: ...
+
     def search(self, fid: str, query: str) -> list[Entry]: ...
 
     def download(
@@ -164,6 +203,19 @@ class DriveBackend:
         with self._client() as client:
             payload = Files(client).list_all(fid)
         return entries(payload["data"]["list"])
+
+    def share_listing(self, source: ShareSource, path: str) -> list[Entry]:
+        """Read one share folder, read-only: nothing is saved and nothing changes.
+
+        The rows carry the share's own FIDs, so a later download re-reads the
+        share and matches its selection by that FID. Each row's ``path`` is its
+        absolute path inside the share, which is what the download request needs
+        as the source folder.
+        """
+        with self._client() as client:
+            payload = ShareSaver(client).inspect(source.url, path=path, passcode=source.passcode)
+        parent = path.rstrip("/") if path not in ("", "/") else ""
+        return [replace(row, path=f"{parent}/{row.name}") for row in entries(payload["items"])]
 
     def search(self, fid: str, query: str) -> list[Entry]:
         """Find matches by name under ``fid``, each with its verified location.
@@ -236,6 +288,23 @@ class DriveBackend:
         if should_stop is not None:
             options["should_stop"] = should_stop
         with self._client() as client:
+            if request.share_source is not None:
+                # A share item is not an account FID: it cannot be handed to the
+                # account download or the transfer library directly, and its
+                # content may not stay in the drive, so it goes through the
+                # temporary-copy path instead.
+                if request.overwrite:
+                    raise UsageError("分享下载不覆盖已有目标")
+                return ShareDownloader(client).download(
+                    request.share_source,
+                    fid=request.fid,
+                    name=request.name,
+                    target=request.target,
+                    recursive=request.recursive,
+                    share_path=request.share_path,
+                    progress=progress,
+                    should_stop=should_stop,
+                )
             transfer = Transfer(client)
             if request.recursive:
                 return RecursiveTransfer(client, transfer=transfer).download_tree(
@@ -270,7 +339,7 @@ def _directory_chain(directories: Mapping[str, tuple[str, str]], path: str) -> t
 
 
 class Worker:
-    """Serialize :class:`Browse`/:class:`Search`/:class:`Download` work onto one daemon thread."""
+    """Serialize :class:`Browse`/:class:`BrowseShare`/:class:`Search`/:class:`Download` work onto one daemon thread."""
 
     def __init__(self, backend: Backend, *, events: "queue.Queue[Any]" | None = None) -> None:
         self._backend = backend
@@ -302,7 +371,7 @@ class Worker:
         self._requests.put(None)
         thread.join(timeout)
 
-    def submit(self, request: Browse | Search | Download) -> None:
+    def submit(self, request: Browse | BrowseShare | Search | Download) -> None:
         self._requests.put(request)
 
     def request_stop(self) -> None:
@@ -325,6 +394,8 @@ class Worker:
                 return
             if isinstance(request, Browse):
                 self._browse(request)
+            elif isinstance(request, BrowseShare):
+                self._browse_share(request)
             elif isinstance(request, Search):
                 self._search(request)
             else:
@@ -339,6 +410,16 @@ class Worker:
             self.events.put(Failed(BROWSE_ACTION, describe_error(error, BROWSE_ACTION)))
             return
         self.events.put(Listing(request.fid, tuple(listing)))
+
+    def _browse_share(self, request: BrowseShare) -> None:
+        try:
+            listing = self._backend.share_listing(request.source, request.path)
+        except Exception as error:
+            # A share that cannot be read is a read failure like any other: the
+            # link, its passcode and the share token never reach the window.
+            self.events.put(Failed(SHARE_BROWSE_ACTION, describe_error(error, SHARE_BROWSE_ACTION)))
+            return
+        self.events.put(ShareListing(request.source, request.path, tuple(listing)))
 
     def _search(self, request: Search) -> None:
         try:
@@ -361,7 +442,12 @@ class Worker:
             # The library ended at a checkpoint it had already persisted, so the
             # outcome is a stop, not a failure: nothing was published, nothing
             # is reset, and the same request continues from there.
-            self.events.put(Stopped(DOWNLOAD_ACTION, str(stopped) or "下载已停止：安全检查点已保留"))
+            message = (
+                "分享下载已停止：临时内容已清理，需重新下载"
+                if request.share_source is not None
+                else str(stopped) or "下载已停止：安全检查点已保留"
+            )
+            self.events.put(Stopped(DOWNLOAD_ACTION, message))
             return
         except Exception as error:
             self.events.put(Failed(DOWNLOAD_ACTION, describe_error(error, DOWNLOAD_ACTION)))

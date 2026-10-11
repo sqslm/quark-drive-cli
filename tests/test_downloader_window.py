@@ -13,11 +13,15 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from quark_cli.auth import LoginCancelled
 from quark_cli.downloader.app import (
+    CHECK_COLUMN,
+    CHECKED_MARK,
     CLOSE_BUSY_STATUS,
+    DOWNLOAD_BUTTON_TEXT,
     IDLE_STATUS,
     KIND_CHOICES,
     LOGIN_HINT,
@@ -25,7 +29,9 @@ from quark_cli.downloader.app import (
     OPEN_FOLDER_ACTION,
     SEARCH_HINT,
     SEARCHING_STATUS,
+    SELECT_ALL_TEXT,
     STOPPING_STATUS,
+    UNCHECKED_MARK,
     WINDOW_TITLE,
     DownloaderWindow,
     default_login_window,
@@ -115,9 +121,16 @@ class _FakeVar:
 class _FakeTree:
     """Records the rows a real ``ttk.Treeview`` would show; no Tk involved."""
 
+    #: The geometry the fake answers ``identify_*`` with: a check column that is
+    #: :data:`CHECK_WIDTH` wide, and rows that are :data:`ROW_HEIGHT` tall.
+    CHECK_WIDTH = 48
+    ROW_HEIGHT = 20
+
     def __init__(self) -> None:
         self.rows: list[tuple[str, str, tuple]] = []
         self.selection_ids: tuple[str, ...] = ()
+        self.focus_id: str = ""
+        self.bindings: dict[str, Any] = {}
 
     def delete(self, *items: Any) -> None:
         self.rows.clear()
@@ -131,14 +144,51 @@ class _FakeTree:
     def selection(self) -> tuple[str, ...]:
         return self.selection_ids
 
+    def focus(self, item: str | None = None) -> str:
+        """Read the keyboard cursor back, or move it like ``tree.focus(item)``."""
+        if item is not None:
+            self.focus_id = item
+        return self.focus_id
+
+    def bind(self, sequence: str, callback: Any) -> None:
+        self.bindings[sequence] = callback
+
+    def focus_set(self) -> None:
+        self.has_focus = True
+
+    def set(self, iid: str, column: str, value: Any) -> str:
+        """Write one cell, the way ``tree.set`` writes the check column."""
+        for index, (row_id, text, values) in enumerate(self.rows):
+            if row_id != iid:
+                continue
+            cells = list(values)
+            cells[0 if column == "check" else 1] = value
+            self.rows[index] = (row_id, text, tuple(cells))
+            return str(value)
+        raise KeyError(iid)
+
+    def identify_row(self, y: int) -> str:
+        index = int(y) // self.ROW_HEIGHT
+        if 0 <= index < len(self.rows):
+            return self.rows[index][0]
+        return ""
+
+    def identify_column(self, x: int) -> str:
+        if x <= 0:
+            return ""
+        return CHECK_COLUMN if x < self.CHECK_WIDTH else "#0"
+
 
 class _FakeButton:
     def __init__(self) -> None:
         self.state = "normal"
+        self.text = ""
 
     def configure(self, **options: Any) -> None:
         if "state" in options:
             self.state = options["state"]
+        if "text" in options:
+            self.text = options["text"]
 
 
 class _FakeCombo(_FakeButton):
@@ -254,6 +304,8 @@ class WindowCase(unittest.TestCase):
         window._search_var = _FakeVar()
         window._kind_var = _FakeVar(KIND_ALL)
         window._count_var = _FakeVar()
+        window._share_var = _FakeVar()
+        window._passcode_var = _FakeVar()
         # ``_build`` ties the keyword box to the local filter; the fake widgets
         # repeat that here, so setting the variable behaves like typing. The real
         # wiring is covered by the Tk smoke tests.
@@ -272,9 +324,14 @@ class WindowCase(unittest.TestCase):
             "_search_button",
             "_search_tree_button",
             "_return_button",
+            "_share_button",
+            "_drive_button",
+            "_select_all_button",
         ):
             setattr(window, name, _FakeButton())
         window._keyword_entry = _FakeButton()
+        window._share_entry = _FakeButton()
+        window._passcode_entry = _FakeButton()
         self.addCleanup(window._worker.stop)
         return window
 
@@ -289,6 +346,26 @@ class WindowCase(unittest.TestCase):
     @staticmethod
     def _results(window: DownloaderWindow, query: str, *entries: Entry, fid: str = ROOT_FID) -> None:
         window._handle(SearchResults(fid=fid, query=query, entries=entries))
+
+    @staticmethod
+    def _click(window: DownloaderWindow, *, x: int = 10, y: int = 0, time: int | None = None) -> Any:
+        """One press in the fake table: ``x`` picks the column, ``y`` the row."""
+        event = SimpleNamespace(x=x, y=y)
+        if time is not None:
+            event.time = time
+        return window._on_click(event)
+
+    @staticmethod
+    def _marks(window: DownloaderWindow) -> list[str]:
+        """The ``选择`` box of every row the fake table shows, in table order."""
+        return [row[2][0] for row in window._tree.rows]
+
+    @staticmethod
+    def _tick(window: DownloaderWindow, *fids: str) -> None:
+        """Tick rows the way a click on their box does, without a fake press."""
+        window._checked.update(fids)
+        window._refresh_checks()
+        window._sync_controls()
 
 
 class CloseTests(WindowCase):
@@ -354,7 +431,10 @@ class RenderingTests(WindowCase):
         window._handle(Listing("0", (Entry("d", "目录", True, None), Entry("f", "f.bin", False, 4))))
         self.assertEqual(
             window._tree.rows,
-            [("row0", "目录", ("", "目录", "—")), ("row1", "f.bin", ("", "文件", "4 B"))],
+            [
+                ("row0", "目录", (UNCHECKED_MARK, "", "目录", "—")),
+                ("row1", "f.bin", (UNCHECKED_MARK, "", "文件", "4 B")),
+            ],
         )
         self.assertEqual(window._status_var.value, IDLE_STATUS)
         self.assertEqual(window._count_var.value, match_text(2, 2))
@@ -389,27 +469,34 @@ class DownloadTests(WindowCase):
         self.addCleanup(temporary.cleanup)
         self.output = Path(temporary.name)
 
-    def test_download_needs_a_selection_and_an_output_directory(self):
+    def test_download_needs_a_ticked_row_and_an_output_directory(self):
         window = self._window()
         window._handle(Listing("0", (Entry("f", "f.bin", False, 4),)))
 
         window.start_download()
-        self.assertEqual(window._status_var.value, "请先在列表中选择一个文件或目录")
+        self.assertEqual(window._status_var.value, "请先在列表中勾选一个文件或目录")
         with self.assertRaises(queue.Empty):
             self._submitted(window)
 
+        # Highlighting the row is not the selection the click takes.
         window._tree.selection_ids = ("row0",)
+        window.start_download()
+        self.assertEqual(window._status_var.value, "请先在列表中勾选一个文件或目录")
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+        self._tick(window, "f")
         window.start_download()
         self.assertEqual(window._status_var.value, "下载失败：请先选择本地输出目录")
         with self.assertRaises(queue.Empty):
             self._submitted(window)
 
-    def test_a_selected_folder_is_planned_under_its_name_and_blocks_the_window(self):
+    def test_a_ticked_folder_is_planned_under_its_name_and_blocks_the_window(self):
         window = self._window()
         window._output_dir = str(self.output)
         window._output_var.set(str(self.output))
         window._handle(Listing("0", (Entry("d", "中文 目录", True, None),)))
-        window._tree.selection_ids = ("row0",)
+        self._tick(window, "d")
 
         window.start_download()
         self.assertEqual(
@@ -421,11 +508,11 @@ class DownloadTests(WindowCase):
         self.assertEqual(window._up_button.state, "disabled")
         self.assertEqual(window._login_button.state, "disabled")
 
-    def test_a_selected_file_uses_a_single_non_recursive_download(self):
+    def test_a_ticked_file_uses_a_single_non_recursive_download(self):
         window = self._window()
         window._output_dir = str(self.output)
         window._handle(Listing("0", (Entry("f", "报告.PDF", False, 4),)))
-        window._tree.selection_ids = ("row0",)
+        self._tick(window, "f")
         window.start_download()
         self.assertEqual(
             self._submitted(window),
@@ -436,7 +523,7 @@ class DownloadTests(WindowCase):
         window = self._window()
         window._output_dir = str(self.output)
         window._handle(Listing("0", (Entry("f", "报告.PDF", False, 4),)))
-        window._tree.selection_ids = ("row0",)
+        self._tick(window, "f")
         window.start_download()
         self._submitted(window)
 
@@ -466,8 +553,8 @@ class DownloadTests(WindowCase):
                 ),
             )
         )
-        # The rows were clicked bottom-up; only the table's order reaches the worker.
-        window._tree.selection_ids = ("row2", "row0", "row1")
+        # The boxes were ticked bottom-up; only the table's order reaches the worker.
+        self._tick(window, "f3", "f1", "f2")
 
         window.start_download()
         self.assertEqual(
@@ -507,7 +594,7 @@ class StopTests(WindowCase):
         self.addCleanup(temporary.cleanup)
         self.output = Path(temporary.name)
 
-    def _select_three(self, window: DownloaderWindow) -> None:
+    def _tick_three(self, window: DownloaderWindow) -> None:
         window._handle(
             Listing(
                 "0",
@@ -518,13 +605,13 @@ class StopTests(WindowCase):
                 ),
             )
         )
-        window._tree.selection_ids = ("row0", "row1", "row2")
+        self._tick(window, "f1", "f2", "f3")
 
     def test_stopping_drops_the_pending_items_and_stays_busy_until_the_item_ends(self):
         window = self._window()
         root = window._root = _FakeRoot()
         window._output_dir = str(self.output)
-        self._select_three(window)
+        self._tick_three(window)
         window.start_download()
         self.assertEqual(
             self._submitted(window),
@@ -561,7 +648,7 @@ class StopTests(WindowCase):
         window = self._window()
         window._root = _FakeRoot()
         window._output_dir = str(self.output)
-        self._select_three(window)
+        self._tick_three(window)
         window.start_download()
         self._submitted(window)
 
@@ -711,8 +798,8 @@ class SearchTests(WindowCase):
         self.assertEqual(
             window._tree.rows,
             [
-                ("row0", "报告.bin", ("/我的网盘/文档/报告.bin", "文件", "4 B")),
-                ("row1", "报告目录", ("/我的网盘/报告目录", "目录", "—")),
+                ("row0", "报告.bin", (UNCHECKED_MARK, "/我的网盘/文档/报告.bin", "文件", "4 B")),
+                ("row1", "报告目录", (UNCHECKED_MARK, "/我的网盘/报告目录", "目录", "—")),
             ],
         )
         self.assertEqual(window._status_var.value, IDLE_STATUS)
@@ -868,8 +955,7 @@ class SearchTests(WindowCase):
         self._listing(window, Entry("d", "报告目录", True, None))
         with tempfile.TemporaryDirectory() as folder:
             window._output_dir = folder
-            window._tree.selection_ids = ("row0",)
-            window._sync_controls()
+            self._tick(window, "d")
             window._search_var.set("报告")
             window.search_subdirectories()
             self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告"))
@@ -917,7 +1003,7 @@ class SearchTests(WindowCase):
                     ),
                 )
             )
-            window._tree.selection_ids = ("row0", "row1")
+            self._tick(window, "m", "n")
             window.start_download()
             self.assertEqual(
                 self._submitted(window),
@@ -1010,7 +1096,7 @@ class SearchTests(WindowCase):
                     ),
                 )
             )
-            window._tree.selection_ids = ("row1", "row0")
+            self._tick(window, "m2", "m1")
 
             window.start_download()
             # The name stays the name the library knows: both matches are asked
@@ -1169,6 +1255,202 @@ class FilterTests(WindowCase):
         self.assertEqual((window._keyword(), window._kind()), ("", KIND_CODE[KIND_ALL]))
         self._listing(window, Entry("d3", "目录", True, None), Entry("f3", "f.bin", False, 4))
         self.assertEqual([row[1] for row in window._tree.rows], ["目录", "f.bin"])
+
+
+class CheckboxTests(WindowCase):
+    """The ``选择`` box is the selection; the highlight and the cursor are not."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.output = Path(temporary.name)
+
+    def _two_rows(self) -> DownloaderWindow:
+        """A window that shows two files, with a save folder already chosen."""
+        window = self._window()
+        window._output_dir = str(self.output)
+        self._listing(window, Entry("f1", "a.bin", False, 4), Entry("f2", "b.bin", False, 4))
+        return window
+
+    @staticmethod
+    def _second_row() -> int:
+        """A ``y`` inside the second row of the fake table."""
+        return _FakeTree.ROW_HEIGHT + 1
+
+    def test_a_plain_click_ticks_that_row_and_a_second_one_untickes_it(self):
+        window = self._two_rows()
+        window._tree.selection_ids = ("row1",)
+
+        # One click, no modifier key: the box of the row under the pointer, and
+        # the highlight the table already had is left alone.
+        self.assertEqual(self._click(window, y=1), "break")
+        self.assertEqual(self._marks(window), [CHECKED_MARK, UNCHECKED_MARK])
+        self.assertEqual(window._checked, {"f1"})
+        self.assertEqual(window._tree.selection_ids, ("row1",))
+
+        self._click(window, y=1, time=2000)
+        self.assertEqual(self._marks(window), [UNCHECKED_MARK, UNCHECKED_MARK])
+        self.assertEqual(window._checked, set())
+
+    def test_a_click_outside_the_box_only_highlights_and_queues_nothing(self):
+        window = self._two_rows()
+
+        # The name column keeps the table's own selection behaviour...
+        self.assertIsNone(self._click(window, x=_FakeTree.CHECK_WIDTH + 5, y=1))
+        self.assertEqual(window._checked, set())
+        self.assertEqual(self._marks(window), [UNCHECKED_MARK, UNCHECKED_MARK])
+        # ...and the row that is highlighted is not what the click takes.
+        window._tree.selection_ids = ("row0",)
+        window.start_download()
+        self.assertEqual(window._status_var.value, "请先在列表中勾选一个文件或目录")
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+    def test_the_header_and_the_space_below_the_rows_tick_nothing(self):
+        window = self._two_rows()
+        self.assertEqual(self._click(window, y=-1), "break")
+        self.assertEqual(self._click(window, y=500), "break")
+        self.assertIsNone(self._click(window, x=0, y=1))
+        self.assertEqual(window._checked, set())
+
+    def test_a_click_on_the_box_leaves_the_keyboard_cursor_on_that_row(self):
+        window = self._two_rows()
+        window._tree.focus_id = "row0"
+
+        self._click(window, y=self._second_row())
+        self.assertEqual(window._tree.focus(), "row1")
+        # The space bar now ticks the row the click was on, not the old cursor.
+        window._on_space(None)
+        self.assertEqual(self._marks(window), [UNCHECKED_MARK, UNCHECKED_MARK])
+        self.assertEqual(window._checked, set())
+
+    def test_the_space_bar_ticks_the_focused_row_only(self):
+        window = self._two_rows()
+        window._on_space(None)
+        self.assertEqual(window._checked, set())
+
+        window._tree.focus_id = "row1"
+        window._on_space(None)
+        self.assertEqual(self._marks(window), [UNCHECKED_MARK, CHECKED_MARK])
+        self.assertEqual(window._checked, {"f2"})
+
+        # A cursor on a row the table no longer holds ticks nothing.
+        window._tree.focus_id = "row9"
+        window._on_space(None)
+        self.assertEqual(window._checked, {"f2"})
+
+    def test_a_double_click_on_the_box_ticks_once_and_opens_nothing(self):
+        window = self._window()
+        self._listing(window, Entry("d", "目录", True, None), Entry("f", "f.bin", False, 4))
+
+        # Tk dispatches the second press to the double-click binding instead
+        # of the single-click binding.
+        self._click(window, y=1, time=3000)
+        window._on_activate(SimpleNamespace(x=10, y=1, time=3100))
+
+        self.assertEqual(self._marks(window), [CHECKED_MARK, UNCHECKED_MARK])
+        self.assertEqual(window._checked, {"d"})
+        self.assertEqual((window._location.fid, window._location_var.value), (ROOT_FID, ""))
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+    def test_select_all_ticks_the_visible_rows_and_the_click_takes_those(self):
+        window = self._two_rows()
+        window._search_var.set("a.bin")
+
+        window.toggle_all()
+        self.assertEqual(window._checked, {"f1"})
+        self.assertEqual(self._marks(window), [CHECKED_MARK])
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+        window._search_var.set("")
+        self.assertEqual(self._marks(window), [CHECKED_MARK, UNCHECKED_MARK])
+        self.assertEqual(window._count_var.value, f"{match_text(2, 2)}，已选 1 项")
+        window.start_download()
+        self.assertEqual(
+            self._submitted(window),
+            Download(fid="f1", target=str(self.output / "a.bin"), recursive=False, overwrite=False, name="a.bin"),
+        )
+
+        # A tick on a row the filter hides is not part of the click either.
+        window._handle(Finished(DOWNLOAD_ACTION, "已下载 a.bin：4 B"))
+        window._search_var.set("b.bin")
+        window.start_download()
+        self.assertEqual(window._status_var.value, "请先在列表中勾选一个文件或目录")
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+    def test_select_all_untickes_when_every_visible_row_is_ticked(self):
+        window = self._two_rows()
+        window.toggle_all()
+        self.assertEqual(window._checked, {"f1", "f2"})
+        self.assertEqual(self._marks(window), [CHECKED_MARK, CHECKED_MARK])
+
+        window.toggle_all()
+        self.assertEqual(window._checked, set())
+        self.assertEqual(self._marks(window), [UNCHECKED_MARK, UNCHECKED_MARK])
+
+    def test_a_tick_survives_a_filter_and_a_refresh_and_goes_with_its_row(self):
+        window = self._two_rows()
+        self._click(window, y=1)
+        self.assertEqual(window._checked, {"f1"})
+
+        # A filter hides the row and brings it back with its box still ticked.
+        window._search_var.set("b.bin")
+        self.assertEqual(self._marks(window), [UNCHECKED_MARK])
+        window._search_var.set("")
+        self.assertEqual(self._marks(window), [CHECKED_MARK, UNCHECKED_MARK])
+
+        # 刷新 re-reads the folder: every row that is still there keeps its box.
+        window.refresh()
+        self.assertEqual(self._submitted(window), Browse(ROOT_FID))
+        self._listing(window, Entry("f1", "a.bin", False, 4), Entry("f2", "b.bin", False, 4))
+        self.assertEqual(self._marks(window), [CHECKED_MARK, UNCHECKED_MARK])
+
+        # The row is gone: its fid goes with it, and the file that takes its
+        # table position does not inherit the tick.
+        self._listing(window, Entry("f9", "新.bin", False, 4), Entry("f2", "b.bin", False, 4))
+        self.assertEqual(window._checked, set())
+        self.assertEqual(self._marks(window), [UNCHECKED_MARK, UNCHECKED_MARK])
+        window.start_download()
+        self.assertEqual(window._status_var.value, "请先在列表中勾选一个文件或目录")
+        with self.assertRaises(queue.Empty):
+            self._submitted(window)
+
+    def test_leaving_the_folder_starts_from_an_empty_tick_set(self):
+        window = self._two_rows()
+        self._click(window, y=1)
+        self.assertEqual(window._checked, {"f1"})
+
+        # 返回上级 at the root does not leave the folder, so the tick stays.
+        window.go_up()
+        self.assertEqual(window._checked, {"f1"})
+
+        self._listing(
+            window,
+            Entry("d", "目录", True, None),
+            Entry("f1", "a.bin", False, 4),
+            Entry("f2", "b.bin", False, 4),
+        )
+        self.assertEqual(window._checked, {"f1"})
+        window._tree.selection_ids = ("row0",)
+        window._on_activate(None)
+        self.assertEqual(self._submitted(window), Browse("d"))
+        self.assertEqual(window._checked, set())
+
+    def test_a_running_download_freezes_the_boxes_and_select_all(self):
+        window = self._two_rows()
+        self._click(window, y=1)
+        window.start_download()
+        self._submitted(window)
+
+        self.assertEqual(self._click(window, y=self._second_row()), "break")
+        self.assertEqual(window._on_space(None), "break")
+        window.toggle_all()
+        self.assertEqual(window._checked, {"f1"})
+        self.assertEqual(self._marks(window), [CHECKED_MARK, UNCHECKED_MARK])
+        self.assertEqual(window._select_all_button.state, "disabled")
 
 
 class OpenFolderTests(WindowCase):
@@ -1458,7 +1740,9 @@ class WindowSmokeTests(unittest.TestCase):
             if not children:
                 root.after(50, begin)
                 return
-            window._tree.selection_set(children[0])
+            box = window._tree.bbox(children[0], "check")
+            window._on_click(SimpleNamespace(x=box[0] + box[2] // 2, y=box[1] + box[3] // 2))
+            self.assertTrue(window._checked)
             window.start_download()
             self.assertTrue(window._downloading)
             window.close()
@@ -1475,6 +1759,7 @@ class WindowSmokeTests(unittest.TestCase):
             window.close()
 
         root.after(50, begin)
+        root.after(5000, root.quit)
         window.run()
 
         self.assertTrue(observed.get("alive"), "the window closed under a running download")
@@ -1508,6 +1793,12 @@ class WindowSmokeTests(unittest.TestCase):
 
         def snapshot_and_close() -> None:
             observed["selectmode"] = str(window._tree.cget("selectmode"))
+            observed["check_heading"] = window._tree.heading("check", "text")
+            observed["select_all"] = window._select_all_button.cget("text")
+            observed["download"] = window._download_button.cget("text")
+            observed["share"] = window._share_button.cget("text")
+            observed["drive"] = window._drive_button.cget("text")
+            observed["passcode_mask"] = window._passcode_entry.cget("show")
             observed["stop_text"] = str(window._stop_button.cget("text"))
             observed["stop_state"] = str(window._stop_button.cget("state"))
             window.close()
@@ -1516,6 +1807,12 @@ class WindowSmokeTests(unittest.TestCase):
         window.run()
 
         self.assertEqual(observed.get("selectmode"), "extended")
+        self.assertEqual(observed.get("check_heading"), "选择")
+        self.assertEqual(observed.get("select_all"), SELECT_ALL_TEXT)
+        self.assertEqual(observed.get("download"), DOWNLOAD_BUTTON_TEXT)
+        self.assertEqual(observed.get("share"), "打开分享")
+        self.assertEqual(observed.get("drive"), "我的网盘")
+        self.assertEqual(observed.get("passcode_mask"), "*")
         self.assertEqual(observed.get("stop_text"), "停止下载")
         self.assertEqual(observed.get("stop_state"), "disabled")
 

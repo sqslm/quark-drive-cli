@@ -300,7 +300,7 @@ def item_status(position: int, total: int, text: str) -> str:
     return f"（{position}/{total}）{text}"
 
 
-def batch_summary(*, succeeded: int, failed: int, stopped: int, skipped: int) -> str:
+def batch_summary(*, succeeded: int, failed: int, stopped: int, skipped: int, resume_available: bool = True) -> str:
     """The closing line of one click: totals, and what a stop left behind.
 
     A stop is named only when it did something: an item ended at its checkpoint
@@ -314,7 +314,8 @@ def batch_summary(*, succeeded: int, failed: int, stopped: int, skipped: int) ->
         if failed:
             parts.append(f"失败 {failed} 项")
         if stopped:
-            parts.append(f"{stopped} 项已停止（检查点已保留）")
+            detail = "检查点已保留" if resume_available else "需重新下载"
+            parts.append(f"{stopped} 项已停止（{detail}）")
         if skipped:
             parts.append(f"{skipped} 项未开始")
         return "已停止：" + "，".join(parts)
@@ -326,6 +327,9 @@ def batch_summary(*, succeeded: int, failed: int, stopped: int, skipped: int) ->
 def progress_text(event: ProgressEvent) -> str:
     """One status line for a transfer event; never contains a URL or a Cookie."""
     name = display_text(event.name)
+    if event.phase in ("saving", "cleaning"):
+        action = "正在临时转存" if event.phase == "saving" else "正在清理临时目录"
+        return f"{name}：{action}"
     if event.total is None:
         return f"{name}：已传输 {format_bytes(event.transferred)} · {format_speed(event.rate)}"
     return (

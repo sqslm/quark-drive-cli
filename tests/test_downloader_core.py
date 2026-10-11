@@ -276,6 +276,10 @@ class BatchTests(unittest.TestCase):
             batch_summary(succeeded=2, failed=0, stopped=1, skipped=0),
             "已停止：成功 2 项，1 项已停止（检查点已保留）",
         )
+        self.assertEqual(
+            batch_summary(succeeded=0, failed=0, stopped=1, skipped=1, resume_available=False),
+            "已停止：成功 0 项，1 项已停止（需重新下载），1 项未开始",
+        )
         # A stop that dropped nothing and stopped nothing is the completion it
         # turned out to be; a click that failed is never reported as completed.
         self.assertEqual(
@@ -290,6 +294,11 @@ class BatchTests(unittest.TestCase):
 
 
 class ProgressTests(unittest.TestCase):
+    def test_share_preparation_and_cleanup_show_the_current_operation(self):
+        for phase, action in (("saving", "正在临时转存"), ("cleaning", "正在清理临时目录")):
+            event = ProgressEvent("download", phase, "报告.bin", 0, 0, None, 0.0)
+            self.assertEqual(progress_text(event), f"报告.bin：{action}")
+
     def test_known_size_renders_bytes_and_rate(self):
         event = ProgressEvent("download", "transferring", "报告.bin", 512, 512, 1024, 1048576.0)
         self.assertEqual(progress_text(event), "报告.bin：512 B / 1.0 KiB · 1.0 MiB/s")

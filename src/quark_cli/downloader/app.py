@@ -39,6 +39,32 @@ an empty folder keeps reporting its real counts. ``打开保存目录`` opens th
 frozen save folder on the user's click, through an injectable opener, so no test
 needs a desktop.
 
+A shared link is browsed in place, never saved into the drive: ``打开分享``
+accepts only the strict ``https://pan.quark.cn/s/<分享ID>`` URL the CLI accepts
+and marks the table as a share view, whose folders are read with
+:class:`~quark_cli.downloader.worker.BrowseShare` and whose own folder chain is
+kept apart from the account's (a share FID means nothing to the account API).
+Opening it ends the account search the table may have been showing, and a folder
+switch inside the share shows an empty table until the new path answers, so a
+failed read can never leave rows under a location line they do not belong to.
+The account search buttons are refused there, because a search would read the
+account instead of the share, while ``我的网盘`` returns to the folder the drive
+was showing. A share download carries its source and the shown folder along, and
+one short line says that it is transferred through a temporary cloud folder that
+is dropped when the click ends; the backend does that, no confirmation is asked.
+
+The table's first column is its own ``选择`` box: a click on that column — or
+the space bar on the focused row — ticks one row, which is what a download
+takes, in table order. Highlighting a row still only says where navigation and
+the keyboard are, and ``全选/取消全选`` ticks exactly the rows the local filters
+currently show, so a hidden row is never downloaded by surprise. A click on a
+box also puts the keyboard cursor on that row, so the space bar follows the
+click instead of the row the cursor was on, and a double-click there is one tick
+and never a step into the folder below. Ticks are kept
+by fid, so a filter may hide a row and bring it back with its box still ticked,
+``刷新`` drops only the fids that are gone, and leaving the folder or the view
+starts from an empty tick set.
+
 Nothing here creates a window at import time: the widget references are plain
 attributes, so the rendering methods are covered by tests with stand-in widgets.
 """
@@ -56,6 +82,7 @@ from typing import Any
 from ..auth import LoginCancelled, get_cookie
 from ..errors import LocalIOError, QuarkError
 from ..potplayer.login_gui import QrLoginWindow
+from ..shares import parse_share_url as parse_share_link
 from .core import (
     DOWNLOAD_ACTION,
     ROOT_FID,
@@ -72,10 +99,13 @@ from .core import (
     item_status,
     output_folder,
 )
+from .share import ShareSource
 
 from .worker import (
+    SHARE_BROWSE_ACTION,
     Backend,
     Browse,
+    BrowseShare,
     Download,
     DriveBackend,
     Failed,
@@ -84,13 +114,14 @@ from .worker import (
     Progress,
     Search,
     SearchResults,
+    ShareListing,
     Stopped,
     Worker,
 )
 
 WINDOW_TITLE = "夸克网盘下载器"
 POLL_MILLISECONDS = 120
-IDLE_STATUS = "请选择一个或多个文件或目录，然后点击「下载选中」"
+IDLE_STATUS = "请勾选一个或多个文件或目录，然后点击「下载选中」"
 LOGIN_HINT = "尚未登录：请点击「扫码登录」，用手机夸克 App 扫码"
 CLOSE_BUSY_STATUS = "正在下载：请等待当前下载完成后再关闭窗口"
 STOPPING_STATUS = "正在停止：当前项目将在已保存的检查点结束，请稍候"
@@ -100,6 +131,25 @@ SEARCH_HINT = "请输入搜索关键词"
 #: still reports its real counts through :func:`match_text`.
 NO_MATCH_RESULT_TEXT = "未找到匹配项"
 OPEN_FOLDER_ACTION = "打开保存目录"
+
+#: The share view's root path: the share is browsed from its own top folder, and
+#: this is also the path every share download of that folder carries.
+SHARE_ROOT_PATH = "/"
+SHARE_IMPORT_ACTION = "导入分享"
+SHARE_READING_STATUS = "正在读取分享……"
+SHARE_TOP_STATUS = "已在分享最上层目录"
+#: The one line a share click says about what the backend does with it: the
+#: click is the authorisation, so no confirmation is asked.
+SHARE_DOWNLOAD_HINT = "分享下载将临时转存，结束后自动清理；停止后需重新下载"
+
+#: The ``选择`` box is the table's first data column, so
+#: :meth:`ttk.Treeview.identify_column` names it ``#1`` (``#0`` is the name
+#: column). The box is text, so no image or extra widget is needed.
+CHECK_COLUMN = "#1"
+CHECKED_MARK = "☑"
+UNCHECKED_MARK = "□"
+DOWNLOAD_BUTTON_TEXT = "下载选中"
+SELECT_ALL_TEXT = "全选/取消全选"
 
 #: The type filter's labels and the ``kind`` each one asks
 #: :func:`~quark_cli.downloader.core.filter_entries` for.
@@ -115,6 +165,19 @@ def match_text(total: int, visible: int) -> str:
     if visible == 0 and total:
         return f"无匹配项（共 {total} 项）"
     return f"共 {total} 项，显示 {visible} 项"
+
+
+def parse_share_url(url: str, passcode: str | None = None) -> ShareSource:
+    """Pair one typed share link with its optional passcode, or refuse it.
+
+    The link goes through the library's own strict parser, so the window accepts
+    exactly what the CLI accepts. An empty passcode stays ``None``: the link's
+    own ``pwd`` parameter is then the one that is used, and neither the URL nor
+    the passcode reaches the status line or the item log (the source also keeps
+    both out of its ``repr``).
+    """
+    link = parse_share_link(url.strip(), passcode)
+    return ShareSource(url=url.strip(), passcode=link.passcode or None)
 
 
 def default_folder_opener(path: str) -> None:
@@ -179,11 +242,31 @@ class DownloaderWindow:
         self._root_factory = root_factory
         self._folder_opener = folder_opener or default_folder_opener
         self._location = Location()
-        self._entries: dict[str, Entry] = {}
+        # The share view: ``None`` means the table follows the account drive.
+        # The share's own folder chain is kept apart from ``_location``, because
+        # a share FID means nothing to the account's browse API; the last path
+        # of the chain is both what the table shows and what the next
+        # ``BrowseShare`` asks for.
+        self._share_source: ShareSource | None = None
+        self._share_trail: list[str] = [SHARE_ROOT_PATH]
+        #: Whether a share read is in flight: it freezes navigation, the view
+        #: switch and the click exactly like a search does.
+        self._reading_share = False
+        #: The share source and parent path a running batch was frozen with, so
+        #: a later view change can never mix a share item with an account item.
+        self._batch_share: tuple[ShareSource, str] | None = None
+        #: The fids whose ``选择`` box is ticked. Keyed by fid rather than by row
+        #: position, so filtering, re-ordering or refreshing can never move a
+        #: tick onto another row.
+        self._checked: set[str] = set()
         # The rows the window holds, before the local filters: re-rendering
         # always starts from this complete list, never from an already filtered
         # one, so clearing a filter restores every row.
         self._rows: list[Entry] = []
+        # The rows the table shows right now, keyed by the iid it shows them
+        # under. It is empty until the first listing arrives, and the controls
+        # are drawn from it from the very first :meth:`_sync_controls`.
+        self._entries: dict[str, Entry] = {}
         # The search whose rows the table shows, and the search that is actually
         # in flight; they are equal while the table shows what was asked for.
         self._search: Search | None = None
@@ -210,6 +293,13 @@ class DownloaderWindow:
         self._count_var: Any = None
         self._keyword_entry: Any = None
         self._kind_combo: Any = None
+        self._share_var: Any = None
+        self._passcode_var: Any = None
+        self._share_entry: Any = None
+        self._passcode_entry: Any = None
+        self._share_button: Any = None
+        self._drive_button: Any = None
+        self._select_all_button: Any = None
         self._up_button: Any = None
         self._refresh_button: Any = None
         self._search_button: Any = None
@@ -271,6 +361,25 @@ class DownloaderWindow:
             side="left", fill="x", expand=True, padx=(6, 0)
         )
 
+        # The share link is only ever read for browsing: the passcode box is
+        # masked, and none of this text is echoed into the status line or the log.
+        shared = tk.Frame(root)
+        shared.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(shared, text="分享链接").pack(side="left")
+        self._share_var = tk.StringVar()
+        self._share_entry = tk.Entry(shared, textvariable=self._share_var, width=40)
+        self._share_entry.pack(side="left", padx=(4, 6))
+        tk.Label(shared, text="提取码").pack(side="left")
+        self._passcode_var = tk.StringVar()
+        self._passcode_entry = tk.Entry(
+            shared, textvariable=self._passcode_var, width=10, show="*"
+        )
+        self._passcode_entry.pack(side="left", padx=(4, 6))
+        self._share_button = tk.Button(shared, text="打开分享", width=8, command=self.open_share)
+        self._drive_button = tk.Button(shared, text="我的网盘", width=8, command=self.open_drive)
+        for button in (self._share_button, self._drive_button):
+            button.pack(side="left", padx=(0, 6))
+
         # The keyword box filters the rows the window already holds as it is
         # typed, and doubles as the query of the two search buttons.
         find = tk.Frame(root)
@@ -298,23 +407,34 @@ class DownloaderWindow:
         )
         self._kind_combo.bind("<<ComboboxSelected>>", self._on_filter_change)
         self._kind_combo.pack(side="left", padx=(4, 6))
+        self._select_all_button = tk.Button(find, text=SELECT_ALL_TEXT, width=14, command=self.toggle_all)
+        self._select_all_button.pack(side="left", padx=(0, 6))
         self._count_var = tk.StringVar(value=match_text(0, 0))
         tk.Label(find, textvariable=self._count_var, anchor="e").pack(side="right")
 
         tree = self._tree = tk.ttk.Treeview(
-            root, columns=("path", "type", "size"), show="tree headings", selectmode="extended"
+            root,
+            columns=("check", "path", "type", "size"),
+            show="tree headings",
+            selectmode="extended",
         )
         tree.heading("#0", text="名称")
+        tree.heading("check", text="选择")
         tree.heading("path", text="路径")
         tree.heading("type", text="类型")
         tree.heading("size", text="大小")
-        tree.column("#0", width=280, anchor="w")
-        tree.column("path", width=280, anchor="w")
+        tree.column("#0", width=240, anchor="w")
+        tree.column("check", width=48, anchor="center", stretch=False)
+        tree.column("path", width=260, anchor="w")
         tree.column("type", width=80, anchor="center", stretch=False)
         tree.column("size", width=120, anchor="e", stretch=False)
         tree.pack(fill="both", expand=True, padx=12, pady=6)
         tree.bind("<Double-1>", self._on_activate)
         tree.bind("<<TreeviewSelect>>", self._on_selection)
+        # The tick is taken from the ``选择`` column, never from the highlight:
+        # a click there toggles the row and leaves the selection to navigation.
+        tree.bind("<Button-1>", self._on_click)
+        tree.bind("<space>", self._on_space)
 
         bar = tk.Frame(root)
         bar.pack(fill="x", padx=12, pady=(0, 4))
@@ -336,7 +456,7 @@ class DownloaderWindow:
         self._open_folder_button.pack(side="left", padx=(0, 6))
         self._output_var = tk.StringVar(value="未选择本地保存目录")
         tk.Label(actions, textvariable=self._output_var, anchor="w").pack(side="left", fill="x", expand=True, padx=6)
-        self._download_button = tk.Button(actions, text="下载选中", width=10, command=self.start_download)
+        self._download_button = tk.Button(actions, text=DOWNLOAD_BUTTON_TEXT, width=10, command=self.start_download)
         self._download_button.pack(side="right")
         self._stop_button = tk.Button(
             actions, text="停止下载", width=10, command=self.stop_download, state="disabled"
@@ -386,6 +506,13 @@ class DownloaderWindow:
         self._count_var = None
         self._keyword_entry = None
         self._kind_combo = None
+        self._share_var = None
+        self._passcode_var = None
+        self._share_entry = None
+        self._passcode_entry = None
+        self._share_button = None
+        self._drive_button = None
+        self._select_all_button = None
         self._up_button = None
         self._refresh_button = None
         self._search_button = None
@@ -417,6 +544,10 @@ class DownloaderWindow:
 
     def _handle(self, event: Any) -> None:
         if isinstance(event, SearchResults):
+            # A search reads the account drive, so its answer never belongs to
+            # the table while that table shows a share.
+            if self._share_source is not None:
+                return
             # One search is in flight at a time; an answer to an older question
             # (another fid, another keyword) is dropped instead of filling the
             # table with rows the window did not ask for.
@@ -428,8 +559,21 @@ class DownloaderWindow:
             self._searching = False
             self._pending = None
             self._search = pending
-            self._rows = list(event.entries)
-            self._apply_filter()
+            self._adopt_rows(event.entries)
+            self._set_status(IDLE_STATUS)
+            self._sync_controls()
+        elif isinstance(event, ShareListing):
+            # Only the share folder the window is actually showing may fill the
+            # table: a listing of another share, or of another path, or one that
+            # arrived after the view was left, is a stale answer and is dropped.
+            if (
+                self._share_source is None
+                or event.source != self._share_source
+                or event.path != self._share_trail[-1]
+            ):
+                return
+            self._reading_share = False
+            self._adopt_rows(event.entries)
             self._set_status(IDLE_STATUS)
             self._sync_controls()
         elif isinstance(event, Listing):
@@ -439,9 +583,11 @@ class DownloaderWindow:
             # on screen speaks for the folder it started from too, so no folder
             # listing may fill the table while either holds: it would both
             # replace the rows and end the search state before its own answer.
+            # A share view is never filled by an account listing either.
             if (
                 self._searching
                 or self._search is not None
+                or self._share_source is not None
                 or event.fid != self._location.fid
             ):
                 return
@@ -481,6 +627,11 @@ class DownloaderWindow:
                     # Nothing of this search reached the table, so there is no
                     # search session left to return from either.
                     self._origin = None
+            if event.action == SHARE_BROWSE_ACTION:
+                # The share read is over (nothing was shown); the user may go
+                # back to the drive or import the link again, and the failure
+                # says nothing about a download that is already running.
+                self._reading_share = False
             self._set_status(event.message)
             self._sync_controls()
 
@@ -489,18 +640,39 @@ class DownloaderWindow:
     def go_up(self) -> None:
         if self._busy():
             return
+        if self._share_source is not None:
+            # The share's own chain, never a share fid: the account's browse API
+            # knows nothing about it.
+            if len(self._share_trail) <= 1:
+                self._set_status(SHARE_TOP_STATUS)
+                return
+            self._share_trail.pop()
+            self._clear_checks()
+            self._clear_rows()
+            self._clear_filters()
+            self._show_location()
+            self._open_share_path()
+            return
         if not self._location.up():
             self._set_status("已经在最上层目录")
             return
         # Walking out of a result folder ends the search listing: the table
         # follows the real folder again from here on.
         self._search = None
+        self._clear_checks()
         self._clear_filters()
         self._show_location()
         self._open(self._location.fid)
 
     def refresh(self) -> None:
-        """Re-read the folder shown, or re-run the search the table shows."""
+        """Re-read the folder shown, or re-run the search the table shows.
+
+        A share folder is re-read with the same chain, so the ticks survive for
+        every item that is still there; nothing else is cleared.
+        """
+        if self._share_source is not None:
+            self._open_share_path()
+            return
         request = self._search
         if request is None:
             self._open(self._location.fid)
@@ -513,6 +685,56 @@ class DownloaderWindow:
         self._sync_controls()
         self._worker.submit(request)
 
+    def open_share(self) -> None:
+        """Read the typed share link and show the share's own top folder.
+
+        Browsing only: nothing is saved into the drive. The link is validated by
+        the library's own strict parser first, so a refused link changes nothing.
+        A share is another source than the account, so the search session of the
+        account view ends here: its rows, its folder to return to and the answer
+        it may still be waiting for all describe a table that is now gone.
+        """
+        if self._busy():
+            return
+        url = self._share_var.get() if self._share_var is not None else ""
+        passcode = self._passcode_var.get() if self._passcode_var is not None else ""
+        try:
+            source = parse_share_url(url, passcode if passcode else None)
+        except QuarkError as error:
+            self._set_status(describe_error(error, SHARE_IMPORT_ACTION))
+            return
+        self._reset_search()
+        self._share_source = source
+        self._share_trail = [SHARE_ROOT_PATH]
+        self._checked.clear()
+        self._clear_rows()
+        self._clear_filters()
+        self._show_location()
+        self._open_share_path()
+
+    def open_drive(self) -> None:
+        """Leave the share view and browse the account folder that was shown."""
+        if self._busy() or self._share_source is None:
+            return
+        self._share_source = None
+        self._share_trail = [SHARE_ROOT_PATH]
+        self._reset_search()
+        self._checked.clear()
+        self._clear_rows()
+        self._clear_filters()
+        self._show_location()
+        self._open(self._location.fid)
+
+    def _open_share_path(self) -> None:
+        """(Re-)read the share folder the trail currently points at."""
+        source = self._share_source
+        if source is None or self._busy():
+            return
+        self._reading_share = True
+        self._set_status(SHARE_READING_STATUS)
+        self._sync_controls()
+        self._worker.submit(BrowseShare(source, self._share_trail[-1]))
+
     def search(self) -> None:
         """Search the whole drive for the keyword in the filter box."""
         self._submit_search(ROOT_FID)
@@ -522,12 +744,17 @@ class DownloaderWindow:
         self._submit_search(self._location.fid)
 
     def leave_search(self) -> None:
-        """Leave the search: show the folder the search started from."""
-        if self._busy() or self._origin is None:
+        """Leave the search: show the folder the search started from.
+
+        A share view has no search session of the account's to leave, so this
+        is refused there as well as disabled in the controls.
+        """
+        if self._busy() or self._share_source is not None or self._origin is None:
             return
         origin, self._origin = self._origin, None
         self._search = None
         self._rows = []
+        self._checked.clear()
         self._render_rows(())
         self._show_counts(0)
         self._clear_filters()
@@ -540,6 +767,10 @@ class DownloaderWindow:
         """Ask for one search of ``fid``; a keyword that is blank asks for none."""
         if self._busy():
             return
+        if self._share_source is not None:
+            # A drive search would read the account, not the share, so it is
+            # refused here as well as disabled in the controls.
+            return
         query = self._keyword()
         if not query:
             self._set_status(SEARCH_HINT)
@@ -550,6 +781,7 @@ class DownloaderWindow:
         self._origin = copy.deepcopy(self._location)
         self._pending = Search(fid=fid, query=query)
         self._searching = True
+        self._clear_checks()
         self._set_status(SEARCHING_STATUS)
         self._sync_controls()
         self._worker.submit(self._pending)
@@ -591,26 +823,35 @@ class DownloaderWindow:
             self._set_status(describe_error(error, OPEN_FOLDER_ACTION))
 
     def start_download(self) -> None:
-        """Freeze the selection and the output folder, then serve it in list order.
+        """Freeze the ticked rows and the output folder, then serve them in list order.
 
-        Planning stays per item: an entry whose name the library refuses fails
-        alone in the log and the rest of the selection continues.
+        The ticked rows are the frozen selection, and the share they came from
+        is frozen with them, so a later view change can never mix a share item
+        with an account item. Planning stays per item: an entry whose name the
+        library refuses fails alone in the log and the rest of the click
+        continues.
         """
         if self._busy():
             return
-        entries = self._selected_entries()
+        entries = self._checked_entries()
         if not entries:
-            self._set_status("请先在列表中选择一个文件或目录")
+            self._set_status("请先在列表中勾选一个文件或目录")
             return
         try:
             folder = output_folder(self._output_dir)
         except (QuarkError, OSError) as error:
             self._set_status(describe_error(error, DOWNLOAD_ACTION))
             return
+        source = self._share_source
         self._batch = Batch(str(folder), entries)
+        self._batch_share = None if source is None else (source, self._share_trail[-1])
         self._stop_requested = False
         self._downloading = True
         self._indeterminate = False
+        if self._batch_share is not None:
+            # The click is the authorisation for the temporary transfer the
+            # backend performs, so this is a line of information, not a question.
+            self._append_log(SHARE_DOWNLOAD_HINT)
         # The stop flag belongs to the batch that was running; it is dropped
         # here, before this batch's first item is submitted to the worker.
         self._worker.clear_stop()
@@ -655,6 +896,7 @@ class DownloaderWindow:
                 continue
             self._stop_progress(0.0)
             self._set_status(self._item_line(f"正在下载 {item.label}……"))
+            shared = self._batch_share
             self._worker.submit(
                 Download(
                     fid=plan.fid,
@@ -664,14 +906,20 @@ class DownloaderWindow:
                     # and the refusal is shown as a readable conflict message.
                     overwrite=False,
                     name=item.name,
+                    # Only a share item carries its source and the folder it was
+                    # shown in; an account download keeps the defaults.
+                    share_source=None if shared is None else shared[0],
+                    share_path=SHARE_ROOT_PATH if shared is None else shared[1],
                 )
             )
             return
 
     def _finish_batch(self) -> None:
-        """Close the click: report what became of every selected entry."""
+        """Close the click: report what became of every ticked entry."""
         batch = self._batch
+        resume_available = self._batch_share is None
         self._batch = None
+        self._batch_share = None
         self._stop_requested = False
         self._downloading = False
         if batch is not None:
@@ -681,12 +929,15 @@ class DownloaderWindow:
                     failed=batch.failed,
                     stopped=batch.stopped,
                     skipped=batch.skipped,
+                    resume_available=resume_available,
                 )
             )
         self._sync_controls()
 
     def login(self) -> None:
-        if self._busy():
+        if self._busy() or self._share_source is not None:
+            # A successful login browses the account folder; that would contradict
+            # a share view, whose controls are the ones for leaving it.
             return
         self._logging_in = True
         self._sync_controls()
@@ -710,8 +961,38 @@ class DownloaderWindow:
     # -- rendering -------------------------------------------------------
 
     def _render_listing(self, listing: Listing) -> None:
-        self._rows = list(listing.entries)
+        self._adopt_rows(listing.entries)
+
+    def _adopt_rows(self, entries: Iterable[Entry]) -> None:
+        """Show a new listing and drop the ticks of the rows it no longer holds.
+
+        The boxes are keyed by fid, so a row that came back with the new listing
+        keeps its tick and a new row that took the same table position starts
+        unticked; only a fid the listing is missing is dropped. The local filters
+        are applied afterwards, never to the list itself.
+        """
+        self._rows = list(entries)
+        self._checked &= {entry.fid for entry in self._rows}
         self._apply_filter()
+
+    def _clear_rows(self) -> None:
+        """Show an empty table: the rows of the view being left are gone.
+
+        A folder switch asks the worker for the rows that replace them, and the
+        table must not show the rows of the path that was left until that answer
+        arrives — a failed read would otherwise leave rows under a location line
+        they do not belong to.
+        """
+        self._rows = []
+        self._render_rows(())
+        self._show_counts(0)
+
+    def _reset_search(self) -> None:
+        """Drop the account search session: switching the view ends it."""
+        self._search = None
+        self._pending = None
+        self._searching = False
+        self._origin = None
 
     def _apply_filter(self) -> None:
         """Re-render the complete list the window holds through the local filters.
@@ -736,8 +1017,53 @@ class DownloaderWindow:
                 "end",
                 iid=iid,
                 text=entry.label,
-                values=(display_text(entry.path), entry.type_label, entry.size_label),
+                values=(
+                    self._check_mark(entry.fid),
+                    display_text(entry.path),
+                    entry.type_label,
+                    entry.size_label,
+                ),
             )
+
+    def _check_mark(self, fid: str) -> str:
+        """The ``选择`` box of one row: the tick is keyed by fid, not by row."""
+        return CHECKED_MARK if fid in self._checked else UNCHECKED_MARK
+
+    def _refresh_checks(self) -> None:
+        """Redraw the ticks the window already holds, and the lines that count them."""
+        tree = self._tree
+        if tree is None:
+            return
+        for iid, entry in self._entries.items():
+            tree.set(iid, "check", self._check_mark(entry.fid))
+        self._show_counts(len(self._entries))
+
+    def _clear_checks(self) -> None:
+        """Drop the ticks of the view being left; a folder switch starts empty."""
+        if not self._checked:
+            return
+        self._checked.clear()
+        self._refresh_checks()
+
+    def _checked_entries(self) -> list[Entry]:
+        """Every ticked row the filters currently show, in table order.
+
+        Hidden rows are not in :attr:`_entries`, so a row a filter hides is
+        never part of the click.
+        """
+        return [entry for entry in self._entries.values() if entry.fid in self._checked]
+
+    def toggle_all(self) -> None:
+        """Tick every visible row, or untick them if they all are already."""
+        if self._busy():
+            return
+        visible = [entry.fid for entry in self._entries.values()]
+        if visible and all(fid in self._checked for fid in visible):
+            self._checked.difference_update(visible)
+        else:
+            self._checked.update(visible)
+        self._refresh_checks()
+        self._sync_controls()
 
     def _show_counts(self, visible: int) -> None:
         if self._count_var is None:
@@ -747,7 +1073,11 @@ class DownloaderWindow:
             # zero counts an empty folder reports.
             self._count_var.set(NO_MATCH_RESULT_TEXT)
             return
-        self._count_var.set(match_text(len(self._rows), visible))
+        text = match_text(len(self._rows), visible)
+        chosen = len(self._checked_entries())
+        if chosen:
+            text = f"{text}，已选 {chosen} 项"
+        self._count_var.set(text)
 
     def _keyword(self) -> str:
         return self._search_var.get().strip() if self._search_var is not None else ""
@@ -780,8 +1110,13 @@ class DownloaderWindow:
             self._search_var.set("")
 
     def _show_location(self) -> None:
-        if self._location_var is not None:
-            self._location_var.set(self._location.title)
+        if self._location_var is None:
+            return
+        # The share's path is prefixed so the table never looks like the account
+        # drive; the account's own breadcrumb is left untouched behind it.
+        self._location_var.set(
+            f"分享 {self._share_trail[-1]}" if self._share_source is not None else self._location.title
+        )
 
     def _set_status(self, text: str) -> None:
         if self._status_var is not None:
@@ -843,35 +1178,53 @@ class DownloaderWindow:
         """One rule per control: what a request in flight may still change."""
         busy = self._busy()
         frozen = self._frozen()
+        share = self._share_source is not None
         free = "disabled" if busy else "normal"
         for button in (
             self._up_button,
             self._refresh_button,
-            self._search_button,
-            self._search_tree_button,
+            self._share_button,
+            self._drive_button,
         ):
             _set_state(button, free)
         _set_state(
             self._return_button,
             "normal" if self._origin is not None and not busy else "disabled",
         )
+        # A drive search would read the account instead of the share, so both
+        # buttons are out of reach while the table shows a share.
+        _set_state(self._search_button, "disabled" if busy or share else "normal")
+        _set_state(self._search_tree_button, "disabled" if busy or share else "normal")
         _set_state(self._keyword_entry, free)
         _set_state(self._kind_combo, "disabled" if busy else "readonly")
-        _set_state(self._login_button, free)
+        _set_state(self._share_entry, free)
+        _set_state(self._passcode_entry, free)
+        _set_state(self._login_button, "disabled" if busy or share else "normal")
         _set_state(self._output_button, "disabled" if frozen else "normal")
         _set_state(
             self._open_folder_button,
             "disabled" if frozen or not self._output_dir else "normal",
         )
         _set_state(self._stop_button, "normal" if self._downloading and not self._stop_requested else "disabled")
-        ready = not busy and bool(self._output_dir) and bool(self._selected_entries())
+        _set_state(self._select_all_button, "disabled" if busy or not self._entries else "normal")
+        chosen = len(self._checked_entries())
+        ready = not busy and bool(self._output_dir) and chosen > 0
         _set_state(self._download_button, "normal" if ready else "disabled")
+        self._show_download_label(chosen)
+
+    def _show_download_label(self, chosen: int) -> None:
+        """The click's own label says how many of the shown rows it would take."""
+        button = self._download_button
+        if button is None:
+            return
+        text = DOWNLOAD_BUTTON_TEXT if not chosen else f"{DOWNLOAD_BUTTON_TEXT}（{chosen}）"
+        button.configure(text=text)
 
     # -- helpers ---------------------------------------------------------
 
     def _busy(self) -> bool:
         """Whether a request in flight freezes the list, the filters and the click."""
-        return self._downloading or self._searching or self._logging_in
+        return self._downloading or self._searching or self._logging_in or self._reading_share
 
     def _frozen(self) -> bool:
         """Whether the save folder may not change: a batch or a login holds it."""
@@ -892,36 +1245,80 @@ class DownloaderWindow:
         self._set_status("正在读取目录……")
         self._worker.submit(Browse(fid))
 
-    def _selected_entries(self) -> list[Entry]:
-        """Every selected row, in the order the table shows them.
+    def _highlighted_row(self) -> Entry | None:
+        """The highlighted row, the fallback for an activate with no row in it."""
+        tree = self._tree
+        if tree is None:
+            return None
+        for iid in tree.selection():
+            entry = self._entries.get(iid)
+            if entry is not None:
+                return entry
+        return None
 
-        The rows keep their listing order in :attr:`_entries`, so a batch is
-        planned and downloaded in display order no matter in which order the
-        rows were clicked.
-        """
-        if self._tree is None:
-            return []
-        chosen = set(self._tree.selection())
-        if not chosen:
-            return []
-        return [entry for iid, entry in self._entries.items() if iid in chosen]
-
-    def _selected(self) -> Entry | None:
-        chosen = self._selected_entries()
-        return chosen[0] if chosen else None
-
-    def _activated_row(self, event: Any) -> str | None:
-        """The row a double-click landed on, or ``None`` when it cannot be told.
-
-        A multi-selection can span several rows, so entering the folder of the
-        *first* selected row would follow a different row than the one clicked.
-        """
+    def _row_at(self, event: Any) -> str:
+        """The row a click landed on, or ``""`` for the header and empty space."""
         identify = getattr(self._tree, "identify_row", None)
         y = getattr(event, "y", None)
         if identify is None or not isinstance(y, int):
-            return None
+            return ""
         iid = identify(y)
-        return iid if isinstance(iid, str) and iid else None
+        return iid if isinstance(iid, str) else ""
+
+    def _column_at(self, event: Any) -> str:
+        """The table column a click landed on, or ``""`` when it cannot be told."""
+        identify = getattr(self._tree, "identify_column", None)
+        x = getattr(event, "x", None)
+        if identify is None or not isinstance(x, int):
+            return ""
+        column = identify(x)
+        return column if isinstance(column, str) else ""
+
+    def _toggle(self, fid: str) -> None:
+        """Flip one row's tick and redraw what counts it."""
+        if fid in self._checked:
+            self._checked.discard(fid)
+        else:
+            self._checked.add(fid)
+        self._refresh_checks()
+        self._sync_controls()
+
+    def _on_click(self, event: Any) -> str | None:
+        """A click on the ``选择`` column ticks that row and nothing else.
+
+        Every other column keeps the table's normal behaviour, so highlighting a
+        row for navigation is untouched; the header and empty space below the
+        rows are ignored. A request in flight freezes the boxes and 全选, so no
+        tick can move under a batch that is already frozen. Tk dispatches the
+        second press to the double-click binding, which only handles navigation.
+        The returned ``break`` suppresses the
+        class binding that would move the highlight and the keyboard cursor, so
+        the cursor is put on the clicked row here: the space bar then ticks the
+        row the click just ticked.
+        """
+        if self._column_at(event) != CHECK_COLUMN:
+            return None
+        if self._busy():
+            return "break"
+        iid = self._row_at(event)
+        entry = self._entries.get(iid)
+        if entry is None:
+            return "break"
+        self._toggle(entry.fid)
+        self._tree.focus_set()
+        self._tree.focus(iid)
+        return "break"
+
+    def _on_space(self, _event: Any) -> str:
+        """The space bar ticks the focused row, like a click on its box."""
+        if self._busy():
+            return "break"
+        focus = getattr(self._tree, "focus", None)
+        iid = focus() if focus is not None else ""
+        entry = self._entries.get(iid) if isinstance(iid, str) else None
+        if entry is not None:
+            self._toggle(entry.fid)
+        return "break"
 
     def _on_selection(self, _event: Any) -> None:
         self._sync_controls()
@@ -932,9 +1329,29 @@ class DownloaderWindow:
         # table would disagree, because ``_open`` refuses to browse while busy.
         if self._busy():
             return
-        row = self._activated_row(event)
-        entry = self._entries.get(row) if row is not None else self._selected()
+        if self._column_at(event) == CHECK_COLUMN:
+            # That column only ever ticks a row; a double-click there must not
+            # also walk into the folder under it.
+            return
+        if event is None:
+            # No row to read (a keyboard-driven activate), so the highlighted row
+            # is the one meant.
+            entry = self._highlighted_row()
+        else:
+            entry = self._entries.get(self._row_at(event))
         if entry is None or not entry.directory:
+            return
+        if self._share_source is not None:
+            # Inside a share every row knows its own full path, so the share's
+            # chain is extended with it and the next read asks for that path.
+            if not entry.path:
+                return
+            self._share_trail.append(entry.path)
+            self._clear_checks()
+            self._clear_rows()
+            self._clear_filters()
+            self._show_location()
+            self._open_share_path()
             return
         if entry.location:
             # A search result knows the folder chain it lives in, so the window
@@ -944,6 +1361,7 @@ class DownloaderWindow:
             self._location.enter(entry.fid, entry.name)
         # The folder just entered is shown in full: a keyword left over from the
         # table that was left behind would hide its rows.
+        self._clear_checks()
         self._clear_filters()
         self._show_location()
         self._open(entry.fid)
