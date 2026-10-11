@@ -40,6 +40,7 @@ from ..files import Files
 from ..paths import is_directory
 from ..request_guard import RequestGuard
 from . import SERVICE_VERSION
+from .bookmark_state import NOTE_LIMIT
 from .diagnostics import Diagnostics
 from .library import (
     DEFAULT_PAGE_SIZE,
@@ -92,6 +93,9 @@ UINT32_MAX = 0xFFFFFFFF
 #: a free lookup cache for a following ``/v1/play``; the persistent parent is
 #: written with the recent record itself.
 MAX_ASSOCIATIONS = 4096
+#: The drive root carries no series identity, so it never earns the "目录名 /"
+#: prefix: a movie stored at the root keeps its full name.
+ROOT_FID = "0"
 
 _CONTROL_ROUTES = frozenset({
     "/v1/auth", "/v1/auth/login", "/v1/auth/logout",
@@ -102,6 +106,8 @@ _CONTROL_ROUTES = frozenset({
     "/v1/subtitles", "/v1/subtitle",
     "/v1/diagnostics", "/v1/diagnostics/report", "/v1/diagnostics/open",
     "/v1/playback/restart",
+    "/v1/bookmarks", "/v1/bookmarks/add", "/v1/bookmarks/rename",
+    "/v1/bookmarks/remove", "/v1/bookmarks/jump",
 })
 
 
@@ -146,6 +152,22 @@ def _parse_pid(value: Any, *, label: str) -> int:
     return value
 
 
+def _bookmark_id(value: Any) -> str:
+    """Validate one caller-supplied bookmark id before any store lookup."""
+    if not isinstance(value, str) or not value:
+        raise UsageError("id 必须是书签标识")
+    return value
+
+
+def _bookmark_note(value: Any) -> str:
+    """Validate a caller-supplied note; the length bound is checked before any write."""
+    if not isinstance(value, str):
+        raise UsageError("note 必须是字符串")
+    if len(value) > NOTE_LIMIT:
+        raise UsageError(f"note 最多 {NOTE_LIMIT} 个字符")
+    return value
+
+
 def _mark_keys(snapshot: Mapping[str, Any]) -> set[tuple[str, int]]:
     """Manual watched marks as ``(fid, size)`` so a replaced object is distinct."""
     return {(mark["fid"], mark["size"]) for mark in snapshot["marks"]}
@@ -162,7 +184,22 @@ def _watched(entry: Mapping[str, Any], marks: set[tuple[str, int]]) -> bool:
     return completed(entry["position_ms"], entry["duration_ms"])
 
 
-def _episode_view(entry: Mapping[str, Any], watched: bool) -> dict[str, Any]:
+def _dir_label(entry: Mapping[str, Any], names: Mapping[str, str]) -> str:
+    """The verified directory name to prefix a row with; empty for root/unknown.
+
+    A root-level file (a movie at the drive root, whose parent is the root FID)
+    and a file whose parent is unknown both stay unprefixed, so the original name
+    is shown in full and no useless "我的网盘 /" prefix appears.
+    """
+    parent = entry["parent"]
+    if not parent or parent == ROOT_FID:
+        return ""
+    # A name verified while browsing the directory outranks the one persisted
+    # with the row, so a renamed directory shows its new name immediately.
+    return names.get(parent, "") or entry["parent_name"]
+
+
+def _episode_view(entry: Mapping[str, Any], watched: bool, dir_name: str = "") -> dict[str, Any]:
     """One video row shared by the recent, continue, and series views."""
     position, duration = entry["position_ms"], entry["duration_ms"]
     return {
@@ -174,7 +211,7 @@ def _episode_view(entry: Mapping[str, Any], watched: bool) -> dict[str, Any]:
         "watched": watched,
         "position_ms": position,
         "duration_ms": duration,
-        "display": display_name(entry["name"], position, duration, watched),
+        "display": display_name(entry["name"], position, duration, watched, dir_name),
     }
 
 
@@ -194,21 +231,21 @@ def _favorite_items(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
     return items
 
 
-def _recent_items(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _recent_items(snapshot: Mapping[str, Any], names: Mapping[str, str]) -> list[dict[str, Any]]:
     marks = _mark_keys(snapshot)
     items = []
     for entry in snapshot["recent"]:
-        view = _episode_view(entry, _watched(entry, marks))
+        view = _episode_view(entry, _watched(entry, marks), _dir_label(entry, names))
         view["played_at"] = entry["played_at"]
         items.append(view)
     return items
 
 
-def _continue_items(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _continue_items(snapshot: Mapping[str, Any], names: Mapping[str, str]) -> list[dict[str, Any]]:
     """Resumable, unfinished, not-yet-watched videos, newest progress first."""
     marks = _mark_keys(snapshot)
     items = [
-        _episode_view(entry, False)
+        _episode_view(entry, False, _dir_label(entry, names))
         for entry in sorted(snapshot["recent"], key=lambda row: row["progress_at"], reverse=True)
         if not _watched(entry, marks) and unfinished(entry["position_ms"], entry["duration_ms"])
     ]
@@ -423,10 +460,13 @@ class Service:
         self._login_factory = login_factory or (
             lambda: QrLoginWindow(transport=transport, cookie_path=credential_path(), guard=self._guard)
         )
-        # Verified video→directory associations seen in a listing, used only to
-        # stamp a following /v1/play with its real parent. Bounded and memory
-        # only: the durable parent lives on the recent record.
+        # Verified video→directory associations and directory names seen in a
+        # listing: used only to stamp a following /v1/play with its real parent
+        # and that parent's name. Bounded and memory only; the durable parent and
+        # name live on the recent record. Names are never guessed from a window
+        # title and never fetched with an extra request.
         self._parents: dict[str, str] = {}
+        self._dir_names: dict[str, str] = {}
         self._parent_lock = threading.Lock()
         self._client: QuarkClient | None = None
         self._client_cookie: str | None = None
@@ -471,22 +511,26 @@ class Service:
         return Files(self.client())
 
     def note_directory(self, parent: str, items: Any) -> None:
-        """Remember the real directory of every video in a response we already read.
+        """Remember the real directory of every video and every sub-directory's name.
 
-        The caller passes an already-fetched listing, so capturing parentage adds
-        no network request; only a real directory FID from server metadata is
-        ever recorded, never a name or a guess.
+        The caller passes an already-fetched listing, so both facts cost no extra
+        network request; only a real directory FID and file name from server
+        metadata are ever recorded, never a window title or a guess.
         """
-        if not parent:
-            return
         with self._parent_lock:
             for item in items:
                 if not isinstance(item, Mapping):
                     continue
                 name, fid = item.get("name"), item.get("fid")
-                if item.get("is_dir") or not isinstance(fid, str) or not fid:
+                if not isinstance(fid, str) or not fid or not isinstance(name, str) or not name:
                     continue
-                if not isinstance(name, str) or not is_video(name):
+                if item.get("is_dir"):
+                    self._dir_names.pop(fid, None)
+                    self._dir_names[fid] = name
+                    while len(self._dir_names) > MAX_ASSOCIATIONS:
+                        self._dir_names.pop(next(iter(self._dir_names)))
+                    continue
+                if not parent or not is_video(name):
                     continue
                 self._parents.pop(fid, None)
                 self._parents[fid] = parent
@@ -497,6 +541,30 @@ class Service:
         """The last verified directory of ``fid``, or ``""`` when unknown."""
         with self._parent_lock:
             return self._parents.get(fid, "")
+
+    def directory_names(self) -> dict[str, str]:
+        """Directory FID→name from listings already read plus favorites; no request.
+
+        Favorites are local state whose name was verified by ``file/info`` when the
+        directory was added, so they complete a known parent of an older record
+        without probing the drive again.
+        """
+        with self._parent_lock:
+            names = dict(self._dir_names)
+        for entry in self.library.favorites():
+            names.setdefault(entry["fid"], entry["name"])
+        return names
+
+    def parent_name_of(self, fid: str) -> str:
+        """The verified name of ``fid``'s directory, or ``""`` when unknown.
+
+        A root or unknown parent yields no name, so a top-level movie keeps its
+        full original name instead of gaining a "我的网盘 /" prefix.
+        """
+        parent = self.parent_of(fid)
+        if not parent or parent == ROOT_FID:
+            return ""
+        return self.directory_names().get(parent, "")
 
     def require_login(self) -> None:
         """Reject a control call whose data belongs to a signed-in plugin."""
@@ -603,13 +671,15 @@ class Service:
     def logout(self) -> dict[str, Any]:
         """Clear only the bridge's own credential; the CLI Cookie stays untouched.
 
-        An explicit logout also drops the favorites and recent lists; a merely
-        expired credential (``invalidate_credential``) keeps them. Monitor
-        bindings are suppressed before the library is cleared, so a poll that was
-        already in flight cannot resurrect the progress logout just removed.
+        An explicit logout also drops the favorites, recent lists and playback
+        bookmarks; a merely expired credential (``invalidate_credential``) keeps
+        all of them. Monitor bindings are suppressed before the library is
+        cleared, so a poll that was already in flight cannot resurrect the
+        progress (or a late bookmark capture) logout just removed.
         """
         self.invalidate_credential()
         self.monitor.clear()
+        self.monitor.bookmarks.clear()
         self.library.clear()
         with self._login_lock:
             self.login_state = "idle"
@@ -852,12 +922,12 @@ class _Handler(BaseHTTPRequestHandler):
             if method not in ("GET", "HEAD"):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
             service.require_login()
-            return self._json(200, {"items": _recent_items(service.library.snapshot())})
+            return self._json(200, {"items": _recent_items(service.library.snapshot(), service.directory_names())})
         if route == "/v1/continue":
             if method not in ("GET", "HEAD"):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
             service.require_login()
-            return self._json(200, {"items": _continue_items(service.library.snapshot())})
+            return self._json(200, {"items": _continue_items(service.library.snapshot(), service.directory_names())})
         if route == "/v1/series":
             if method not in ("GET", "HEAD"):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
@@ -912,6 +982,54 @@ class _Handler(BaseHTTPRequestHandler):
             service.require_login()
             fid = require_fid(_first(query, "fid", None), label="fid")
             return self._text(200, read_subtitle(service.files(), service.client(), fid))
+        if route == "/v1/bookmarks":
+            if method not in ("GET", "HEAD"):
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
+            # Local-only: the plugin's own bookmark document needs no Quark login.
+            fid = require_fid(_first(query, "fid", None), label="fid")
+            return self._json(200, {"items": service.monitor.bookmarks.list(fid)})
+        if route == "/v1/bookmarks/add":
+            if method != "POST":
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
+            body = self._body(raw)
+            player_pid = _parse_pid(body.get("player_pid"), label="player_pid")
+            fid = require_fid(body.get("fid"), label="fid")
+            note = _bookmark_note(body.get("note"))
+            # The stored timestamp, file name and size come from a fresh native
+            # sample taken on the monitor's worker thread: no client field and no
+            # cloud request is trusted or made here.
+            bookmark = service.monitor.add_bookmark(player_pid, fid, note)
+            if bookmark is None:
+                return self._json(409, _failure("media_changed", "未找到可保存的播放位置"))
+            return self._json(200, {"bookmark": bookmark})
+        if route == "/v1/bookmarks/rename":
+            if method != "POST":
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
+            body = self._body(raw)
+            bookmark_id = _bookmark_id(body.get("id"))
+            note = _bookmark_note(body.get("note"))
+            if not service.monitor.bookmarks.rename(bookmark_id, note):
+                return self._json(404, _failure("not_found", "书签不存在"))
+            return self._json(200, {"status": "renamed"})
+        if route == "/v1/bookmarks/remove":
+            if method != "POST":
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
+            bookmark_id = _bookmark_id(self._body(raw).get("id"))
+            if not service.monitor.bookmarks.remove(bookmark_id):
+                return self._json(404, _failure("not_found", "书签不存在"))
+            return self._json(200, {"status": "removed"})
+        if route == "/v1/bookmarks/jump":
+            if method != "POST":
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
+            body = self._body(raw)
+            player_pid = _parse_pid(body.get("player_pid"), label="player_pid")
+            fid = require_fid(body.get("fid"), label="fid")
+            bookmark_id = _bookmark_id(body.get("id"))
+            # The seek only ever runs on the monitor's worker and only against
+            # the already-bound player: no cloud request is made.
+            if not service.monitor.jump_bookmark(player_pid, fid, bookmark_id):
+                return self._json(409, _failure("media_changed", "未能跳转到该播放位置"))
+            return self._json(200, {"status": "jumped"})
         if route in _CONTROL_ROUTES:
             return self._json(405, _failure("method_not_allowed", "请求方法不受支持"))
         return self._json(404, _failure("not_found", "未知接口"))
@@ -1019,7 +1137,11 @@ class _Handler(BaseHTTPRequestHandler):
         reporting the stored document as broken.
         """
         self.service.library.record_recent(
-            session.fid, session.name, session.size, self.service.parent_of(session.fid)
+            session.fid,
+            session.name,
+            session.size,
+            self.service.parent_of(session.fid),
+            self.service.parent_name_of(session.fid),
         )
 
     def _record_failure(self, exc: BaseException, *, phase: str | None = None) -> None:

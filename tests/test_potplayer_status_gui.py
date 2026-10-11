@@ -30,6 +30,9 @@ from quark_cli.potplayer.status_gui import (
     BridgeWorker,
     Endpoint,
     StatusWindow,
+    bookmark_action_enabled,
+    bookmark_enabled,
+    bookmark_id_of,
     default_export_name,
     format_bytes,
     format_duration_ms,
@@ -42,6 +45,7 @@ from quark_cli.potplayer.status_gui import (
     protection_text,
     restart_enabled,
     run_status_window,
+    selection_target,
     state_label,
     validation_label,
 )
@@ -488,6 +492,9 @@ class _FakeVar:
     def __init__(self, value: str = "") -> None:
         self.value = value
 
+    def get(self) -> str:
+        return self.value
+
     def set(self, value: str) -> None:
         self.value = value
 
@@ -497,15 +504,76 @@ class _FakeTree:
 
     def __init__(self) -> None:
         self.rows = []
+        self.selected: tuple = ()
 
     def delete(self, *items) -> None:
         self.rows.clear()
+        self.selected = ()
 
     def get_children(self):
         return tuple(iid for iid, _ in self.rows)
 
     def insert(self, parent, index, iid=None, values=()) -> None:
         self.rows.append((iid, tuple(values)))
+
+    def selection(self):
+        return self.selected
+
+    def selection_set(self, *items) -> None:
+        self.selected = tuple(items)
+
+    def focus(self, *items) -> None:
+        pass
+
+
+class _FakeButton:
+    """Records the enable/disable calls a real ttk button would receive."""
+
+    def __init__(self) -> None:
+        self.states: list[tuple] = []
+
+    def state(self, value) -> None:
+        self.states.append(tuple(value))
+
+    @property
+    def enabled(self) -> bool:
+        return self.states[-1] == ("!disabled",) if self.states else True
+
+
+class _FakeToplevel:
+    """A bookmark window stand-in: existence, destruction and lift only."""
+
+    def __init__(self) -> None:
+        self.destroyed = False
+        self.lifted = 0
+
+    def winfo_exists(self) -> bool:
+        return not self.destroyed
+
+    def destroy(self) -> None:
+        self.destroyed = True
+
+    def lift(self) -> None:
+        self.lifted += 1
+
+
+class _FakeDialog:
+    """Stand-in for ``tkinter.simpledialog``; may mutate state mid-dialog."""
+
+    def __init__(self, answer=None, error=None, on_call=None) -> None:
+        self.answer = answer
+        self.error = error
+        self.on_call = on_call
+        self.calls: list[tuple] = []
+
+    def askstring(self, title, prompt, parent=None, initialvalue=""):
+        self.calls.append((title, prompt, parent, initialvalue))
+        if self.on_call is not None:
+            # ``simpledialog`` re-enters mainloop, so worker events run here.
+            self.on_call()
+        if self.error is not None:
+            raise self.error
+        return self.answer
 
 
 class TransferRenderTests(unittest.TestCase):
@@ -551,6 +619,665 @@ class TransferRenderTests(unittest.TestCase):
     def test_rows_tolerate_missing_fields_and_skip_non_dicts(self):
         window = self._window({"transfer": {"plays": [{"name": "A"}, None, "x"]}})
         self.assertEqual(window._transfer_tree.rows, [("play0", ("A", "—", "—", "—"))])
+
+
+BOOKMARK_ROWS = [
+    {"player_pid": 1, "fid": "F1", "name": "A.mkv", "state": "playing"},
+    {"player_pid": 2, "fid": "F2", "name": "B.mkv", "state": "stopped"},
+    {"player_pid": 3, "fid": "F3", "name": "C.mkv", "state": "playing"},
+]
+
+BOOKMARK_ENTRY = {
+    "id": "b1",
+    "fid": "F1",
+    "name": "A.mkv",
+    "size": 10,
+    "position_ms": 3_661_000,
+    "duration_ms": 7_200_000,
+    "note": "第 3 分钟",
+}
+
+
+def _status_window(rows=None, selected=(1, "F1"), connected=True, dialog=None) -> StatusWindow:
+    """A StatusWindow wired to fake widgets: no Tk object is ever created."""
+    window = StatusWindow(None, None)
+    window._root = object()
+    window._connected = connected
+    window._playback = list(BOOKMARK_ROWS if rows is None else rows)
+    window._selected = selected
+    window._transfer_var = _FakeVar()
+    window._account_var = _FakeVar()
+    window._protection_var = _FakeVar()
+    window._notice_var = _FakeVar()
+    window._transfer_tree = _FakeTree()
+    window._playback_tree = _FakeTree()
+    window._errors_tree = _FakeTree()
+    window._restart_button = _FakeButton()
+    window._export_button = _FakeButton()
+    window._bookmark_button = _FakeButton()
+    window._bookmark_window = _FakeToplevel()
+    window._bookmark_tree = _FakeTree()
+    window._bookmark_header_var = _FakeVar()
+    window._bookmark_notice_var = _FakeVar()
+    window._bookmark_add_button = _FakeButton()
+    window._bookmark_jump_button = _FakeButton()
+    window._bookmark_rename_button = _FakeButton()
+    window._bookmark_remove_button = _FakeButton()
+    window._bookmark_refresh_button = _FakeButton()
+    window._simpledialog = dialog
+    return window
+
+
+class BookmarkClientTests(unittest.TestCase):
+    def _client(self, handler) -> BridgeClient:
+        seen: list[httpx.Request] = []
+
+        def wrapped(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return handler(request)
+
+        client = BridgeClient(_endpoint(), transport=httpx.MockTransport(wrapped))
+        client.seen = seen
+        return client
+
+    def test_list_reads_one_video_by_fid_with_the_bearer_token(self):
+        client = self._client(
+            lambda request: httpx.Response(200, json={"items": [dict(BOOKMARK_ENTRY), "junk"]})
+        )
+        self.assertEqual(client.bookmarks("F1"), [BOOKMARK_ENTRY])
+        (request,) = client.seen
+        self.assertEqual((request.method, request.url.path), ("GET", "/v1/bookmarks"))
+        self.assertEqual(request.url.params["fid"], "F1")
+        self.assertEqual(request.headers["Authorization"], f"Bearer {SECRET}")
+
+    def test_list_quotes_a_fid_that_needs_escaping(self):
+        client = self._client(lambda request: httpx.Response(200, json={"items": []}))
+        self.assertEqual(client.bookmarks("F 1/2?x#y"), [])
+        self.assertEqual(client.seen[0].url.params["fid"], "F 1/2?x#y")
+
+    def test_empty_list_is_a_valid_answer_while_failures_are_none(self):
+        empty = self._client(lambda request: httpx.Response(200, json={"items": []}))
+        self.assertEqual(empty.bookmarks("F1"), [])
+        for response in (
+            httpx.Response(500, text="boom"),
+            httpx.Response(401, json={"error": {"type": "unauthorized", "message": SECRET}}),
+            httpx.Response(200, text="not json"),
+            httpx.Response(200, json={"items": "nope"}),
+        ):
+            client = self._client(lambda request, response=response: response)
+            self.assertIsNone(client.bookmarks("F1"))
+            client.close()
+
+    def test_add_posts_the_binding_and_the_note(self):
+        client = self._client(lambda request: httpx.Response(200, json={"bookmark": dict(BOOKMARK_ENTRY)}))
+        self.assertTrue(client.add_bookmark(7, "F1", "第 3 分钟"))
+        (request,) = client.seen
+        self.assertEqual((request.method, request.url.path), ("POST", "/v1/bookmarks/add"))
+        self.assertEqual(
+            json.loads(request.content), {"player_pid": 7, "fid": "F1", "note": "第 3 分钟"}
+        )
+        self.assertEqual(request.headers["Authorization"], f"Bearer {SECRET}")
+
+    def test_rename_remove_and_jump_post_exactly_the_documented_fields(self):
+        client = self._client(lambda request: httpx.Response(200, json={"status": "ok"}))
+        self.assertTrue(client.rename_bookmark("b1", "新备注"))
+        self.assertTrue(client.remove_bookmark("b1"))
+        self.assertTrue(client.jump_bookmark(7, "F1", "b1"))
+        self.assertEqual(
+            [(request.url.path, json.loads(request.content)) for request in client.seen],
+            [
+                ("/v1/bookmarks/rename", {"id": "b1", "note": "新备注"}),
+                ("/v1/bookmarks/remove", {"id": "b1"}),
+                ("/v1/bookmarks/jump", {"player_pid": 7, "fid": "F1", "id": "b1"}),
+            ],
+        )
+
+    def test_any_2xx_is_accepted_and_non_2xx_is_a_plain_false(self):
+        for status, expected in ((200, True), (201, True), (202, True), (400, False), (401, False), (409, False), (500, False)):
+            client = self._client(
+                lambda request, status=status: httpx.Response(
+                    status, json={"error": {"type": "boom", "message": f"token={SECRET}"}}
+                )
+            )
+            self.assertIs(client.add_bookmark(1, "F1", "备注"), expected)
+            self.assertIs(client.rename_bookmark("b1", "备注"), expected)
+            self.assertIs(client.remove_bookmark("b1"), expected)
+            self.assertIs(client.jump_bookmark(1, "F1", "b1"), expected)
+
+    def test_transport_failure_never_raises_and_never_leaks_text(self):
+        def dead(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("refused", request=request)
+
+        client = self._client(dead)
+        self.assertIsNone(client.bookmarks("F1"))
+        self.assertFalse(client.add_bookmark(1, "F1", "备注"))
+        self.assertFalse(client.rename_bookmark("b1", "备注"))
+        self.assertFalse(client.remove_bookmark("b1"))
+        self.assertFalse(client.jump_bookmark(1, "F1", "b1"))
+
+    def test_bookmark_calls_only_touch_the_bookmark_endpoints(self):
+        client = self._client(lambda request: httpx.Response(200, json={"items": [], "status": "ok"}))
+        client.bookmarks("F1")
+        client.add_bookmark(1, "F1", "备注")
+        client.rename_bookmark("b1", "备注")
+        client.remove_bookmark("b1")
+        client.jump_bookmark(1, "F1", "b1")
+        self.assertEqual(
+            {request.url.path for request in client.seen},
+            {
+                "/v1/bookmarks",
+                "/v1/bookmarks/add",
+                "/v1/bookmarks/rename",
+                "/v1/bookmarks/remove",
+                "/v1/bookmarks/jump",
+            },
+        )
+
+
+class BookmarkWorkerTests(unittest.TestCase):
+    def _worker(self, handler):
+        seen: list[httpx.Request] = []
+
+        def wrapped(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return handler(request)
+
+        client = BridgeClient(_endpoint(), transport=httpx.MockTransport(wrapped))
+        events: queue.Queue = queue.Queue()
+        requests: queue.Queue = queue.Queue()
+        client.seen = seen
+        return client, BridgeWorker(client, events, requests), events, requests
+
+    def test_every_bookmark_command_is_served_with_its_binding_echoed(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json={"items": [dict(BOOKMARK_ENTRY)]})
+            return httpx.Response(200, json={"status": "ok"})
+
+        client, worker, events, _ = self._worker(handler)
+        worker._serve(("bookmarks", 1, "F1"))
+        self.assertEqual(events.get_nowait(), ("bookmarks", (1, "F1", [BOOKMARK_ENTRY])))
+        worker._serve(("bookmark_add", 1, "F1", "备注"))
+        self.assertEqual(events.get_nowait(), ("bookmark_added", (1, "F1", True)))
+        worker._serve(("bookmark_rename", 1, "F1", "b1", "新备注"))
+        self.assertEqual(events.get_nowait(), ("bookmark_renamed", (1, "F1", True)))
+        worker._serve(("bookmark_remove", 1, "F1", "b1"))
+        self.assertEqual(events.get_nowait(), ("bookmark_removed", (1, "F1", True)))
+        worker._serve(("bookmark_jump", 1, "F1", "b1"))
+        self.assertEqual(events.get_nowait(), ("bookmark_jumped", (1, "F1", True)))
+        self.assertEqual(
+            [request.url.path for request in client.seen],
+            [
+                "/v1/bookmarks",
+                "/v1/bookmarks/add",
+                "/v1/bookmarks/rename",
+                "/v1/bookmarks/remove",
+                "/v1/bookmarks/jump",
+            ],
+        )
+
+    def test_failed_or_dead_requests_become_fixed_false_events(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, json={"error": {"type": "remote_error", "message": SECRET}})
+
+        _, worker, events, _ = self._worker(handler)
+        worker._serve(("bookmark_add", 1, "F1", "备注"))
+        self.assertEqual(events.get_nowait(), ("bookmark_added", (1, "F1", False)))
+
+        def dead(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("refused", request=request)
+
+        _, worker, events, _ = self._worker(dead)
+        worker._serve(("bookmarks", 1, "F1"))
+        self.assertEqual(events.get_nowait(), ("bookmarks", (1, "F1", None)))
+
+    def test_bookmark_events_never_leak_token_url_or_upstream_text(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                500, json={"error": {"message": f"token={SECRET} http://evil.example/x"}}
+            )
+
+        _, worker, events, _ = self._worker(handler)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            worker._serve(("bookmarks", 1, "F1"))
+            worker._serve(("bookmark_add", 1, "F1", "备注"))
+            worker._serve(("bookmark_rename", 1, "F1", "b1", "备注"))
+            worker._serve(("bookmark_remove", 1, "F1", "b1"))
+            worker._serve(("bookmark_jump", 1, "F1", "b1"))
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "")
+        dumped = repr(list(events.queue))
+        self.assertNotIn(SECRET, dumped)
+        self.assertNotIn("/v1/", dumped)
+        self.assertNotIn("127.0.0.1", dumped)
+        self.assertNotIn("evil.example", dumped)
+
+
+class BookmarkSelectionTests(unittest.TestCase):
+    ROWS = [
+        {"player_pid": 1, "fid": "F1", "name": "A.mkv", "state": "playing"},
+        {"player_pid": 2, "fid": "F2", "name": "B.mkv", "state": "stopped"},
+    ]
+
+    def test_target_requires_both_identifiers(self):
+        self.assertEqual(selection_target(self.ROWS, (1, "F1")), (1, "F1"))
+        self.assertIsNone(selection_target(self.ROWS, (1, "F2")))
+        self.assertIsNone(selection_target(self.ROWS, None))
+        self.assertIsNone(selection_target("nope", (1, "F1")))
+
+    def test_target_rejects_bogus_identifiers(self):
+        rows = [
+            {"player_pid": "1", "fid": "F1"},
+            {"player_pid": 1, "fid": ""},
+            {"player_pid": True, "fid": "F1"},
+        ]
+        for selected in (("1", "F1"), (1, ""), (True, "F1")):
+            self.assertIsNone(selection_target(rows, selected))
+
+    def test_listing_needs_a_connection_and_a_matched_binding(self):
+        self.assertTrue(bookmark_enabled(True, self.ROWS, (1, "F1")))
+        self.assertTrue(bookmark_enabled(True, self.ROWS, (2, "F2")))  # stopped still lists
+        self.assertFalse(bookmark_enabled(False, self.ROWS, (1, "F1")))
+        self.assertFalse(bookmark_enabled(True, self.ROWS, (9, "F9")))
+        self.assertFalse(bookmark_enabled(True, self.ROWS, None))
+        self.assertFalse(bookmark_enabled(True, self.ROWS, (1, "F1"), pending=True))
+
+    def test_adding_and_jumping_need_a_binding_that_still_holds_the_file(self):
+        self.assertTrue(bookmark_action_enabled(True, self.ROWS, (1, "F1")))
+        self.assertFalse(bookmark_action_enabled(True, self.ROWS, (2, "F2")))
+        self.assertFalse(bookmark_action_enabled(False, self.ROWS, (1, "F1")))
+        self.assertFalse(bookmark_action_enabled(True, self.ROWS, (1, "F1"), pending=True))
+
+    def test_a_suspended_or_mismatched_binding_cannot_act_natively(self):
+        rows = [
+            {"player_pid": 1, "fid": "F1", "state": "suspended"},  # same-FID multi-instance
+            {"player_pid": 2, "fid": "F2", "state": "mismatch"},
+            {"player_pid": 3, "fid": "F3", "state": "playing"},
+        ]
+        for selected in ((1, "F1"), (2, "F2")):
+            self.assertFalse(bookmark_action_enabled(True, rows, selected))
+            self.assertFalse(restart_enabled(True, rows, selected))
+        self.assertTrue(bookmark_action_enabled(True, rows, (3, "F3")))
+        self.assertTrue(restart_enabled(True, rows, (3, "F3")))
+        # Listing stays local-only, so a suspended binding may still be read.
+        self.assertTrue(bookmark_enabled(True, rows, (1, "F1")))
+
+    def test_bookmark_ids_accept_non_empty_strings_and_ints_only(self):
+        self.assertEqual(bookmark_id_of({"id": "b1"}), "b1")
+        self.assertEqual(bookmark_id_of({"id": 3}), 3)
+        for entry in ({"id": ""}, {"id": True}, {"id": None}, {"id": 1.5}, {}, "nope", None):
+            self.assertIsNone(bookmark_id_of(entry))
+
+
+class BookmarkWindowTests(unittest.TestCase):
+    def test_opening_reads_only_the_selected_binding(self):
+        window = _status_window()
+        window._open_bookmarks()
+        self.assertEqual(window._requests.get_nowait(), ("bookmarks", 1, "F1"))
+        self.assertEqual(window._bookmark_pending, (1, "F1"))
+        self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_LOADING)
+        self.assertTrue(window._requests.empty())
+
+    def test_opening_without_a_matched_row_never_asks_the_bridge(self):
+        for selected in (None, (9, "F9")):
+            window = _status_window(selected=selected)
+            window._open_bookmarks()
+            self.assertTrue(window._requests.empty())
+
+    def test_a_snapshot_rebuild_keeps_the_selection_and_never_rereads(self):
+        window = _status_window()
+        window._bookmark_window = _FakeToplevel()
+        window._refresh_playback()
+        self.assertEqual(window._selected, (1, "F1"))
+        self.assertIn("A.mkv", window._bookmark_header_var.value)
+        self.assertTrue(window._requests.empty())
+
+    def test_a_binding_that_disappeared_from_the_snapshot_drops_the_list(self):
+        window = _status_window()
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        window._playback = [dict(BOOKMARK_ROWS[1])]
+        window._refresh_playback()
+        self.assertIsNone(window._selected)
+        self.assertEqual(window._bookmarks, [])
+        self.assertEqual(window._bookmark_tree.rows, [])
+        self.assertEqual(window._bookmark_rows, {})
+        self.assertTrue(window._requests.empty())
+
+    def test_selecting_another_row_clears_and_rereads_once(self):
+        window = _status_window()
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        window._rows = {"row0": (1, "F1"), "row1": (2, "F2")}
+        window._playback_tree.selected = ("row1",)
+        window._on_select()
+        window._on_select()  # the same selection again is not a change
+        self.assertEqual(window._selected, (2, "F2"))
+        self.assertEqual(window._bookmarks, [])
+        self.assertEqual(window._bookmark_tree.rows, [])
+        self.assertEqual(window._requests.get_nowait(), ("bookmarks", 2, "F2"))
+        self.assertTrue(window._requests.empty())
+
+    def test_a_late_list_for_another_binding_is_dropped(self):
+        window = _status_window()
+        window._bookmark_pending = (1, "F1")
+        window._handle("bookmarks", (2, "F2", [{"id": "b9", "position_ms": 0, "note": "别的"}]))
+        self.assertEqual(window._bookmarks, [])
+        self.assertEqual(window._bookmark_pending, (1, "F1"))
+        window._handle("bookmarks", (1, "F1", [dict(BOOKMARK_ENTRY), "junk", {"note": "无 id"}]))
+        self.assertIsNone(window._bookmark_pending)
+        self.assertEqual(window._bookmark_tree.rows, [("mark0", ("01:01:01", "第 3 分钟"))])
+        self.assertEqual(window._bookmark_rows, {"mark0": "b1"})
+        self.assertIn("书签：1 条", window._bookmark_header_var.value)
+
+    def test_a_failed_list_is_one_fixed_message(self):
+        window = _status_window()
+        window._bookmark_pending = (1, "F1")
+        window._handle("bookmarks", (1, "F1", None))
+        self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_LOAD_FAILED)
+        self.assertEqual(window._bookmark_tree.rows, [])
+        self.assertIsNone(window._bookmark_pending)
+
+    def test_a_loaded_list_ends_the_reading_notice(self):
+        window = _status_window()
+        window._open_bookmarks()
+        self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_LOADING)
+        window._handle("bookmarks", (1, "F1", [dict(BOOKMARK_ENTRY)]))
+        self.assertNotEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_LOADING)
+        self.assertIn("已读取", window._bookmark_notice_var.value)
+        self.assertIn("1", window._bookmark_notice_var.value)
+        self.assertIsNone(window._bookmark_pending)
+        self.assertTrue(window._bookmark_button.enabled)
+
+    def test_a_command_refresh_does_not_erase_the_command_result(self):
+        window = _status_window()
+        window._bookmark_pending = (1, "F1")
+        window._handle("bookmark_added", (1, "F1", True))
+        self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_ADDED)
+        # The add triggered an announce=False re-read; its answer must not
+        # overwrite the command's own success message with a load message.
+        window._handle("bookmarks", (1, "F1", [dict(BOOKMARK_ENTRY)]))
+        self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_ADDED)
+        self.assertIsNone(window._bookmark_pending)
+
+    def test_a_late_command_answer_for_another_binding_is_dropped(self):
+        window = _status_window()
+        window._bookmark_pending = (1, "F1")
+        window._handle("bookmark_added", (2, "F2", True))
+        self.assertEqual(window._bookmark_pending, (1, "F1"))
+        self.assertTrue(window._requests.empty())
+        window._handle("bookmark_removed", (1, "F1", False))
+        self.assertIsNone(window._bookmark_pending)
+        self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_REMOVE_FAILED)
+
+    def test_each_command_has_its_own_fixed_result_message(self):
+        cases = (
+            ("bookmark_added", "_BOOKMARK_ADDED", "_BOOKMARK_ADD_FAILED", True),
+            ("bookmark_renamed", "_BOOKMARK_RENAMED", "_BOOKMARK_RENAME_FAILED", True),
+            ("bookmark_removed", "_BOOKMARK_REMOVED", "_BOOKMARK_REMOVE_FAILED", True),
+            ("bookmark_jumped", "_BOOKMARK_JUMPED", "_BOOKMARK_JUMP_FAILED", False),
+        )
+        for kind, done, failed, refreshes in cases:
+            window = _status_window()
+            window._bookmark_pending = (1, "F1")
+            window._handle(kind, (1, "F1", False))
+            self.assertEqual(window._bookmark_notice_var.value, getattr(status_gui, failed))
+            window = _status_window()
+            window._bookmark_pending = (1, "F1")
+            window._handle(kind, (1, "F1", True))
+            self.assertEqual(window._bookmark_notice_var.value, getattr(status_gui, done))
+            self.assertEqual(window._requests.qsize(), 1 if refreshes else 0)
+
+    def test_a_late_answer_never_leaks_sensitive_text(self):
+        window = _status_window()
+        window._bookmark_pending = (1, "F1")
+        window._handle("bookmarks", (1, "F1", None))
+        window._handle("bookmark_added", (1, "F1", False))
+        window._handle("bookmark_renamed", (1, "F1", False))
+        window._handle("bookmark_removed", (1, "F1", False))
+        window._handle("bookmark_jumped", (1, "F1", False))
+        rendered = window._bookmark_notice_var.value
+        self.assertNotIn(SECRET, rendered)
+        self.assertNotIn("http", rendered)
+        for name in ("_BOOKMARK_LOAD_FAILED", "_BOOKMARK_ADD_FAILED", "_BOOKMARK_RENAME_FAILED", "_BOOKMARK_REMOVE_FAILED", "_BOOKMARK_JUMP_FAILED"):
+            self.assertTrue(getattr(status_gui, name))
+
+    def test_adding_a_note_targets_the_selected_binding_and_strips_it(self):
+        dialog = _FakeDialog(answer="  第 3 分钟  ")
+        window = _status_window(dialog=dialog)
+        window._add_bookmark()
+        self.assertEqual(window._requests.get_nowait(), ("bookmark_add", 1, "F1", "第 3 分钟"))
+        self.assertEqual(window._bookmark_pending, (1, "F1"))
+        self.assertEqual(dialog.calls[0][0], "添加书签")
+
+    def test_a_cancelled_note_never_reaches_the_bridge(self):
+        window = _status_window(dialog=_FakeDialog(answer=None))
+        window._add_bookmark()
+        self.assertTrue(window._requests.empty())
+        self.assertIsNone(window._bookmark_pending)
+
+    def test_an_empty_note_is_a_valid_add_and_a_valid_rename(self):
+        # The bridge accepts an empty note; the window must not invent a
+        # requirement of its own, so a blank answer is sent as an empty string.
+        window = _status_window(dialog=_FakeDialog(answer="   "))
+        window._add_bookmark()
+        self.assertEqual(window._requests.get_nowait(), ("bookmark_add", 1, "F1", ""))
+        self.assertEqual(window._bookmark_pending, (1, "F1"))
+
+        window = _status_window()
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        window._bookmark_tree.selected = ("mark0",)
+        window._simpledialog = _FakeDialog(answer="")
+        window._rename_bookmark()
+        self.assertEqual(
+            window._requests.get_nowait(), ("bookmark_rename", 1, "F1", "b1", "")
+        )
+
+    def test_a_note_over_the_limit_is_refused_before_the_bridge(self):
+        limit = status_gui.MAX_NOTE_CHARS
+        self.assertEqual(limit, 200)
+        for answer in ("x" * (limit + 1), "中" * (limit + 1)):
+            window = _status_window(dialog=_FakeDialog(answer=answer))
+            window._add_bookmark()
+            self.assertTrue(window._requests.empty())
+            self.assertIsNone(window._bookmark_pending)
+            self.assertEqual(
+                window._bookmark_notice_var.value, status_gui._BOOKMARK_NOTE_TOO_LONG
+            )
+
+        window = _status_window(dialog=_FakeDialog(answer="y" * limit))  # exactly the limit
+        window._add_bookmark()
+        self.assertEqual(window._requests.get_nowait(), ("bookmark_add", 1, "F1", "y" * limit))
+
+        window = _status_window()
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        window._bookmark_tree.selected = ("mark0",)
+        window._simpledialog = _FakeDialog(answer="z" * (limit + 1))
+        window._rename_bookmark()
+        self.assertTrue(window._requests.empty())
+        self.assertEqual(
+            window._bookmark_notice_var.value, status_gui._BOOKMARK_NOTE_TOO_LONG
+        )
+
+    def test_an_empty_note_row_shows_its_timestamp_as_the_default_name(self):
+        window = _status_window()
+        window._bookmark_pending = (1, "F1")
+        blank = dict(BOOKMARK_ENTRY, id="b2", note="", position_ms=90_000)
+        window._handle("bookmarks", (1, "F1", [blank]))
+        self.assertEqual(window._bookmark_tree.rows, [("mark0", ("00:01:30", "00:01:30"))])
+
+    def test_a_dialog_error_and_an_inactive_player_never_ask_the_bridge(self):
+        window = _status_window(dialog=_FakeDialog(error=RuntimeError("窗口已销毁")))
+        window._add_bookmark()
+        self.assertTrue(window._requests.empty())
+
+        dialog = _FakeDialog(answer="备注")
+        window = _status_window(selected=(2, "F2"), dialog=dialog)  # stopped row
+        window._add_bookmark()
+        self.assertTrue(window._requests.empty())
+        self.assertEqual(dialog.calls, [])
+
+    def test_a_selection_change_during_the_dialog_aborts_the_operation(self):
+        for replacement in ((3, "F3"), (2, "F2")):
+            window = _status_window()
+
+            def move(window=window, replacement=replacement):
+                # ``simpledialog`` re-enters mainloop: a snapshot may retarget.
+                window._selected = replacement
+
+            window._simpledialog = _FakeDialog(answer="备注", on_call=move)
+            window._add_bookmark()
+            self.assertTrue(window._requests.empty())
+            self.assertIsNone(window._bookmark_pending)
+            self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_STALE)
+
+    def test_rename_remove_and_jump_use_the_visible_row(self):
+        window = _status_window()
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        window._bookmark_tree.selected = ("mark0",)
+
+        dialog = _FakeDialog(answer="新备注")
+        window._simpledialog = dialog
+        window._rename_bookmark()
+        self.assertEqual(window._requests.get_nowait(), ("bookmark_rename", 1, "F1", "b1", "新备注"))
+        self.assertEqual(dialog.calls[0][3], "第 3 分钟")  # the stored note is the default
+
+        window._bookmark_pending = None  # the worker answered; drop the guard
+        window._remove_bookmark()
+        self.assertEqual(window._requests.get_nowait(), ("bookmark_remove", 1, "F1", "b1"))
+
+        window._bookmark_pending = None
+        window._jump_bookmark()
+        self.assertEqual(window._requests.get_nowait(), ("bookmark_jump", 1, "F1", "b1"))
+
+    def test_commands_without_a_selected_bookmark_row_or_a_live_player_are_ignored(self):
+        window = _status_window(dialog=_FakeDialog(answer="新备注"))
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        window._rename_bookmark()
+        window._remove_bookmark()
+        window._jump_bookmark()
+        self.assertTrue(window._requests.empty())
+
+        window = _status_window(selected=(2, "F2"))  # stopped binding
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        window._bookmark_tree.selected = ("mark0",)
+        window._jump_bookmark()
+        self.assertTrue(window._requests.empty())
+        window._remove_bookmark()  # removing a stored bookmark needs no player
+        self.assertEqual(window._requests.get_nowait(), ("bookmark_remove", 2, "F2", "b1"))
+
+    def test_button_gating_follows_selection_and_pending_requests(self):
+        window = _status_window(selected=None)
+        window._update_actions()
+        self.assertFalse(window._bookmark_button.enabled)
+
+        window._selected = (1, "F1")
+        window._update_actions()
+        self.assertTrue(window._bookmark_button.enabled)
+
+        window._bookmark_pending = (1, "F1")
+        window._update_actions()
+        self.assertFalse(window._bookmark_button.enabled)
+        window._bookmark_pending = None
+
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        self.assertTrue(window._bookmark_add_button.enabled)
+        self.assertTrue(window._bookmark_refresh_button.enabled)
+        self.assertFalse(window._bookmark_rename_button.enabled)
+        self.assertFalse(window._bookmark_remove_button.enabled)
+        self.assertFalse(window._bookmark_jump_button.enabled)
+
+        window._bookmark_tree.selected = ("mark0",)
+        window._on_bookmark_select()
+        self.assertTrue(window._bookmark_rename_button.enabled)
+        self.assertTrue(window._bookmark_remove_button.enabled)
+        self.assertTrue(window._bookmark_jump_button.enabled)
+
+    def test_a_stopped_binding_may_be_listed_but_not_bookmarked_or_jumped(self):
+        window = _status_window(selected=(2, "F2"))
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        window._bookmark_tree.selected = ("mark0",)
+        window._on_bookmark_select()
+        self.assertFalse(window._bookmark_add_button.enabled)
+        self.assertFalse(window._bookmark_jump_button.enabled)
+        self.assertTrue(window._bookmark_rename_button.enabled)
+        window._open_bookmarks()
+        self.assertEqual(window._requests.get_nowait(), ("bookmarks", 2, "F2"))
+
+    def test_a_multi_instance_binding_may_be_listed_but_not_bookmarked_or_jumped(self):
+        window = _status_window(
+            rows=[{"player_pid": 1, "fid": "F1", "name": "A.mkv", "state": "suspended"}]
+        )
+        window._update_actions()
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        window._bookmark_tree.selected = ("mark0",)
+        window._on_bookmark_select()
+        self.assertFalse(window._bookmark_add_button.enabled)
+        self.assertFalse(window._bookmark_jump_button.enabled)
+        self.assertFalse(window._restart_button.enabled)
+        self.assertTrue(window._bookmark_rename_button.enabled)
+        self.assertTrue(window._bookmark_remove_button.enabled)
+        window._open_bookmarks()
+        self.assertEqual(window._requests.get_nowait(), ("bookmarks", 1, "F1"))
+
+    def test_jump_needs_a_row_of_the_attached_list(self):
+        window = _status_window()
+        window._update_bookmark_actions()
+        self.assertFalse(window._bookmark_jump_button.enabled)  # no list yet
+        window._open_bookmarks()
+        self.assertFalse(window._bookmark_jump_button.enabled)  # list still in flight
+        window._handle("bookmarks", (1, "F1", [dict(BOOKMARK_ENTRY)]))
+        self.assertFalse(window._bookmark_jump_button.enabled)  # nothing selected yet
+        window._bookmark_tree.selected = ("mark0",)
+        window._on_bookmark_select()
+        self.assertTrue(window._bookmark_jump_button.enabled)
+        window._clear_bookmarks()
+        self.assertFalse(window._bookmark_jump_button.enabled)
+
+    def test_disconnect_clears_the_list_and_says_why(self):
+        window = _status_window()
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        window._bookmark_pending = (1, "F1")
+        window._show_disconnected()
+        self.assertEqual(window._bookmarks, [])
+        self.assertEqual(window._bookmark_tree.rows, [])
+        self.assertEqual(window._bookmark_rows, {})
+        self.assertIsNone(window._bookmark_pending)
+        self.assertEqual(window._bookmark_notice_var.value, status_gui._DISCONNECTED_NOTE)
+        window._open_bookmarks()
+        self.assertTrue(window._requests.empty())
+
+    def test_closing_the_window_drops_its_state_and_ignores_late_answers(self):
+        window = _status_window()
+        window._bookmarks = [dict(BOOKMARK_ENTRY)]
+        window._render_bookmarks()
+        window._bookmark_pending = (1, "F1")
+        window._close_bookmarks()
+        self.assertIsNone(window._bookmark_window)
+        self.assertEqual(window._bookmarks, [])
+        self.assertIsNone(window._bookmark_pending)
+        window._handle("bookmarks", (1, "F1", [dict(BOOKMARK_ENTRY)]))
+        window._handle("bookmark_added", (1, "F1", True))
+        window._handle("bookmark_jumped", (1, "F1", True))
+        self.assertEqual(window._bookmarks, [])
+        self.assertTrue(window._requests.empty())
+
+    def test_opening_a_live_window_raises_it_and_rereads(self):
+        window = _status_window()
+        window._bookmark_window.lift()
+        window._open_bookmarks()
+        self.assertEqual(window._bookmark_window.lifted, 2)
+        self.assertEqual(window._requests.get_nowait(), ("bookmarks", 1, "F1"))
 
 
 class NamingTests(unittest.TestCase):

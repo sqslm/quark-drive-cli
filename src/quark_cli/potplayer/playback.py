@@ -20,6 +20,7 @@ from typing import Any, Protocol
 from urllib.parse import unquote, urlsplit
 
 from ..errors import LocalIOError, UsageError
+from .bookmark_state import NOTE_LIMIT, BookmarkStore
 from .library_state import END_FRACTION, END_MAX_MS, MIN_RESUME_MS, Library
 from .stream import PlaySession
 
@@ -36,6 +37,8 @@ MAX_BINDINGS = 128
 CLOSE_TIMEOUT = 5.0
 #: Bound on how long ``restart`` blocks for the worker's real seek/reset result.
 RESTART_TIMEOUT = 3.0
+#: Bound on how long a bookmark capture/jump blocks for the worker's real result.
+BOOKMARK_TIMEOUT = 3.0
 #: A stopped player answers ``0x5006`` with ``-1``; ``0`` is kept as the legacy
 #: fake/undefined value so both mean "not running" without an unsigned sentinel.
 STATUS_STOPPED = -1
@@ -128,6 +131,45 @@ class _Restart:
 
 
 @dataclass
+class _AddBookmark:
+    """One bookmark capture: the worker samples the real position and stores it.
+
+    ``result`` carries the stored bookmark row (or ``None`` on any refusal) back
+    to the blocked caller; ``error`` carries a storage :class:`LocalIOError` so
+    the caller can tell it apart from a refused capture; ``cancelled`` lets a
+    timed-out request be skipped before it runs.
+    """
+
+    player_pid: int
+    generation: int
+    fid: str
+    note: str
+    done: threading.Event = field(default_factory=threading.Event)
+    result: dict[str, Any] | None = None
+    error: BaseException | None = None
+    cancelled: bool = False
+
+
+@dataclass
+class _JumpBookmark:
+    """One bookmark jump: the worker seeks the bound player and reports success.
+
+    ``outcome`` is the real result; ``error`` carries a storage
+    :class:`LocalIOError` so a broken document is never reported as the same
+    plain ``False`` as a switched file or a refused seek.
+    """
+
+    player_pid: int
+    generation: int
+    fid: str
+    bookmark_id: str
+    done: threading.Event = field(default_factory=threading.Event)
+    outcome: bool = False
+    error: BaseException | None = None
+    cancelled: bool = False
+
+
+@dataclass
 class _Binding:
     player_pid: int
     session: PlaySession
@@ -182,11 +224,16 @@ class PlaybackMonitor:
         native_factory: Callable[[], NativeAdapter] | None = None,
         clock: Callable[[], float] = time.monotonic,
         poll_interval: float = POLL_INTERVAL,
+        bookmarks: BookmarkStore | None = None,
         start: bool = True,
     ) -> None:
         self._library = library
         self._native_factory = native_factory
         self._clock = clock
+        #: The local bookmark document this monitor captures and jumps through.
+        #: A caller (service/GUI) shares one store; a bare monitor creates its
+        #: own default-path store, which only touches disk when actually used.
+        self.bookmarks = BookmarkStore() if bookmarks is None else bookmarks
         self._poll_interval = poll_interval
         self._lock = threading.Lock()
         self._adapter_lock = threading.Lock()
@@ -291,6 +338,89 @@ class PlaybackMonitor:
             return False
         return request.outcome
 
+    def add_bookmark(self, player_pid: int, fid: str, note: str) -> dict[str, Any] | None:
+        """Save the bound player's *real* current position as a local bookmark.
+
+        The position and duration are read from a fresh native sample on the
+        worker thread -- never the snapshot and never the caller's clock -- and
+        the sample must still identify the exact registered file. A *paused*
+        sample is legitimate and captures normally. ``None`` means the capture
+        was refused: an unbound or switched binding, a stopped or unknown-status
+        player, a not-yet-streamed player, a position at or past the media end,
+        a same-FID multi-instance conflict, or an invalid note (an empty note is
+        accepted -- the UI fills the timestamp in). A timed-out command also
+        yields ``None`` and never writes late. A broken local bookmark document
+        raises :class:`LocalIOError`, so the caller reports a storage failure
+        instead of a false "no media" result. This is independent of the
+        watched-mark progress suppression: a manual watched flag never blocks a
+        bookmark.
+        """
+        if not isinstance(note, str) or len(note) > NOTE_LIMIT:
+            return None
+        with self._lock:
+            if self._closed:
+                return None
+            binding = self._bindings.get(player_pid)
+            if binding is None or binding.session.fid != fid:
+                return None
+            request = _AddBookmark(player_pid, binding.generation, fid, note)
+            self._pending.append(request)
+            self._wake.set()
+        if self._thread is None:
+            # No worker to hand it to: run exactly one pass on this thread.
+            self._poll_once()
+        if not request.done.wait(BOOKMARK_TIMEOUT):
+            with self._lock:
+                request.cancelled = True
+                request.result = None
+                try:
+                    self._pending.remove(request)
+                except ValueError:
+                    pass
+            return None
+        if request.error is not None:
+            raise request.error
+        return request.result
+
+    def jump_bookmark(self, player_pid: int, fid: str, bookmark_id: str) -> bool:
+        """Seek the bound player to one saved bookmark and report the real result.
+
+        The seek runs on the worker thread and only succeeds while the player
+        still plays the exact registered identity of ``fid`` *and* the live
+        duration still matches the bookmark (a replaced or re-encoded file is
+        refused); the saved point must fall strictly inside the live media
+        (``target < duration``). On success the binding's initial auto-resume is
+        marked done, so a later poll cannot seek back over the point the user
+        chose. ``False`` covers an unbound/mismatched/switched player, a stale or
+        out-of-range bookmark, a timed-out command, and a seek the player did not
+        confirm; a broken local bookmark document raises :class:`LocalIOError`.
+        """
+        if not isinstance(bookmark_id, str) or not bookmark_id:
+            return False
+        with self._lock:
+            if self._closed:
+                return False
+            binding = self._bindings.get(player_pid)
+            if binding is None or binding.session.fid != fid:
+                return False
+            request = _JumpBookmark(player_pid, binding.generation, fid, bookmark_id)
+            self._pending.append(request)
+            self._wake.set()
+        if self._thread is None:
+            self._poll_once()
+        if not request.done.wait(BOOKMARK_TIMEOUT):
+            with self._lock:
+                request.cancelled = True
+                request.outcome = False
+                try:
+                    self._pending.remove(request)
+                except ValueError:
+                    pass
+            return False
+        if request.error is not None:
+            raise request.error
+        return request.outcome
+
     def clear(self) -> None:
         """Stop persisting progress for current bindings until each is bound again.
 
@@ -302,10 +432,7 @@ class PlaybackMonitor:
         with self._lock:
             self._storage_epoch += 1
             for task in self._pending:
-                if isinstance(task, _Restart):
-                    task.cancelled = True
-                    task.outcome = False
-                    task.done.set()
+                self._cancel(task)
             self._pending.clear()
             for binding in self._bindings.values():
                 binding.suppressed = True
@@ -322,10 +449,7 @@ class PlaybackMonitor:
                 return
             self._closed = True
             for task in self._pending:
-                if isinstance(task, _Restart):
-                    task.cancelled = True
-                    task.outcome = False
-                    task.done.set()
+                self._cancel(task)
             self._pending.clear()
             thread = self._thread
             self._stop.set()
@@ -370,9 +494,15 @@ class PlaybackMonitor:
                 self._apply_flush(task)
                 continue
             if task.cancelled:
+                task.done.set()  # a cancelled command still has to unblock its caller
                 continue
             try:
-                task.outcome = self._apply_restart(adapter, task)
+                if isinstance(task, _AddBookmark):
+                    task.result = self._apply_add_bookmark(adapter, task)
+                elif isinstance(task, _JumpBookmark):
+                    task.outcome = self._apply_jump_bookmark(adapter, task)
+                else:
+                    task.outcome = self._apply_restart(adapter, task)
             finally:
                 task.done.set()  # always unblock the waiting caller
         self._collect(adapter, targets)
@@ -582,6 +712,147 @@ class PlaybackMonitor:
             binding.state, binding.message = STATE_PLAYING, MSG_RESTARTED
         return True
 
+    def _apply_add_bookmark(self, adapter: NativeAdapter | None, task: _AddBookmark) -> dict[str, Any] | None:
+        """Capture a bookmark from a real sample on the worker thread."""
+        if adapter is None or task.cancelled:
+            return None
+        with self._lock:
+            if not self._current(task.player_pid, task.generation) or task.cancelled:
+                return None
+            binding = self._bindings[task.player_pid]
+            fid, url, name, size = binding.session.fid, binding.url, binding.name, binding.session.size
+        try:
+            sample = adapter.sample(task.player_pid)
+        except Exception:
+            self._set(task.player_pid, task.generation, STATE_ERROR, MSG_NATIVE_FAILED)
+            return None
+        if sample is None or getattr(sample, "player_pid", None) != task.player_pid:
+            self._set(task.player_pid, task.generation, STATE_MISSING, MSG_MISSING)
+            return None
+        if not _identity_matches(getattr(sample, "file_name", None), fid, url):
+            self._set(task.player_pid, task.generation, STATE_MISMATCH, MSG_MISMATCH)
+            return None
+        with self._lock:
+            # Re-check *after* the (possibly blocking) sample: a command that
+            # timed out meanwhile must not write, and the epoch snapshotted here
+            # is what the storage barrier below re-validates against a clear().
+            if not self._current(task.player_pid, task.generation) or task.cancelled:
+                return None
+            epoch = self._storage_epoch
+        status = getattr(sample, "status", -1)
+        if status not in (1, 2):
+            # Only a live clock is a real point: a stopped player (0/-1) or an
+            # unknown status must not become a bookmark.
+            return None
+        position = _ms(getattr(sample, "position_ms", 0))
+        duration = _ms(getattr(sample, "duration_ms", 0))
+        if position <= 0 or duration <= 0 or position >= duration:
+            # A real time strictly inside the media is required; the snapshot, a
+            # zero/unknown clock, or a point at/past the end is not enough.
+            return None
+        with self._storage_lock:
+            # Same barrier as a progress write: a capture that reached here just
+            # before a clear()/logout can never land after that clear bumped the
+            # epoch, and a late cancelled request is dropped before it writes.
+            if epoch != self._storage_epoch or task.cancelled:
+                return None
+            try:
+                return self.bookmarks.add(fid, name, size, position, duration, task.note)
+            except LocalIOError as exc:
+                task.error = exc
+                return None
+            except UsageError:
+                return None
+
+    def _apply_jump_bookmark(self, adapter: NativeAdapter | None, task: _JumpBookmark) -> bool:
+        """Seek to one bookmark, refusing a replaced file and confirming identity."""
+        if adapter is None or task.cancelled:
+            return False
+        with self._lock:
+            if not self._current(task.player_pid, task.generation) or task.cancelled:
+                return False
+            binding = self._bindings[task.player_pid]
+            fid, url, size = binding.session.fid, binding.url, binding.session.size
+        try:
+            saved = next((entry for entry in self.bookmarks.list(fid) if entry["id"] == task.bookmark_id), None)
+        except LocalIOError as exc:
+            task.error = exc
+            return False
+        if saved is None or saved["size"] != size:
+            return False  # unknown bookmark, or the file was replaced with a new size
+        target = saved["position_ms"]
+        if target <= 0:
+            return False
+        try:
+            sample = adapter.sample(task.player_pid)
+        except Exception:
+            self._set(task.player_pid, task.generation, STATE_ERROR, MSG_NATIVE_FAILED)
+            return False
+        if sample is None or getattr(sample, "player_pid", None) != task.player_pid:
+            self._set(task.player_pid, task.generation, STATE_MISSING, MSG_MISSING)
+            return False
+        identity = getattr(sample, "file_name", None)
+        if not _identity_matches(identity, fid, url):
+            self._set(task.player_pid, task.generation, STATE_MISMATCH, MSG_MISMATCH)
+            return False
+        duration = _ms(getattr(sample, "duration_ms", 0))
+        saved_duration = saved["duration_ms"]
+        if duration <= 0:
+            return False
+        if target >= duration:
+            return False  # the saved point is at/past the end of the live media
+        if saved_duration > 0:
+            tolerance = max(DURATION_TOLERANCE_MS, int(saved_duration * DURATION_TOLERANCE_FRACTION))
+            if abs(duration - saved_duration) > tolerance:
+                return False  # the media changed materially; the old point is stale
+        with self._lock:
+            # Re-check right before the seek: a command that timed out while the
+            # sample above blocked, or a binding a clear() replaced, must never
+            # reach the player as a late seek.
+            if not self._current(task.player_pid, task.generation) or task.cancelled:
+                return False
+        try:
+            seeked = bool(adapter.seek(task.player_pid, identity, target))
+        except Exception:
+            seeked = False
+        if not seeked:
+            self._set(task.player_pid, task.generation, None, MSG_SEEK_FAILED)
+            return False
+        if task.cancelled:
+            # The seek already happened, but the caller got its timeout result:
+            # do not run the verify or claim success late.
+            return False
+        try:
+            verify = adapter.sample(task.player_pid)
+        except Exception:
+            verify = None
+        if not (
+            verify is not None
+            and getattr(verify, "player_pid", None) == task.player_pid
+            and _identity_matches(getattr(verify, "file_name", None), fid, url)
+            and abs(_ms(getattr(verify, "position_ms", 0)) - target) <= VERIFY_TOLERANCE_MS
+        ):
+            self._set(task.player_pid, task.generation, None, MSG_SEEK_FAILED)
+            return False
+        with self._lock:
+            binding = self._bindings.get(task.player_pid)
+            if binding is None or binding.generation != task.generation or task.cancelled:
+                return False
+            # The user's chosen point wins over the initial auto-resume: mark the
+            # restore done and own the position so a later poll cannot seek back
+            # to the saved resume point over this jump.
+            binding.restore_done = True
+            binding.good = True
+            binding.last_position = target
+            binding.last_duration = duration
+            # ``last_saved_position`` tracks what is really on disk, not this new
+            # point: the jump only seeks, so the periodic poll, the paused
+            # transition, or the close-time flush must still persist ``target``.
+            # Claiming it here would make those write paths believe the point was
+            # already stored and silently keep the old resume position.
+            binding.last_save_at = self._clock()
+        return True
+
     # -- progress --------------------------------------------------------
 
     def _restore(
@@ -711,6 +982,21 @@ class PlaybackMonitor:
         self._generation += 1
         return self._generation
 
+    def _cancel(self, task: Any) -> None:
+        """Cancel one queued command so its blocked caller gets the failure value.
+
+        Only the blocking commands carry a result; a flush has no caller to
+        unblock. Called with the main lock held.
+        """
+        if isinstance(task, _AddBookmark):
+            task.cancelled = True
+            task.result = None
+            task.done.set()
+        elif isinstance(task, (_Restart, _JumpBookmark)):
+            task.cancelled = True
+            task.outcome = False
+            task.done.set()
+
     def _is_live(self, adapter: NativeAdapter | None, player_pid: int) -> bool:
         """True only when the adapter can still see the owned player window.
 
@@ -749,6 +1035,25 @@ class PlaybackMonitor:
             and binding.active
             and not binding.suppressed
             and not binding.storage_failed
+        )
+
+    def _current(self, player_pid: int, generation: int) -> bool:
+        """True while a binding is unchanged and operable for a real command.
+
+        Unlike :meth:`_fresh` this deliberately ignores the progress-storage
+        suppression flags: a bookmark is an independent document, so a watched
+        mark or a broken progress write never blocks capturing or jumping one.
+        The same-FID multi-instance conflict is evaluated live here (not from the
+        poll-set ``suspended`` flag, which a command may run ahead of).
+        Called with the main lock held.
+        """
+        binding = self._bindings.get(player_pid)
+        return (
+            binding is not None
+            and binding.generation == generation
+            and binding.active
+            and binding.streamed
+            and not self._suspended(binding.session.fid)
         )
 
     def _flush_record(self, binding: _Binding) -> _Flush | None:

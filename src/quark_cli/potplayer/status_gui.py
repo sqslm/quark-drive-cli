@@ -1,4 +1,4 @@
-"""Standalone Tk status window for the PotPlayer bridge (release 0.6.0).
+"""Standalone Tk status window for the PotPlayer bridge (release 0.7.0).
 
 The service owns the bridge; this module only *observes* it. It loads the
 bridge's private runtime record (``plugin_state.read_runtime``), confirms that
@@ -8,6 +8,13 @@ then reuses the recorded Bearer token for a fixed set of read-only endpoints:
 * ``GET  /v1/diagnostics``         one request per second while the window is open
 * ``GET  /v1/diagnostics/report``  only when the operator exports a report
 * ``POST /v1/playback/restart``    only when the operator asks for it
+* ``GET  /v1/bookmarks``           only for the selected binding, on selection
+                                   change or an explicit operator action
+* ``POST /v1/bookmarks/{add,rename,remove,jump}``
+                                   only when the operator acts in the bookmark
+                                   window; these are local bridge calls, so no
+                                   cloud login is required and the diagnostics
+                                   report never contains bookmarks or notes
 
 Nothing else is ever fetched, no host other than ``127.0.0.1`` is ever
 contacted, and no Cookie, token, URL or raw upstream text is shown or logged.
@@ -30,6 +37,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
+from urllib.parse import quote
 
 import httpx
 
@@ -43,6 +51,11 @@ HEALTH_PATH = "/v1/health"
 SNAPSHOT_PATH = "/v1/diagnostics"
 REPORT_PATH = "/v1/diagnostics/report"
 RESTART_PATH = "/v1/playback/restart"
+BOOKMARKS_PATH = "/v1/bookmarks"
+BOOKMARKS_ADD_PATH = "/v1/bookmarks/add"
+BOOKMARKS_RENAME_PATH = "/v1/bookmarks/rename"
+BOOKMARKS_REMOVE_PATH = "/v1/bookmarks/remove"
+BOOKMARKS_JUMP_PATH = "/v1/bookmarks/jump"
 
 POLL_INTERVAL = 1.0
 REQUEST_TIMEOUT = 3.0
@@ -57,6 +70,18 @@ MIN_HEIGHT = 520
 
 # Visible rows in the per-session transfer table; more rows scroll.
 TRANSFER_ROWS = 5
+
+# The bookmark manager is a separate top-level window: the status window is
+# already full, and bookmark work must never hide the diagnostics tables.
+BOOKMARK_WIDTH = 560
+BOOKMARK_HEIGHT = 360
+BOOKMARK_MIN_WIDTH = 420
+BOOKMARK_MIN_HEIGHT = 260
+BOOKMARK_NOTICE_WRAP = 500
+
+# Longest bookmark note accepted by the bridge (``bookmark_state.NOTE_LIMIT``);
+# an empty note is valid and is shown as the bookmark's own timestamp.
+MAX_NOTE_CHARS = 200
 
 # Ordered Chinese UI fonts shipped with Windows; the first installed one wins.
 PREFERRED_FONTS = ("Microsoft YaHei UI", "Microsoft YaHei", "SimHei", "SimSun")
@@ -83,8 +108,13 @@ _STATE_LABELS = {
     "error": "读取播放器进度失败",
 }
 
-# States in which the player still holds the file: only these offer "从头开始".
-_INACTIVE_STATES = frozenset({"stopped", "missing", "unavailable", "error"})
+# States in which the player no longer holds the monitored file: only the other
+# states offer a bookmark, a jump or "从头开始". ``suspended`` is a same-FID
+# multi-instance conflict and ``mismatch`` a player showing another file, so a
+# native command must not be offered for either.
+_INACTIVE_STATES = frozenset(
+    {"stopped", "missing", "mismatch", "suspended", "unavailable", "error"}
+)
 
 _COOLDOWN_LABELS = {
     "rate_limited": "上游限流",
@@ -116,6 +146,22 @@ _DISCONNECT_FAILED_NOTE = "读取诊断数据失败，正在重试"
 _EXPORT_UNAVAILABLE = "当前未连接本地服务，无法导出诊断报告"
 _EXPORT_FAILED_REPORT = "导出失败：无法从本地服务获取诊断报告"
 _EXPORT_FAILED_WRITE = "导出失败：无法写入所选文件，请检查路径和磁盘空间"
+
+# Fixed bookmark messages: every failure is one of these, never a transport
+# error, a URL, a token or any other upstream text.
+_BOOKMARK_LOADING = "正在读取书签……"
+_BOOKMARK_WORKING = "正在处理书签操作……"
+_BOOKMARK_LOAD_FAILED = "读取书签失败，请稍后重试"
+_BOOKMARK_ADD_FAILED = "添加书签失败，请稍后重试"
+_BOOKMARK_RENAME_FAILED = "重命名书签失败，请稍后重试"
+_BOOKMARK_REMOVE_FAILED = "删除书签失败，请稍后重试"
+_BOOKMARK_JUMP_FAILED = "跳转失败，请稍后重试"
+_BOOKMARK_ADDED = "已添加书签"
+_BOOKMARK_RENAMED = "已重命名书签"
+_BOOKMARK_REMOVED = "已删除书签"
+_BOOKMARK_JUMPED = "已请求跳转"
+_BOOKMARK_NOTE_TOO_LONG = "备注过长，请控制在 200 个字符以内"
+_BOOKMARK_STALE = "当前选择已变更，请重新操作"
 
 
 # -- formatting ---------------------------------------------------------
@@ -315,6 +361,47 @@ class BridgeClient:
             return None
         return payload if isinstance(payload, dict) else None
 
+    def bookmarks(self, fid: str) -> list[dict[str, Any]] | None:
+        """One video's bookmarks by fid; ``None`` when the request failed.
+
+        The fid is always the binding's own identifier, never a title guess, and
+        an empty list is a valid answer (the video simply has no bookmark yet).
+        """
+        payload = self._get_object(f"{BOOKMARKS_PATH}?fid={quote(fid, safe='')}")
+        items = payload.get("items") if payload is not None else None
+        if not isinstance(items, list):
+            return None
+        return [item for item in items if isinstance(item, dict)]
+
+    def add_bookmark(self, player_pid: int, fid: str, note: str) -> bool:
+        """Bookmark the player's current position of one binding."""
+        return self._post_accepted(
+            BOOKMARKS_ADD_PATH, {"player_pid": player_pid, "fid": fid, "note": note}
+        )
+
+    def rename_bookmark(self, bookmark_id: Any, note: str) -> bool:
+        return self._post_accepted(BOOKMARKS_RENAME_PATH, {"id": bookmark_id, "note": note})
+
+    def remove_bookmark(self, bookmark_id: Any) -> bool:
+        return self._post_accepted(BOOKMARKS_REMOVE_PATH, {"id": bookmark_id})
+
+    def jump_bookmark(self, player_pid: int, fid: str, bookmark_id: Any) -> bool:
+        return self._post_accepted(
+            BOOKMARKS_JUMP_PATH, {"player_pid": player_pid, "fid": fid, "id": bookmark_id}
+        )
+
+    def _post_accepted(self, path: str, body: dict[str, Any]) -> bool:
+        """One JSON POST: any 2xx means the local bridge accepted the request.
+
+        The response body is never inspected, so no upstream text (and no error
+        message) can ever reach the window; failures are a plain ``False``.
+        """
+        try:
+            response = self._client.post(path, json=body)
+        except httpx.HTTPError:
+            return False
+        return 200 <= response.status_code < 300
+
 
 # -- worker -------------------------------------------------------------
 
@@ -328,6 +415,13 @@ class BridgeWorker:
     ``("failed", None)``    this poll failed but the bridge is still healthy
     ``("disconnected", None)`` the bridge itself no longer answers
     ``("exported", path)`` / ``("export_failed", msg)`` / ``("restart_done", (ok, msg))``
+    ``("bookmarks", (player_pid, fid, items_or_none))``
+    ``("bookmark_added" | "bookmark_renamed" | "bookmark_removed" | "bookmark_jumped",
+        (player_pid, fid, ok))``
+
+    Every bookmark event echoes the ``(player_pid, fid)`` of the request that
+    caused it, so the Tk side can drop a late answer whose binding is no longer
+    the selected one.
     """
 
     def __init__(
@@ -382,6 +476,26 @@ class BridgeWorker:
         elif kind == "restart":
             ok, message = self._client.restart(request[1], request[2])
             self._events.put(("restart_done", (ok, message)))
+        elif kind == "bookmarks":
+            _, player_pid, fid = request
+            items = self._client.bookmarks(fid)
+            self._events.put(("bookmarks", (player_pid, fid, items)))
+        elif kind == "bookmark_add":
+            _, player_pid, fid, note = request
+            ok = self._client.add_bookmark(player_pid, fid, note)
+            self._events.put(("bookmark_added", (player_pid, fid, ok)))
+        elif kind == "bookmark_rename":
+            _, player_pid, fid, bookmark_id, note = request
+            ok = self._client.rename_bookmark(bookmark_id, note)
+            self._events.put(("bookmark_renamed", (player_pid, fid, ok)))
+        elif kind == "bookmark_remove":
+            _, player_pid, fid, bookmark_id = request
+            ok = self._client.remove_bookmark(bookmark_id)
+            self._events.put(("bookmark_removed", (player_pid, fid, ok)))
+        elif kind == "bookmark_jump":
+            _, player_pid, fid, bookmark_id = request
+            ok = self._client.jump_bookmark(player_pid, fid, bookmark_id)
+            self._events.put(("bookmark_jumped", (player_pid, fid, ok)))
 
     def _export(self, path: str) -> None:
         report = self._client.report()
@@ -415,6 +529,53 @@ def match_selection(playback: Any, selected: Any) -> dict[str, Any] | None:
     return None
 
 
+def selection_target(playback: Any, selected: Any) -> tuple[int, str] | None:
+    """The validated ``(player_pid, fid)`` of the selected playback row.
+
+    ``None`` for an unmatched row or an unusable binding. Every bookmark request
+    is addressed with these identifiers, so a bookmark list is never matched to
+    a video by its title.
+    """
+    row = match_selection(playback, selected)
+    if row is None:
+        return None
+    player_pid, fid = row.get("player_pid"), row.get("fid")
+    if type(player_pid) is not int or not isinstance(fid, str) or not fid:
+        return None
+    return player_pid, fid
+
+
+def bookmark_enabled(
+    connected: bool, playback: Any, selected: Any, pending: bool = False
+) -> bool:
+    """A connected window with a matched binding may open that video's bookmarks."""
+    if not connected or pending:
+        return False
+    return selection_target(playback, selected) is not None
+
+
+def bookmark_action_enabled(
+    connected: bool, playback: Any, selected: Any, pending: bool = False
+) -> bool:
+    """Only a binding that still holds the file can bookmark or jump."""
+    if not bookmark_enabled(connected, playback, selected, pending):
+        return False
+    row = match_selection(playback, selected)
+    return row.get("state") not in _INACTIVE_STATES
+
+
+def bookmark_id_of(entry: Any) -> Any:
+    """The bridge bookmark id of one list entry, or ``None`` when unusable."""
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("id")
+    if isinstance(value, str) and value:
+        return value
+    if type(value) is int:
+        return value
+    return None
+
+
 def restart_enabled(
     connected: bool, playback: Any, selected: Any, pending: bool = False
 ) -> bool:
@@ -424,8 +585,7 @@ def restart_enabled(
     row = match_selection(playback, selected)
     if row is None or row.get("state") in _INACTIVE_STATES:
         return False
-    player_pid, fid = row.get("player_pid"), row.get("fid")
-    return type(player_pid) is int and isinstance(fid, str) and bool(fid)
+    return selection_target(playback, selected) is not None
 
 
 def default_export_name(moment: datetime | None = None) -> str:
@@ -477,6 +637,12 @@ class StatusWindow:
         self._restart_pending = False
         self._export_pending = False
 
+        # Bookmark manager state: the list always belongs to ``_selected``; a
+        # pending request records the binding it was issued for so a late answer
+        # from another binding is dropped instead of applied.
+        self._bookmarks: list[dict[str, Any]] = []
+        self._bookmark_pending: tuple[Any, Any] | None = None
+
         self._transfer_var: Any = None
         self._transfer_tree: Any = None
         self._account_var: Any = None
@@ -486,6 +652,18 @@ class StatusWindow:
         self._errors_tree: Any = None
         self._restart_button: Any = None
         self._export_button: Any = None
+        self._bookmark_button: Any = None
+        self._bookmark_window: Any = None
+        self._bookmark_tree: Any = None
+        self._bookmark_rows: dict[str, Any] = {}
+        self._bookmark_header_var: Any = None
+        self._bookmark_notice_var: Any = None
+        self._bookmark_add_button: Any = None
+        self._bookmark_jump_button: Any = None
+        self._bookmark_rename_button: Any = None
+        self._bookmark_remove_button: Any = None
+        self._bookmark_refresh_button: Any = None
+        self._simpledialog: Any = None
 
     # -- lifecycle -------------------------------------------------------
 
@@ -547,15 +725,27 @@ class StatusWindow:
         finally:
             self._tk = None
             self._filedialog = None
+            self._simpledialog = None
             self._transfer_tree = None
             self._playback_tree = None
             self._errors_tree = None
             self._restart_button = None
             self._export_button = None
+            self._bookmark_button = None
             self._transfer_var = None
             self._account_var = None
             self._protection_var = None
             self._notice_var = None
+            self._bookmark_window = None
+            self._bookmark_tree = None
+            self._bookmark_rows = {}
+            self._bookmark_header_var = None
+            self._bookmark_notice_var = None
+            self._bookmark_add_button = None
+            self._bookmark_jump_button = None
+            self._bookmark_rename_button = None
+            self._bookmark_remove_button = None
+            self._bookmark_refresh_button = None
 
     # -- widget construction ---------------------------------------------
 
@@ -678,6 +868,10 @@ class StatusWindow:
             actions, text="导出诊断", width=12, command=self._export
         )
         self._export_button.pack(side="right")
+        self._bookmark_button = ttk.Button(
+            actions, text="播放书签", width=12, command=self._open_bookmarks
+        )
+        self._bookmark_button.pack(side="right", padx=(0, 6))
 
         root.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -719,6 +913,22 @@ class StatusWindow:
             ok, message = value
             self._notice_var.set(message if ok else f"从头开始失败：{message}")
             self._update_actions()
+        elif kind == "bookmarks":
+            self._apply_bookmarks(value)
+        elif kind == "bookmark_added":
+            self._apply_bookmark_result(value, _BOOKMARK_ADDED, _BOOKMARK_ADD_FAILED, refresh=True)
+        elif kind == "bookmark_renamed":
+            self._apply_bookmark_result(
+                value, _BOOKMARK_RENAMED, _BOOKMARK_RENAME_FAILED, refresh=True
+            )
+        elif kind == "bookmark_removed":
+            self._apply_bookmark_result(
+                value, _BOOKMARK_REMOVED, _BOOKMARK_REMOVE_FAILED, refresh=True
+            )
+        elif kind == "bookmark_jumped":
+            self._apply_bookmark_result(
+                value, _BOOKMARK_JUMPED, _BOOKMARK_JUMP_FAILED, refresh=False
+            )
 
     def _apply_snapshot(self, snapshot: dict[str, Any]) -> None:
         self._connected = True
@@ -745,6 +955,9 @@ class StatusWindow:
         self._errors_tree.delete(*self._errors_tree.get_children())
         self._rows = {}
         self._selected = None
+        if self._bookmark_live():
+            self._clear_bookmarks()
+            self._bookmark_notice(_DISCONNECTED_NOTE)
         self._update_actions()
 
     def _refresh_transfer(self, snapshot: dict[str, Any]) -> None:
@@ -791,9 +1004,12 @@ class StatusWindow:
 
     def _refresh_playback(self) -> None:
         tree = self._playback_tree
+        # Read the selection before rebuilding: a programmatic selection change
+        # during ``delete``/``selection_set`` may fire ``_on_select``, and the
+        # row is restored afterwards so the bookmark list keeps its binding.
+        previous = self._selected
         tree.delete(*tree.get_children())
         self._rows = {}
-        previous = self._selected
         restored = False
         for index, row in enumerate(self._playback):
             if not isinstance(row, dict):
@@ -815,8 +1031,13 @@ class StatusWindow:
                 tree.selection_set(iid)
                 tree.focus(iid)
                 restored = True
-        if previous is not None and not restored:
-            self._selected = None
+        if previous is not None:
+            self._selected = previous if restored else None
+        if self._bookmark_live():
+            if selection_target(self._playback, self._selected) is None:
+                self._clear_bookmarks()
+            else:
+                self._refresh_bookmark_header()
 
     def _refresh_errors(self, snapshot: dict[str, Any]) -> None:
         tree = self._errors_tree
@@ -840,8 +1061,15 @@ class StatusWindow:
 
     def _on_select(self, _event: Any = None) -> None:
         selection = self._playback_tree.selection()
-        self._selected = self._rows.get(selection[0]) if selection else None
+        selected = self._rows.get(selection[0]) if selection else None
+        if selected == self._selected:
+            # Programmatic re-selection during a snapshot rebuild is not a change.
+            return
+        self._selected = selected
         self._update_actions()
+        if self._bookmark_live():
+            self._clear_bookmarks()
+            self._request_bookmarks()
 
     def _update_actions(self) -> None:
         if self._root is None:
@@ -854,6 +1082,11 @@ class StatusWindow:
             self._export_button.state(["!disabled"])
         else:
             self._export_button.state(["disabled"])
+        busy = self._bookmark_pending is not None
+        if bookmark_enabled(self._connected, self._playback, self._selected, busy):
+            self._bookmark_button.state(["!disabled"])
+        else:
+            self._bookmark_button.state(["disabled"])
 
     # -- operator actions ------------------------------------------------
 
@@ -891,6 +1124,396 @@ class StatusWindow:
     def _close(self) -> None:
         """Tk thread only: cancel the worker, then destroy the window."""
         self._shutdown()
+
+    # -- bookmark manager (a separate Toplevel, same Tk thread) -----------
+
+    def _bookmark_live(self) -> bool:
+        """True while the bookmark window exists (Tk thread only)."""
+        window = self._bookmark_window
+        if window is None:
+            return False
+        exists = False
+        with contextlib.suppress(Exception):
+            exists = bool(window.winfo_exists())
+        return exists
+
+    def _list_target(self) -> tuple[int, str] | None:
+        """The selected binding when the list may address it, else ``None``."""
+        if not self._bookmark_live() or self._bookmark_pending is not None:
+            return None
+        if not bookmark_enabled(self._connected, self._playback, self._selected):
+            return None
+        return selection_target(self._playback, self._selected)
+
+    def _action_target(self) -> tuple[int, str] | None:
+        """The selected binding when the player can still be asked to add/jump."""
+        if not self._bookmark_live():
+            return None
+        if not bookmark_action_enabled(
+            self._connected, self._playback, self._selected, self._bookmark_pending is not None
+        ):
+            return None
+        return selection_target(self._playback, self._selected)
+
+    def _selected_bookmark(self) -> Any:
+        """The id of the selected bookmark row, or ``None``."""
+        tree = self._bookmark_tree
+        if tree is None:
+            return None
+        selection = tree.selection()
+        return self._bookmark_rows.get(selection[0]) if selection else None
+
+    def _bookmark_notice(self, text: str) -> None:
+        if self._bookmark_notice_var is not None:
+            self._bookmark_notice_var.set(text)
+
+    def _settle_bookmark_notice(self, text: str) -> None:
+        """Replace a load-in-progress message with the load's own result.
+
+        The re-read after an operator command runs with ``announce=False`` so
+        that command's own success message stays visible; it must not be
+        overwritten by a later list answer.
+        """
+        var = self._bookmark_notice_var
+        if var is not None and var.get() == _BOOKMARK_LOADING:
+            var.set(text)
+
+    def _open_bookmarks(self) -> None:
+        """Open (or re-read) the bookmark manager for the selected binding."""
+        if self._root is None:
+            return
+        if not bookmark_enabled(
+            self._connected, self._playback, self._selected, self._bookmark_pending is not None
+        ):
+            return
+        if self._bookmark_live():
+            with contextlib.suppress(Exception):
+                self._bookmark_window.lift()
+        else:
+            self._build_bookmarks()
+        # Only a selection change and an explicit operator action re-read the
+        # list; the per-second diagnostics poll never does.
+        self._request_bookmarks()
+
+    def _build_bookmarks(self) -> None:
+        """Create the manager window; every Tk call stays on this thread."""
+        from tkinter import simpledialog, ttk
+
+        root = self._root
+        self._simpledialog = simpledialog
+        window = self._tk.Toplevel(root)
+        self._bookmark_window = window
+        window.title("播放书签")
+        window.geometry(f"{BOOKMARK_WIDTH}x{BOOKMARK_HEIGHT}")
+        window.minsize(BOOKMARK_MIN_WIDTH, BOOKMARK_MIN_HEIGHT)
+        window.transient(root)
+        window.protocol("WM_DELETE_WINDOW", self._close_bookmarks)
+
+        self._bookmark_header_var = self._tk.StringVar(value="—")
+        self._bookmark_notice_var = self._tk.StringVar(value="")
+        outer = ttk.Frame(window, padding=10)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+        ttk.Label(
+            outer, textvariable=self._bookmark_header_var, anchor="w", justify="left"
+        ).grid(row=0, column=0, sticky="ew")
+
+        table = ttk.Frame(outer)
+        table.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        self._bookmark_tree = ttk.Treeview(
+            table, columns=("time", "note"), show="headings", selectmode="browse"
+        )
+        for column, title, width in (("time", "时间", 110), ("note", "备注", 360)):
+            self._bookmark_tree.heading(column, text=title)
+            self._bookmark_tree.column(column, width=width, anchor="w", stretch=(column == "note"))
+        self._bookmark_tree.grid(row=0, column=0, sticky="nsew")
+        bookmark_scroll = ttk.Scrollbar(
+            table, orient="vertical", command=self._bookmark_tree.yview
+        )
+        self._bookmark_tree.configure(yscrollcommand=bookmark_scroll.set)
+        bookmark_scroll.grid(row=0, column=1, sticky="ns")
+        self._bookmark_tree.bind("<<TreeviewSelect>>", self._on_bookmark_select)
+
+        actions = ttk.Frame(outer)
+        actions.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self._bookmark_add_button = ttk.Button(
+            actions, text="添加书签", width=10, command=self._add_bookmark
+        )
+        self._bookmark_jump_button = ttk.Button(
+            actions, text="跳转", width=8, command=self._jump_bookmark
+        )
+        self._bookmark_rename_button = ttk.Button(
+            actions, text="重命名", width=10, command=self._rename_bookmark
+        )
+        self._bookmark_remove_button = ttk.Button(
+            actions, text="删除", width=8, command=self._remove_bookmark
+        )
+        self._bookmark_refresh_button = ttk.Button(
+            actions, text="刷新", width=8, command=self._request_bookmarks
+        )
+        for button in (
+            self._bookmark_add_button,
+            self._bookmark_jump_button,
+            self._bookmark_rename_button,
+            self._bookmark_remove_button,
+            self._bookmark_refresh_button,
+        ):
+            button.pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="关闭", width=8, command=self._close_bookmarks).pack(side="right")
+        ttk.Label(
+            outer, textvariable=self._bookmark_notice_var, anchor="w", wraplength=BOOKMARK_NOTICE_WRAP
+        ).grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self._refresh_bookmark_header()
+        self._update_bookmark_actions()
+
+    def _close_bookmarks(self) -> None:
+        """Tk thread only: destroy the manager window and drop its state."""
+        self._clear_bookmarks()
+        window, self._bookmark_window = self._bookmark_window, None
+        if window is not None:
+            with contextlib.suppress(Exception):
+                window.destroy()
+        self._bookmark_tree = None
+        self._bookmark_header_var = None
+        self._bookmark_notice_var = None
+        self._simpledialog = None
+        self._bookmark_add_button = None
+        self._bookmark_jump_button = None
+        self._bookmark_rename_button = None
+        self._bookmark_remove_button = None
+        self._bookmark_refresh_button = None
+        self._update_actions()
+
+    def _clear_bookmarks(self) -> None:
+        """Drop the list and pending request of a binding that is gone."""
+        self._bookmarks = []
+        self._bookmark_pending = None
+        self._bookmark_rows = {}
+        tree = self._bookmark_tree
+        if tree is not None:
+            with contextlib.suppress(Exception):
+                tree.delete(*tree.get_children())
+        self._bookmark_notice("")
+        self._refresh_bookmark_header()
+        self._update_bookmark_actions()
+
+    def _request_bookmarks(self, *, announce: bool = True) -> None:
+        """Ask the worker for the selected binding's bookmarks (Tk thread only).
+
+        ``announce`` is dropped for the re-read after an operator command so the
+        command's own result message stays visible.
+        """
+        target = self._list_target()
+        if target is None:
+            return
+        player_pid, fid = target
+        self._bookmark_pending = target
+        self._bookmarks = []
+        self._bookmark_rows = {}
+        tree = self._bookmark_tree
+        if tree is not None:
+            with contextlib.suppress(Exception):
+                tree.delete(*tree.get_children())
+        self._refresh_bookmark_header()
+        if announce:
+            self._bookmark_notice(_BOOKMARK_LOADING)
+        self._update_bookmark_actions()
+        self._update_actions()
+        self._requests.put(("bookmarks", player_pid, fid))
+
+    def _apply_bookmarks(self, value: Any) -> None:
+        """Apply a list answer, dropping any that belongs to another binding."""
+        if not self._bookmark_live() or not isinstance(value, tuple) or len(value) != 3:
+            return
+        player_pid, fid, items = value
+        if (player_pid, fid) != selection_target(self._playback, self._selected):
+            return
+        self._bookmark_pending = None
+        if items is None:
+            self._bookmarks = []
+            self._render_bookmarks()
+            self._bookmark_notice(_BOOKMARK_LOAD_FAILED)
+            self._update_actions()
+            return
+        # Only addressable entries are kept: an entry without an id could not be
+        # renamed, removed or jumped, and the header count is the visible one.
+        self._bookmarks = [entry for entry in items if bookmark_id_of(entry) is not None]
+        self._render_bookmarks()
+        self._settle_bookmark_notice(f"已读取 {len(self._bookmarks)} 条书签")
+        self._update_actions()
+
+    def _apply_bookmark_result(self, value: Any, done: str, failed: str, *, refresh: bool) -> None:
+        """Apply one add/rename/remove/jump answer for the binding that asked."""
+        if not self._bookmark_live() or not isinstance(value, tuple) or len(value) != 3:
+            return
+        player_pid, fid, ok = value
+        if (player_pid, fid) != self._bookmark_pending:
+            return
+        self._bookmark_pending = None
+        if not ok:
+            self._bookmark_notice(failed)
+            self._update_bookmark_actions()
+            self._update_actions()
+            return
+        self._bookmark_notice(done)
+        self._update_actions()
+        if refresh:
+            self._request_bookmarks(announce=False)
+        else:
+            self._update_bookmark_actions()
+
+    def _render_bookmarks(self) -> None:
+        tree = self._bookmark_tree
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        self._bookmark_rows = {}
+        for index, entry in enumerate(self._bookmarks):
+            bookmark_id = bookmark_id_of(entry)
+            if bookmark_id is None:
+                continue
+            iid = f"mark{index}"
+            position = format_duration_ms(entry.get("position_ms"))
+            note = entry.get("note")
+            tree.insert(
+                "",
+                "end",
+                iid=iid,
+                # An empty note is valid; the bookmark's own time point stands in
+                # as its default name.
+                values=(position, note if isinstance(note, str) and note else position),
+            )
+            self._bookmark_rows[iid] = bookmark_id
+        self._refresh_bookmark_header()
+        self._update_bookmark_actions()
+
+    def _refresh_bookmark_header(self) -> None:
+        if self._bookmark_header_var is None:
+            return
+        row = match_selection(self._playback, self._selected)
+        name = (row.get("name") if row is not None else None) or "—"
+        self._bookmark_header_var.set(f"当前视频：{name}　书签：{len(self._bookmarks)} 条")
+
+    def _on_bookmark_select(self, _event: Any = None) -> None:
+        self._update_bookmark_actions()
+
+    def _update_bookmark_actions(self) -> None:
+        if self._root is None or not self._bookmark_live():
+            return
+        busy = self._bookmark_pending is not None
+        listing = bookmark_enabled(self._connected, self._playback, self._selected, busy)
+        acting = bookmark_action_enabled(
+            self._connected, self._playback, self._selected, busy
+        )
+        # Jump needs a row of the *attached* list of the selected binding: before
+        # that list has arrived -- or after it was dropped -- nothing can be
+        # selected, so jump stays disabled exactly like rename and remove.
+        chosen = self._selected_bookmark() is not None
+        _toggle(self._bookmark_add_button, acting)
+        _toggle(self._bookmark_jump_button, acting and chosen)
+        _toggle(self._bookmark_rename_button, listing and chosen)
+        _toggle(self._bookmark_remove_button, listing and chosen)
+        _toggle(self._bookmark_refresh_button, listing)
+
+    def _ask_note(self, title: str, prompt: str, initial: str = "") -> str | None:
+        """A modal note prompt on the Tk thread; ``None`` when it cannot answer.
+
+        ``simpledialog`` re-enters ``mainloop``, so worker events (including a
+        selection change) are handled while the operator types; callers must
+        re-check their target afterwards.
+        """
+        dialog = self._simpledialog
+        if dialog is None:
+            return None
+        try:
+            answer = dialog.askstring(
+                title, prompt, parent=self._bookmark_window, initialvalue=initial
+            )
+        except Exception:
+            return None
+        return None if answer is None else answer.strip()
+
+    def _add_bookmark(self) -> None:
+        """Bookmark the player's current position for the selected binding."""
+        target = self._action_target()
+        if target is None:
+            return
+        note = self._ask_note("添加书签", "请输入书签备注（可留空，最多 200 字）：")
+        if note is None:
+            return
+        if len(note) > MAX_NOTE_CHARS:
+            self._bookmark_notice(_BOOKMARK_NOTE_TOO_LONG)
+            return
+        if target != self._action_target():
+            self._bookmark_notice(_BOOKMARK_STALE)
+            return
+        self._bookmark_pending = target
+        self._bookmark_notice(_BOOKMARK_WORKING)
+        self._update_bookmark_actions()
+        self._update_actions()
+        self._requests.put(("bookmark_add", target[0], target[1], note))
+
+    def _rename_bookmark(self) -> None:
+        """Rename the selected bookmark's note."""
+        target = self._list_target()
+        bookmark_id = self._selected_bookmark()
+        if target is None or bookmark_id is None:
+            return
+        note = self._ask_note("重命名书签", "请输入新的备注（可留空，最多 200 字）：", self._note_of(bookmark_id))
+        if note is None:
+            return
+        if len(note) > MAX_NOTE_CHARS:
+            self._bookmark_notice(_BOOKMARK_NOTE_TOO_LONG)
+            return
+        if target != self._list_target() or bookmark_id != self._selected_bookmark():
+            self._bookmark_notice(_BOOKMARK_STALE)
+            return
+        self._bookmark_pending = target
+        self._bookmark_notice(_BOOKMARK_WORKING)
+        self._update_bookmark_actions()
+        self._update_actions()
+        self._requests.put(("bookmark_rename", target[0], target[1], bookmark_id, note))
+
+    def _remove_bookmark(self) -> None:
+        """Remove the selected bookmark."""
+        target = self._list_target()
+        bookmark_id = self._selected_bookmark()
+        if target is None or bookmark_id is None:
+            return
+        self._bookmark_pending = target
+        self._bookmark_notice(_BOOKMARK_WORKING)
+        self._update_bookmark_actions()
+        self._update_actions()
+        self._requests.put(("bookmark_remove", target[0], target[1], bookmark_id))
+
+    def _jump_bookmark(self) -> None:
+        """Ask the player to seek to the selected bookmark."""
+        target = self._action_target()
+        bookmark_id = self._selected_bookmark()
+        if target is None or bookmark_id is None:
+            return
+        self._bookmark_pending = target
+        self._bookmark_notice(_BOOKMARK_WORKING)
+        self._update_bookmark_actions()
+        self._update_actions()
+        self._requests.put(("bookmark_jump", target[0], target[1], bookmark_id))
+
+    def _note_of(self, bookmark_id: Any) -> str:
+        """The stored note of one bookmark id, used as the rename default."""
+        for entry in self._bookmarks:
+            if bookmark_id_of(entry) == bookmark_id:
+                note = entry.get("note")
+                return note if isinstance(note, str) else ""
+        return ""
+
+
+def _toggle(widget: Any, enabled: bool) -> None:
+    """Enable or disable one ttk button; no-op for a missing widget."""
+    if widget is not None:
+        widget.state(["!disabled"] if enabled else ["disabled"])
 
 
 def _apply_font(root: Any, tkfont: Any, ttk: Any) -> None:

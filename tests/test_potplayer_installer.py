@@ -98,6 +98,39 @@ class DetectionTests(unittest.TestCase):
             self.assertEqual(core.detect_potplayer_dir(explicit=directory), directory)
             self.assertEqual(core.detect_potplayer_dir(saved=str(directory / "PotPlayerMini64.exe")), directory)
 
+    def test_an_invalid_explicit_directory_is_refused_without_any_probe(self) -> None:
+        # An explicit choice is authoritative: a bad one must raise instead of
+        # silently installing into a different, auto-detected player. The search
+        # itself must not even be attempted.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            good = make_potplayer(root)
+            empty = root / "empty"
+            empty.mkdir()
+            with mock.patch.object(core, "_registry_program_dirs",
+                                   side_effect=AssertionError("registry probed")), \
+                 mock.patch.object(core, "_registry_uninstall_icons",
+                                   side_effect=AssertionError("uninstall registry probed")), \
+                 mock.patch.object(core, "_common_install_dirs",
+                                   side_effect=AssertionError("common folders probed")):
+                with self.assertRaises(core.InstallError):
+                    core.detect_potplayer_dir(explicit=root / "missing", saved=str(good))
+                with self.assertRaises(core.InstallError):
+                    core.detect_potplayer_dir(explicit=empty, saved=str(good))
+
+    def test_auto_detection_skips_a_stale_saved_path_and_keeps_looking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            good = make_potplayer(root)
+            with mock.patch.object(core, "_registry_program_dirs", return_value=[]), \
+                 mock.patch.object(core, "_registry_uninstall_icons", return_value=[]), \
+                 mock.patch.object(core, "_common_install_dirs", return_value=[good]):
+                self.assertEqual(core.detect_potplayer_dir(saved=str(root / "gone")), good)
+            with mock.patch.object(core, "_registry_program_dirs", return_value=[]), \
+                 mock.patch.object(core, "_registry_uninstall_icons", return_value=[]), \
+                 mock.patch.object(core, "_common_install_dirs", return_value=[]):
+                self.assertIsNone(core.detect_potplayer_dir(saved=str(root / "gone")))
+
     def test_user_roots_come_from_environment(self) -> None:
         env = {"LOCALAPPDATA": r"C:\Users\u\AppData\Local", "APPDATA": r"C:\Users\u\AppData\Roaming"}
         self.assertEqual(core.default_install_dir(env), Path(r"C:\Users\u\AppData\Local/QuarkPotPlayer"))
@@ -117,6 +150,79 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(
             core.cli_config_dir(relative), Path(r"C:\Users\u\AppData\Roaming/quark-drive-cli")
         )
+
+
+class _StubVar:
+    """Minimal stand-in for a ``tkinter.StringVar`` (no Tk root in tests)."""
+
+    def __init__(self, value: str = "") -> None:
+        self.value = value
+
+    def get(self) -> str:
+        return self.value
+
+    def set(self, value: str) -> None:
+        self.value = value
+
+
+class DetectCallbackTests(unittest.TestCase):
+    """The GUI 自动检测 callback reports a bad typed directory instead of raising."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def window(self, typed: str) -> installer.InstallerWindow:
+        window = installer.InstallerWindow.__new__(installer.InstallerWindow)
+        window.potplayer = _StubVar(typed)
+        window.messages = []
+        window.log = window.messages.append
+        return window
+
+    def test_typed_invalid_directory_is_reported_without_a_traceback(self) -> None:
+        typed = self.root / "not-a-player"
+        typed.mkdir()
+        window = self.window(str(typed))
+        window.detect()  # a Tk callback: it must never raise out of here
+        self.assertEqual(window.potplayer.get(), str(typed))
+        self.assertEqual(len(window.messages), 1)
+        self.assertIn("目录无效", window.messages[0])
+        self.assertIn(str(typed), window.messages[0])
+
+    def test_typed_missing_directory_is_reported_without_a_traceback(self) -> None:
+        window = self.window(str(self.root / "gone"))
+        window.detect()
+        self.assertEqual(len(window.messages), 1)
+        self.assertIn("目录无效", window.messages[0])
+        self.assertIn("目录不存在", window.messages[0])
+
+    def test_typed_player_directory_is_kept(self) -> None:
+        directory = make_potplayer(self.root)
+        window = self.window(str(directory))
+        window.detect()
+        self.assertEqual(window.potplayer.get(), str(directory))
+        self.assertEqual(window.messages, [f"已找到 PotPlayer：{directory}"])
+
+    def test_blank_input_still_auto_detects(self) -> None:
+        directory = make_potplayer(self.root)
+        window = self.window("   ")
+        with mock.patch.object(core, "_registry_program_dirs", return_value=[]), \
+             mock.patch.object(core, "_registry_uninstall_icons", return_value=[]), \
+             mock.patch.object(core, "_common_install_dirs", return_value=[directory]):
+            window.detect()
+        self.assertEqual(window.potplayer.get(), str(directory))
+        self.assertEqual(window.messages, [f"已找到 PotPlayer：{directory}"])
+
+    def test_blank_input_reports_when_nothing_is_found(self) -> None:
+        window = self.window("")
+        with mock.patch.object(core, "_registry_program_dirs", return_value=[]), \
+             mock.patch.object(core, "_registry_uninstall_icons", return_value=[]), \
+             mock.patch.object(core, "_common_install_dirs", return_value=[]):
+            window.detect()
+        self.assertEqual(window.messages, ["未自动找到 PotPlayer，请点击「浏览…」选择安装目录"])
 
 
 class RelaunchTests(unittest.TestCase):
@@ -573,7 +679,15 @@ class LauncherEntryTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], [str(self.component), "--ensure-service"])
 
     def test_missing_component_reports_cleanly(self) -> None:
-        with mock.patch.object(launcher_entry, "launcher_directory", return_value=self.extension):
+        # No recorded path and no override: hide the machine's real
+        # %LOCALAPPDATA% so the default-location lookup cannot find (and run) a
+        # user's installed bridge.
+        env = {
+            key: value for key, value in os.environ.items()
+            if key not in ("LOCALAPPDATA", launcher_entry.ENV_OVERRIDE)
+        }
+        with mock.patch.object(launcher_entry, "launcher_directory", return_value=self.extension), \
+             mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(launcher_entry.main(["quark-potplayer.exe", "--ensure-service"]), 3)
 
     def test_bridge_reuses_the_launcher_stdio(self) -> None:

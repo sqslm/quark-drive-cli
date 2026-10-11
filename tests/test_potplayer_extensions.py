@@ -740,7 +740,7 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
 
     def test_versions_report_the_current_release(self):
         for raw in (self.url_raw, self.play_raw):
-            self.assertIn('return "0.6.0";', self.raw_body(raw, "string GetVersion()"))
+            self.assertIn('return "0.7.0";', self.raw_body(raw, "string GetVersion()"))
 
     def test_diagnostics_category_posts_a_json_body_and_returns_a_back_row(self):
         page = self.raw_body(self.url_raw, "array<dictionary> QuarkDiagnosticsPage()")

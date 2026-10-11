@@ -10,7 +10,7 @@
 | `SHA256SUMS.txt` | 安装程序 SHA-256 |
 | `build-info.json` | 构建时间、组件版本、随包扩展脚本清单 |
 
-当前版本为 **0.6.0**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.6.0/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
+当前版本为 **0.7.0**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.7.0/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
 
 构建方式见文末“开发者构建”。
 
@@ -46,7 +46,9 @@
 
 组件、安装程序副本与 `install.json` 写在 `%LOCALAPPDATA%`（当前用户目录），**不需要管理员权限**。但扩展脚本 `*.as`、启动器 `quark-potplayer.exe` 与 `quark-potplayer.path` 必须写入 PotPlayer 的 `Extension` 目录：当 PotPlayer 装在 `Program Files` 等受保护位置时，安装程序需要对该目录的**写权限**，否则覆盖会失败——请对 `Extension` 目录授予当前用户写权限，或以管理员身份运行安装程序。
 
-组件安装目录只接受**空目录**或**本插件已有的安装目录**（含 `install.json` 或 `app\QuarkPotPlayer.exe`）。选择非空的无关目录时安装程序拒绝写入并提示，避免把文件写进用户的目录。
+组件安装目录只接受**空目录**或**本插件已有的安装目录**（含 `install.json` 或 `app\QuarkPotPlayer.exe`）。选择非空的无关目录时安装程序拒绝写入，并在界面上给出可读的中文提示，避免把文件写进用户的目录。
+
+目录框留空（默认）或点“自动检测”时，按注册表与常见路径自动查找 PotPlayer/安装位置；**手动填入**的目录会被严格校验：无效时立即报错并停止，**不会**回退到自动检测的结果，以免把文件装到你没指定的位置。
 
 ## 首次使用
 
@@ -79,13 +81,14 @@ QuarkPotPlayer-Setup.exe --silent --potplayer-dir "D:\PotPlayer"
 QuarkPotPlayer-Setup.exe --uninstall --silent [--clear-credentials]
 ```
 
-其他参数：`--install-dir <目录>`、`--no-shortcut`、`--no-registry`、`--no-open`。静默模式把日志写入 `%TEMP%\QuarkPotPlayer-Setup.log`，退出码 `0` 成功、`4` 失败。
+其他参数：`--install-dir <目录>`（显式指定时严格校验，无效目录直接失败、不回退到自动检测；省略则自动查找）、`--no-shortcut`、`--no-registry`、`--no-open`。静默模式把日志写入 `%TEMP%\QuarkPotPlayer-Setup.log`，退出码 `0` 成功、`4` 失败。
 
 ## 故障排查
 
 | 现象 | 处理 |
 | --- | --- |
 | 提示未找到 PotPlayer | 手动选择含 `PotPlayerMini64.exe` 的目录（应有 `Extension` 子目录） |
+| 目录框提示无效 / 自动检测报错 | 手动填入的目录会被严格校验，无效时直接报错且不会回退；清空该栏或点“自动检测”改用自动查找 |
 | 扩展脚本覆盖失败 | 关闭 PotPlayer 后重试安装 |
 | 目录/播放异常 | 运行 `%LOCALAPPDATA%\QuarkPotPlayer\app\QuarkPotPlayer.exe --stop` 结束后台服务，再重新打开播放器 |
 | 需要重新登录 | 在插件入口重新扫码；如需彻底重置，卸载时勾选清除插件凭证后重装 |

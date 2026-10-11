@@ -210,14 +210,20 @@ def detect_potplayer_dir(
     saved: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> Path | None:
-    """First validated PotPlayer directory, or ``None``.
+    """The validated PotPlayer directory, or ``None`` when nothing is found.
 
-    Order: explicit argument, the path recorded by a previous install, PotPlayer's
-    own registry entries, its uninstall entry, then conventional install folders.
+    An ``explicit`` directory is authoritative: when it is not a usable PotPlayer
+    directory, :class:`InstallError` is raised at once. The search never falls
+    back to another location the user did not ask for, which could otherwise
+    silently install into a completely different player.
+
+    Without ``explicit``, the order is: the path recorded by a previous install,
+    PotPlayer's own registry entries, its uninstall entry, then conventional
+    install folders. A stale recorded path is skipped and the search continues.
     """
-    candidates: list[Path] = []
     if explicit is not None:
-        candidates.append(Path(explicit))
+        return resolve_potplayer_dir(Path(explicit))
+    candidates: list[Path] = []
     if saved:
         candidates.append(Path(saved))
     for entry in _registry_program_dirs():

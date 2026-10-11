@@ -150,7 +150,7 @@
   "parent":"...","watched":false,"position_ms":0,"duration_ms":0,"display":"第2集.mp4"}]}
 ```
 
-`played_at` 是本机 Unix 秒。`parent` 是该视频真实所在目录的 FID（从未知目录播放时为空串），`watched` 表示手动标记或已基本看完（见下），`position_ms`/`duration_ms` 是本机续播点，`display` 是把进度并入后的显示标题（原始 `name` 保持不变）。条目用于从该集开始同目录选集。
+`played_at` 是本机 Unix 秒。`parent` 是该视频真实所在目录的 FID（从未知目录播放时为空串），`watched` 表示手动标记或已基本看完（见下），`position_ms`/`duration_ms` 是本机续播点，`display` 是把已知目录名与进度并入后的显示标题：已确认所属目录时为“目录名 / 原文件名 · 已看 x%”，未知目录则保留原文件名（原始 `name` 字段始终不变）。条目用于从该集开始同目录选集。
 
 ### `GET /v1/continue`
 
@@ -183,7 +183,7 @@
 ### 写入时机与数据边界
 
 - 最近记录在**首个非空媒体块成功转发之后**写入，不等整集传输结束：取链、`HEAD`、未转发任何媒体字节的失败 `GET` 不记录。已经开始传输后再关闭、拖动或遇到上游中断，已写入的记录仍保留；每个 HTTP 请求只记一次，不按分段或数据块重复写盘。
-- 收藏与最近观看存放在插件私有目录 `config_directory()/potplayer/library.json`（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。文件版本 3 起，最近观看条目另含观看进度字段 `position_ms`、`duration_ms`、`progress_at`（本机时间）与真实 `parent` 目录 FID，并新增独立的 `marks` 列表保存显式“已看”标记（不受 100 条最近上限影响）；`marks` 按 FID **和大小** 记录，FID 被替换成不同大小的文件时不会继承旧的已看标记。版本 1/2 记录可正常读取，读取时不改写文件，仅在下次正常写入时才就地升级为版本 3，既有收藏/最近观看不受影响。
+- 收藏与最近观看存放在插件私有目录 `config_directory()/potplayer/library.json`（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。文件版本 2 起，最近观看条目另含观看进度字段 `position_ms`、`duration_ms`、`progress_at`（本机时间）；版本 3 起另含真实 `parent` 目录 FID，并新增独立的 `marks` 列表保存显式“已看”标记（不受 100 条最近上限影响）；`marks` 按 FID **和大小** 记录，FID 被替换成不同大小的文件时不会继承旧的已看标记。版本 4 起，最近观看条目另存真实目录名 `parent_name`：它只取自桥接**已经拉取过**的目录清单或“收藏目录”，从不使用窗口标题、从不猜测剧名、也不为此新增任何云端请求；`/v1/recent` 与 `/v1/continue` 的 `display` 因此显示“目录名 / 原文件名”，无法确认所属目录（含根目录，`parent` 为 `0`）时保留原文件名。版本 1/2/3 记录可正常读取，读取时不改写文件，仅在下次正常写入时才就地升级为版本 4，既有收藏/最近观看不受影响。
 - 显式插件退出登录（`POST /v1/auth/logout`）会一并清空这两份列表及其中的观看进度；本地清理失败时返回 `500 local_io_error`，凭证仍已失效，不误报清理成功。登录过期只要求重新扫码，不清空。跨进程重启与升级保留。
 
 ## 播放流
@@ -207,7 +207,7 @@
 
 ### 播放进度（本机）
 
-- 播放期间组件按绑定核对当前播放器进度，并把位置写入 `library.json` 中该最近观看条目的版本 3 字段（`position_ms`、`duration_ms`、`progress_at`）。显式标记为已看的视频既不续播也不再写入真实进度，直到标记被清除。`/v1/recent`、`/v1/continue`、`/v1/series` 会把这些字段转为只读视图；`progress_at` 本身不作为公共响应字段暴露。
+- 播放期间组件按绑定核对当前播放器进度，并把位置写入 `library.json` 中该最近观看条目的进度字段（`position_ms`、`duration_ms`、`progress_at`）。显式标记为已看的视频既不续播也不再写入真实进度，直到标记被清除。`/v1/recent`、`/v1/continue`、`/v1/series` 会把这些字段转为只读视图；`progress_at` 本身不作为公共响应字段暴露。
 - 读取频率约每 2 秒一次，落盘约每 10 秒一次，并在暂停、切换集数与关闭时各写一次。保存位置不足 15 秒时不续播；剩余时长不足 `min(30 秒, 时长 2%)` 时不回跳（从 0 开始）也不计为已看完；保存时的文件大小或时长与当前明显不符时不套用旧进度。
 - 首次读到播放器位置已超过约 5 秒（例如用户手动拖过）时，尊重播放器当前位置，组件**不**把它强行拉回保存点。
 - 绑定标识为播放器窗口进程 PID 与完整逻辑 fid 地址（`https://quark.invalid/{video,play}/<fid>`）；不使用文件名、窗口标题或下载字节比例推断归属。同一 fid 被多个实例同时打开时暂停该 fid 的进度写入，实例减少后恢复。
@@ -228,7 +228,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.6.0", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.7.0", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -262,6 +262,20 @@
 - 本机进度写盘失败。
 
 使播放器跳回 0 但进度重置未完成同样按失败处理（`409`）。参数缺失或非法（`player_pid` 非上述范围的整数、`fid` 缺失/空）→ `400 bad_request`；方法不是 `POST` → `405 method_not_allowed`。失败时状态窗口显示固定中文提示（如“从头开始失败，请稍后重试”）。
+
+### 播放书签（本机）
+
+需 Bearer；纯本机读写，**不需要**夸克登录，未登录/登录过期/冷却中均可使用。书签按视频 fid 归属，只保存本机时间点、时长与备注，不含 Cookie、令牌或签名地址；状态窗口的“播放书签”按钮即调用这五个接口。
+
+- `GET /v1/bookmarks?fid=<视频 fid>` → `{"items":[{"id":"…","fid":"…","name":"…","size":123,"position_ms":0,"duration_ms":0,"note":""}]}`。`fid` 必填，最近添加在前；无书签时 `items` 为空数组。
+- `POST /v1/bookmarks/add`，请求体 `{"player_pid":1234,"fid":"…","note":"…"}`（`player_pid` 为**严格 JSON 整数**，`note` 为字符串、最长 200 个字符、**可以为空**）→ `200 {"bookmark":{…}}`。时间点与时长取自播放器的实时采样，**不信任**客户端提供的时间、名称或大小。
+- `POST /v1/bookmarks/rename`，请求体 `{"id":"…","note":"…"}`（同样可空、最长 200 字符）→ `200 {"status":"renamed"}`；`id` 不存在 → `404 not_found`。
+- `POST /v1/bookmarks/remove`，请求体 `{"id":"…"}` → `200 {"status":"removed"}`；`id` 不存在 → `404 not_found`。
+- `POST /v1/bookmarks/jump`，请求体 `{"player_pid":1234,"fid":"…","id":"…"}` → `200 {"status":"jumped"}`。
+
+`add`/`jump` 只对**当前正在播放同一逻辑文件**的绑定生效，并核对实时身份：该 PID 没有绑定、播放器中的文件不符、同一 fid 被多实例打开、或本机缺少原生读取能力时返回 `409 media_changed`；`add` 在位置无效（为 0 或已在结尾）时同样失败，但它始终记录当前文件的真实时间点，因此文件换了大小/时长后仍可对新文件添加书签；`jump` 额外在书签保存的大小/时长与当前文件明显不符时失败（指向旧文件的旧书签因此不可跳转）。参数、`fid`、`id` 或备注非法（含 `note` 非字符串或超过 200 字符）→ `400 bad_request`；写入路由只接受 `POST`，任何其它方法（含 `HEAD`）都只会得到 `405 method_not_allowed`，不会执行写入。`GET`/`rename`/`remove` 只读写本地文件，不访问夸克；`add`/`jump` 也不产生额外的云请求。
+
+书签存放在同目录的独立小文件 `bookmark.json`（与 `library.json` 分开，见下），**不**进入诊断报告；显式退出登录会一并清空，登录过期不清。
 
 > 通用约定：本地令牌无效 → `401 unauthorized`；参数非法 → `400 bad_request`；方法不被支持 → `405 method_not_allowed`（与既有路由一致）。这些接口只要求本地 Bearer，不要求夸克登录，因此在未登录、登录过期或冷却中仍可用于查看状态与导出报告。
 
@@ -330,7 +344,8 @@
 
 - 插件凭证：`config_directory()/potplayer/cookie`，由 `QRLogin` 单独保存；`quark` CLI 的 Cookie 从不读取、写入或删除。
 - 运行配置：同目录 `runtime.json`；单实例锁 `service.lock`。
-- 收藏、最近观看与已看标记：同目录 `library.json`，含 FID、名称、大小与本机时间，版本 3 起另含观看进度（`position_ms`/`duration_ms`/`progress_at`）、真实 `parent` 目录与 `marks` 已看列表；显式退出登录清空，过期不清、升级保留。
+- 收藏、最近观看与已看标记：同目录 `library.json`，含 FID、名称、大小与本机时间，版本 2 起另含观看进度（`position_ms`/`duration_ms`/`progress_at`），版本 3 起另含真实 `parent` 目录与 `marks` 已看列表，版本 4 起另存目录名 `parent_name`（只来自已拉取的目录清单或收藏目录，零额外云请求；未知目录保留原文件名）；显式退出登录清空，过期不清、升级保留。
+- 播放书签：同目录独立文件 `bookmark.json`（含 fid、名称、大小、时间点、时长与备注，备注最长 200 字符、可为空；不含 Cookie/令牌/签名地址）；显式退出登录一并清空，过期不清、升级保留；不进入诊断报告。
 - 视频不落盘：无分片、无磁盘缓存、无转码；仅内存转发请求的字节范围。
 - 内嵌字幕/音轨由播放器原生解码、显示与切换，本插件不替换、不自动选中外挂轨；同目录外挂字幕经原生“字幕搜索”手动选择，只从本桥接读取内存文本——桥接自身不写字幕或视频文件，播放器是否把所选字幕保存到磁盘由 PotPlayer 自身行为决定。
 - 本地凭证与诊断数据保持私有：`/v1/diagnostics/report` 只在用户显式导出时才写文件，且经白名单裁剪，不含 Cookie/令牌/URL/FID/文件名/观看进度/绝对路径。

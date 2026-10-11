@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
@@ -943,9 +944,9 @@ class RecentCase(_ServerCase):
         library = self.service.library
         original = library.record_recent
 
-        def spy(fid, name, size, parent=""):
+        def spy(fid, *args, **kwargs):
             calls.append(fid)
-            return original(fid, name, size, parent)
+            return original(fid, *args, **kwargs)
 
         library.record_recent = spy
 
@@ -1253,6 +1254,107 @@ class SeriesCase(_ServerCase):
         self.api("GET", "/v1/favorites")
         self.assertEqual(len(self.fixture.requests), before)
 
+    # -- directory names in recent/continue titles ------------------------
+
+    def test_recorded_play_carries_the_directory_name_into_recent(self):
+        # "剧集" comes from the root page the bridge already serves; no window
+        # title, no guess, and no extra request for the name.
+        page = self.api("GET", "/v1/files?parent=0").json()
+        self.assertEqual([item["name"] for item in page["items"]], ["剧集", "空目录"])
+        self.api("GET", "/v1/playlist?parent=root-dir")
+        self.assertEqual(self.stream(self.play("v2")["url"]).status_code, 200)
+
+        item = self.api("GET", "/v1/recent").json()["items"][0]
+        self.assertEqual(item["name"], "第2集.mp4")
+        self.assertTrue(item["display"].startswith("剧集 / 第2集.mp4"), item["display"])
+        stored = json.loads(self.service.library.path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["version"], 4)
+        self.assertEqual(stored["recent"][0]["parent"], "root-dir")
+        self.assertEqual(stored["recent"][0]["parent_name"], "剧集")
+
+    def test_stored_directory_name_is_used_without_any_request(self):
+        write_json(self.service.library.path, {
+            "version": 4,
+            "favorites": [],
+            "marks": [],
+            "recent": [{
+                "fid": "v2", "name": "01.mkv", "size": self.SIZE, "played_at": 10,
+                "position_ms": 500_000, "duration_ms": 1_800_000, "progress_at": 5,
+                "parent": "dir-a", "parent_name": "剧集",
+            }],
+        })
+        before = len(self.fixture.requests)
+        item = self.api("GET", "/v1/continue").json()["items"][0]
+        self.assertEqual(item["display"], "剧集 / 01.mkv · 已看 27%")
+        self.assertEqual(len(self.fixture.requests), before)
+
+    def test_a_renamed_directory_shows_the_fresh_name_without_a_new_request(self):
+        # The row still carries the old directory name, but browsing the
+        # directory already fetched the verified new one: the fresh name wins
+        # immediately, with the raw file name untouched and no extra request.
+        write_json(self.service.library.path, {
+            "version": 4,
+            "favorites": [],
+            "marks": [],
+            "recent": [{
+                "fid": "v2", "name": "01.mkv", "size": self.SIZE, "played_at": 10,
+                "position_ms": 500_000, "duration_ms": 1_800_000, "progress_at": 5,
+                "parent": "root-dir", "parent_name": "旧剧名",
+            }],
+        })
+        self.api("GET", "/v1/files?parent=0")
+        before = len(self.fixture.requests)
+        item = self.api("GET", "/v1/continue").json()["items"][0]
+        self.assertEqual(item["name"], "01.mkv")
+        self.assertEqual(item["display"], "剧集 / 01.mkv · 已看 27%")
+        self.assertEqual(len(self.fixture.requests), before)
+
+    def test_favorites_complete_an_older_record_without_a_probe(self):
+        # A version-3 record has the parent FID but never the name; the favorite
+        # already carries the verified name, so no cloud request is needed.
+        self.save_document(
+            favorites=[{"fid": "root-dir", "name": "剧集", "added_at": 1}],
+            recent=[self.recent_row("v2", "第2集.mp4", position_ms=60_000, duration_ms=1_800_000, progress_at=5)],
+        )
+        before = len(self.fixture.requests)
+        self.assertEqual(self.api("GET", "/v1/continue").json()["items"][0]["display"],
+                         "剧集 / 第2集.mp4 · 已看 3%")
+        self.assertEqual(self.api("GET", "/v1/recent").json()["items"][0]["display"],
+                         "剧集 / 第2集.mp4 · 已看 3%")
+        self.assertEqual(len(self.fixture.requests), before)
+
+    def test_a_browsed_directory_completes_an_older_record_without_a_probe(self):
+        self.api("GET", "/v1/files?parent=0")
+        self.save_document(recent=[
+            self.recent_row("v2", "第2集.mp4", position_ms=60_000, duration_ms=1_800_000, progress_at=5)
+        ])
+        before = len(self.fixture.requests)
+        item = self.api("GET", "/v1/continue").json()["items"][0]
+        self.assertEqual(item["display"], "剧集 / 第2集.mp4 · 已看 3%")
+        self.assertEqual(len(self.fixture.requests), before)
+
+    def test_unknown_and_root_parents_keep_the_full_file_name(self):
+        self.save_document(recent=[
+            self.recent_row("v2", "第2集.mp4", parent="",
+                            position_ms=60_000, duration_ms=1_800_000, progress_at=5),
+            self.recent_row("v9", "电影.mkv", parent="0",
+                            position_ms=60_000, duration_ms=1_800_000, progress_at=6),
+        ])
+        items = {item["fid"]: item for item in self.api("GET", "/v1/recent").json()["items"]}
+        self.assertEqual(items["v2"]["display"], "第2集.mp4 · 已看 3%")
+        self.assertEqual(items["v9"]["display"], "电影.mkv · 已看 3%")
+
+    def test_series_episode_rows_stay_unprefixed(self):
+        # A series listing is already grouped by its directory, so its episode
+        # rows keep the plain name even when the directory name is known.
+        self.api("GET", "/v1/files?parent=0")
+        self.save_document(recent=[
+            self.recent_row("v2", "第2集.mp4", position_ms=60_000, duration_ms=1_800_000, progress_at=5)
+        ])
+        episodes = {episode["fid"]: episode for episode in
+                    self.api("GET", "/v1/series?parent=root-dir").json()["episodes"]}
+        self.assertEqual(episodes["v2"]["display"], "第2集.mp4 · 已看 3%")
+
 
 class PersistenceCase(_ServerCase):
     """The private document is read back by a fresh service instance."""
@@ -1316,6 +1418,351 @@ class AuthGateCase(_ServerCase):
                 response = self.api(method, path, body={"fid": "root-dir"} if method == "POST" else None)
                 self.assertEqual(response.status_code, 401)
                 self.assertEqual(response.json()["error"]["type"], "login_required")
+
+
+class _NativeSample:
+    """One scripted native reading: exactly the fields the monitor reads itself."""
+
+    __slots__ = ("player_pid", "file_name", "position_ms", "duration_ms", "status")
+
+    def __init__(self, player_pid: int, file_name: str, position_ms: int, duration_ms: int, status: int) -> None:
+        self.player_pid = player_pid
+        self.file_name = file_name
+        self.position_ms = position_ms
+        self.duration_ms = duration_ms
+        self.status = status
+
+
+class FakeNativePlayer:
+    """Scripted native adapter: one live reading per PID plus the recorded seeks.
+
+    It stands in for :class:`NativePlayer` *behind the real* ``PlaybackMonitor``,
+    so the bookmark endpoints are exercised over HTTP against a real worker.
+    """
+
+    def __init__(self) -> None:
+        self.samples: dict[int, _NativeSample] = {}
+        self.seeks: list[tuple[int, str, int]] = []
+        self.seek_ok = True
+        self.closed = False
+
+    def feed(self, player_pid: int, file_name: str, position_ms: int, duration_ms: int, status: int = 2) -> None:
+        self.samples[player_pid] = _NativeSample(player_pid, file_name, position_ms, duration_ms, status)
+
+    def sample(self, player_pid: int) -> _NativeSample | None:
+        return self.samples.get(player_pid)
+
+    def seek(self, player_pid: int, expected_file_name: str, position_ms: int) -> bool:
+        self.seeks.append((player_pid, expected_file_name, position_ms))
+        return self.seek_ok
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def seed_bookmark(store, fid: str = "v2", note: str = "备注", *, name: str = "第2集.mp4", size: int = 2048,
+                  position_ms: int = 30_000, duration_ms: int = 1_800_000) -> dict:
+    """Write one row straight into the local bookmark document."""
+    return store.add(fid, name, size, position_ms, duration_ms, note)
+
+
+class BookmarksLocalCase(_ServerCase):
+    """The bookmark document is served locally: no Quark login, no cloud request."""
+
+    def service_kwargs(self) -> dict:
+        return {"transport": self.fixture.transport()}
+
+    def test_local_crud_works_without_a_login_and_without_any_cloud_request(self):
+        self.assertFalse(self.api("GET", "/v1/auth").json()["authenticated"])
+        first = seed_bookmark(self.service.monitor.bookmarks, "v2", "开场")
+        second = seed_bookmark(self.service.monitor.bookmarks, "v2", "高潮")
+        other = seed_bookmark(self.service.monitor.bookmarks, "v9", "别的视频", name="第9集.mkv", size=4096)
+
+        listed = self.api("GET", "/v1/bookmarks?fid=v2")
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(listed.json()["items"], [second, first])  # newest first
+        self.assertEqual(set(second), {"id", "fid", "name", "size", "position_ms", "duration_ms", "note"})
+        self.assertEqual(self.api("GET", "/v1/bookmarks?fid=v9").json()["items"], [other])
+        self.assertEqual(self.api("GET", "/v1/bookmarks?fid=never").json(), {"items": []})
+        self.assertEqual(self.fixture.requests, [])
+
+        renamed = self.api("POST", "/v1/bookmarks/rename", body={"id": first["id"], "note": "改过的备注"})
+        self.assertEqual(renamed.status_code, 200, renamed.text)
+        self.assertEqual(renamed.json(), {"status": "renamed"})
+        items = self.api("GET", "/v1/bookmarks?fid=v2").json()["items"]
+        self.assertEqual(items[1]["note"], "改过的备注")
+        self.assertEqual(items[0], second)  # a rename rewrites neither order nor siblings
+        self.assertEqual(self.api("GET", "/v1/bookmarks?fid=v9").json()["items"], [other])
+
+        missing = self.api("POST", "/v1/bookmarks/rename", body={"id": "nope", "note": "x"})
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["error"]["type"], "not_found")
+
+        removed = self.api("POST", "/v1/bookmarks/remove", body={"id": second["id"]})
+        self.assertEqual(removed.status_code, 200, removed.text)
+        self.assertEqual(removed.json(), {"status": "removed"})
+        self.assertEqual(
+            [item["id"] for item in self.api("GET", "/v1/bookmarks?fid=v2").json()["items"]],
+            [first["id"]],
+        )
+        self.assertEqual(self.api("POST", "/v1/bookmarks/remove", body={"id": second["id"]}).status_code, 404)
+        self.assertEqual(self.fixture.requests, [])
+
+    def test_bookmark_endpoints_require_the_runtime_token(self):
+        requests = (
+            ("GET", "/v1/bookmarks?fid=v2", None),
+            ("POST", "/v1/bookmarks/add", {"player_pid": 1, "fid": "v2", "note": ""}),
+            ("POST", "/v1/bookmarks/rename", {"id": "a", "note": ""}),
+            ("POST", "/v1/bookmarks/remove", {"id": "a"}),
+            ("POST", "/v1/bookmarks/jump", {"player_pid": 1, "fid": "v2", "id": "a"}),
+        )
+        for method, path, body in requests:
+            with self.subTest(path=path):
+                anonymous = self.api(method, path, body=body, token=False)
+                self.assertEqual(anonymous.status_code, 401)
+                self.assertEqual(anonymous.json()["error"]["type"], "unauthorized")
+                self.assertEqual(self.api(method, path, body=body, token="wrong").status_code, 401)
+
+    def test_wrong_methods_are_405_and_head_never_mutates(self):
+        seeded = seed_bookmark(self.service.monitor.bookmarks, "v2", "保留")
+        for method, path in (
+            ("POST", "/v1/bookmarks"),
+            ("DELETE", "/v1/bookmarks"),
+            ("GET", "/v1/bookmarks/add"),
+            ("HEAD", "/v1/bookmarks/add"),
+            ("PUT", "/v1/bookmarks/add"),
+            ("GET", "/v1/bookmarks/rename"),
+            ("HEAD", "/v1/bookmarks/rename"),
+            ("PATCH", "/v1/bookmarks/remove"),
+            ("HEAD", "/v1/bookmarks/remove"),
+            ("GET", "/v1/bookmarks/jump"),
+            ("HEAD", "/v1/bookmarks/jump"),
+        ):
+            with self.subTest(method=method, path=path):
+                self.assertEqual(self.api(method, path).status_code, 405)
+
+        body = json.dumps({"id": seeded["id"]}).encode("utf-8")
+        head = self.api("HEAD", "/v1/bookmarks/remove", content=body)
+        self.assertEqual(head.status_code, 405)
+        self.assertEqual(head.content, b"")
+        self.assertEqual(
+            [item["id"] for item in self.api("GET", "/v1/bookmarks?fid=v2").json()["items"]],
+            [seeded["id"]],
+        )
+        self.assertEqual(self.api("GET", "/v1/bookmarks/absent").status_code, 404)
+        self.assertEqual(self.api("POST", "/v1/bookmarks/absent", body={}).status_code, 404)
+
+    def test_bad_payloads_are_rejected_with_400(self):
+        seeded = seed_bookmark(self.service.monitor.bookmarks, "v2", "保留")
+        cases = (
+            ("POST", "/v1/bookmarks/add", {}),
+            ("POST", "/v1/bookmarks/add", {"player_pid": 1, "fid": "v2"}),
+            ("POST", "/v1/bookmarks/add", {"player_pid": 1, "fid": "v2", "note": None}),
+            ("POST", "/v1/bookmarks/add", {"player_pid": 0, "fid": "v2", "note": ""}),
+            ("POST", "/v1/bookmarks/add", {"player_pid": True, "fid": "v2", "note": ""}),
+            ("POST", "/v1/bookmarks/add", {"player_pid": "1", "fid": "v2", "note": ""}),
+            ("POST", "/v1/bookmarks/add", {"player_pid": 1, "fid": "0", "note": ""}),
+            ("POST", "/v1/bookmarks/add", {"player_pid": 1, "fid": "", "note": ""}),
+            ("POST", "/v1/bookmarks/add", {"player_pid": 1, "fid": "v2", "note": 7}),
+            ("POST", "/v1/bookmarks/add", {"player_pid": 1, "fid": "v2", "note": "x" * 201}),
+            ("POST", "/v1/bookmarks/rename", {}),
+            ("POST", "/v1/bookmarks/rename", {"id": "", "note": "x"}),
+            ("POST", "/v1/bookmarks/rename", {"id": 7, "note": "x"}),
+            ("POST", "/v1/bookmarks/rename", {"id": seeded["id"], "note": "x" * 201}),
+            ("POST", "/v1/bookmarks/remove", {}),
+            ("POST", "/v1/bookmarks/remove", {"id": 12}),
+            ("POST", "/v1/bookmarks/jump", {"player_pid": 1, "fid": "v2"}),
+            ("POST", "/v1/bookmarks/jump", {"player_pid": 1, "id": seeded["id"]}),
+            ("POST", "/v1/bookmarks/jump", {"fid": "v2", "id": seeded["id"]}),
+            ("GET", "/v1/bookmarks", None),
+            ("GET", "/v1/bookmarks?fid=", None),
+            ("GET", "/v1/bookmarks?fid=0", None),
+        )
+        for method, path, body in cases:
+            with self.subTest(path=path, body=body):
+                response = self.api(method, path, body=body)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(response.json()["error"]["type"], "bad_request")
+        for content in (b"", b"[1]", b"{", b"not json"):
+            with self.subTest(content=content):
+                self.assertEqual(self.api("POST", "/v1/bookmarks/add", content=content).status_code, 400)
+        # The length bound is on characters, and 200 is still accepted (it only
+        # fails later because nothing is bound to that pid).
+        self.assertEqual(
+            self.api("POST", "/v1/bookmarks/add",
+                     body={"player_pid": 1, "fid": "v2", "note": "x" * 200}).status_code,
+            409,
+        )
+        # Every refusal above left the document exactly as it was.
+        self.assertEqual(
+            [item["id"] for item in self.api("GET", "/v1/bookmarks?fid=v2").json()["items"]],
+            [seeded["id"]],
+        )
+        self.assertEqual(self.api("GET", "/v1/bookmarks?fid=v2").json()["items"][0]["note"], "保留")
+
+    def test_a_corrupt_store_reports_a_local_error_and_keeps_the_file(self):
+        path = self.service.monitor.bookmarks.path
+        write_json(path, {"version": 1, "bookmarks": []})
+        path.write_text("{broken", encoding="utf-8")
+        for method, route, body in (
+            ("GET", "/v1/bookmarks?fid=v2", None),
+            ("POST", "/v1/bookmarks/rename", {"id": "x", "note": "y"}),
+            ("POST", "/v1/bookmarks/remove", {"id": "x"}),
+        ):
+            with self.subTest(route=route):
+                response = self.api(method, route, body=body)
+                self.assertEqual(response.status_code, 500)
+                self.assertEqual(response.json()["error"]["type"], "local_io_error")
+        self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
+
+    def test_a_failed_write_reports_a_local_error_and_keeps_the_document(self):
+        seeded = seed_bookmark(self.service.monitor.bookmarks, "v2", "原备注")
+        path = self.service.monitor.bookmarks.path
+        before = path.read_text(encoding="utf-8")
+        with mock.patch("quark_cli.state.os.replace", side_effect=PermissionError("locked")):
+            response = self.api("POST", "/v1/bookmarks/rename", body={"id": seeded["id"], "note": "新备注"})
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["type"], "local_io_error")
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        self.assertEqual(self.api("GET", "/v1/bookmarks?fid=v2").json()["items"][0]["note"], "原备注")
+
+
+class BookmarksNativeCase(_ServerCase):
+    """add/jump run through the real monitor and a scripted native adapter."""
+
+    def service_kwargs(self) -> dict:
+        self.player = FakeNativePlayer()
+        return {
+            "transport": self.fixture.transport(),
+            "cookie": COOKIE,
+            "native_factory": lambda: self.player,
+        }
+
+    def bind_and_stream(self, fid: str = "v2", player_pid: int = 4242,
+                        position_ms: int = 30_000, duration_ms: int = 1_800_000) -> str:
+        """Bind a pid, feed its native reading, then start the stream.
+
+        The reading is fed *before* the stream starts so the first poll after
+        ``stream_started`` already sees a live sample: a poll that ran in
+        between would otherwise drop the binding as a player that is gone.
+        """
+        played = self.api("POST", "/v1/play", body={"fid": fid, "player_pid": player_pid})
+        self.assertEqual(played.status_code, 200, played.text)
+        relative = played.json()["url"]
+        url = self.base + relative
+        self.player.feed(player_pid, url, position_ms, duration_ms)
+        streamed = self.stream(relative)
+        self.assertEqual(streamed.status_code, 200)
+        return url
+
+    def add(self, player_pid: int, fid: str, note: str, **extra) -> httpx.Response:
+        return self.api("POST", "/v1/bookmarks/add",
+                        body={"player_pid": player_pid, "fid": fid, "note": note, **extra})
+
+    def test_add_captures_a_real_sample_and_jump_seeks_without_any_cloud_request(self):
+        url = self.bind_and_stream()
+        before = len(self.fixture.requests)
+
+        added = self.add(4242, "v2", "看到这里", position_ms=1, duration_ms=99,
+                         name="伪造.mp4", size=7, id="client-id")
+        self.assertEqual(added.status_code, 200, added.text)
+        bookmark = added.json()["bookmark"]
+        self.assertEqual(bookmark["fid"], "v2")
+        # Name, size, position and duration come from the native sample only.
+        self.assertEqual(bookmark["name"], "第2集.mp4")
+        self.assertEqual(bookmark["size"], len(VIDEO_BYTES))
+        self.assertEqual(bookmark["position_ms"], 30_000)
+        self.assertEqual(bookmark["duration_ms"], 1_800_000)
+        self.assertEqual(bookmark["note"], "看到这里")
+        self.assertNotEqual(bookmark["id"], "client-id")
+
+        self.assertEqual(self.api("GET", "/v1/bookmarks?fid=v2").json()["items"], [bookmark])
+        self.assertEqual(self.api("GET", "/v1/bookmarks?fid=v9").json(), {"items": []})
+
+        jumped = self.api("POST", "/v1/bookmarks/jump",
+                          body={"player_pid": 4242, "fid": "v2", "id": bookmark["id"]})
+        self.assertEqual(jumped.status_code, 200, jumped.text)
+        self.assertEqual(jumped.json(), {"status": "jumped"})
+        self.assertEqual(self.player.seeks, [(4242, url, 30_000)])
+        # list/add/jump stayed local: not one further cloud request.
+        self.assertEqual(len(self.fixture.requests), before)
+
+    def test_add_is_refused_with_409_when_nothing_usable_is_playing(self):
+        self.assertEqual(self.add(7777, "v2", "").status_code, 409)
+
+        played = self.api("POST", "/v1/play", body={"fid": "v2", "player_pid": 4242})
+        url = self.base + played.json()["url"]
+        # Bound but not streamed: there is no real playing position yet.
+        self.assertEqual(self.add(4242, "v2", "").status_code, 409)
+        self.player.feed(4242, url, 30_000, 1_800_000)
+        self.assertEqual(self.stream(played.json()["url"]).status_code, 200)
+        # A different fid than the bound one is never captured.
+        self.assertEqual(self.add(4242, "v9", "").status_code, 409)
+        # The player reports another file: that sample is not this bookmark's.
+        self.player.feed(4242, "https://quark.invalid/video/v9", 30_000, 1_800_000)
+        self.assertEqual(self.add(4242, "v2", "").status_code, 409)
+        # A zero clock or a stopped player is not a real, bookmarkable point.
+        self.player.feed(4242, url, 0, 1_800_000)
+        self.assertEqual(self.add(4242, "v2", "").status_code, 409)
+        self.player.feed(4242, url, 30_000, 1_800_000, status=-1)
+        self.assertEqual(self.add(4242, "v2", "").status_code, 409)
+        self.assertEqual(self.api("GET", "/v1/bookmarks?fid=v2").json(), {"items": []})
+
+    def test_a_same_fid_second_instance_blocks_add_and_jump(self):
+        first = self.bind_and_stream("v2", 4242)
+        bookmark = self.add(4242, "v2", "第一实例").json()["bookmark"]
+        second = self.bind_and_stream("v2", 5150)
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.add(4242, "v2", "").status_code, 409)
+        jumped = self.api("POST", "/v1/bookmarks/jump",
+                          body={"player_pid": 4242, "fid": "v2", "id": bookmark["id"]})
+        self.assertEqual(jumped.status_code, 409)
+        self.assertEqual(jumped.json()["error"]["type"], "media_changed")
+        self.assertEqual(self.player.seeks, [])
+
+    def test_jump_refuses_a_stale_unknown_or_foreign_bookmark(self):
+        self.bind_and_stream("v2", 4242)
+        replaced = seed_bookmark(self.service.monitor.bookmarks, "v2", "旧大小", size=999)
+        refused = (
+            replaced["id"],     # the live file is a different size than the saved one
+            "missing",          # no such bookmark
+            seed_bookmark(self.service.monitor.bookmarks, "v9", "", size=2048)["id"],  # another file
+        )
+        for bookmark_id in refused:
+            with self.subTest(bookmark_id=bookmark_id):
+                response = self.api("POST", "/v1/bookmarks/jump",
+                                    body={"player_pid": 4242, "fid": "v2", "id": bookmark_id})
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(response.json()["error"]["type"], "media_changed")
+        self.assertEqual(self.player.seeks, [])
+
+    def test_explicit_logout_clears_bookmarks_while_an_expired_credential_keeps_them(self):
+        seed_bookmark(self.service.monitor.bookmarks, "v2", "保留")
+        path = self.service.monitor.bookmarks.path
+        self.assertTrue(path.exists())
+
+        # A stale credential is dropped by the account API, not by the user.
+        self.fixture.api_unauthorized = True
+        self.assertEqual(self.api("GET", "/v1/files").status_code, 401)
+        self.assertFalse(self.api("GET", "/v1/auth").json()["authenticated"])
+        self.assertTrue(path.exists())
+        self.assertEqual(len(self.api("GET", "/v1/bookmarks?fid=v2").json()["items"]), 1)
+
+        self.assertEqual(self.api("POST", "/v1/auth/logout").json(), {"authenticated": False})
+        self.assertFalse(path.exists())
+        self.assertEqual(self.api("GET", "/v1/bookmarks?fid=v2").json(), {"items": []})
+
+    def test_the_diagnostics_report_never_carries_a_bookmark_note(self):
+        secret = "机密备注-9f3c1a"
+        self.bind_and_stream()
+        bookmark = self.add(4242, "v2", secret).json()["bookmark"]
+        self.assertEqual(bookmark["note"], secret)
+        for route in ("/v1/diagnostics", "/v1/diagnostics/report"):
+            with self.subTest(route=route):
+                payload = self.api("GET", route)
+                self.assertEqual(payload.status_code, 200)
+                self.assertNotIn(secret, json.dumps(payload.json(), ensure_ascii=False))
+        self.assertIn(secret, json.dumps(self.api("GET", "/v1/bookmarks?fid=v2").json(), ensure_ascii=False))
 
 
 if __name__ == "__main__":

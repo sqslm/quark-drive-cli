@@ -305,7 +305,19 @@ class InstallerWindow:
         self.messages.put(message)
 
     def detect(self) -> None:
-        found = core.detect_potplayer_dir(explicit=Path(self.potplayer.get()) if self.potplayer.get().strip() else None)
+        """Fill the directory box from the typed path, else auto-detect.
+
+        A typed path is authoritative for ``detect_potplayer_dir``, so an
+        unusable one raises :class:`InstallError`. It is reported in the window
+        instead of escaping this Tk callback, which would print a traceback and
+        leave the user with no reason at all. An empty box keeps auto-detecting.
+        """
+        typed = self.potplayer.get().strip()
+        try:
+            found = core.detect_potplayer_dir(explicit=Path(typed) if typed else None)
+        except core.InstallError as exc:
+            self.log(f"目录无效：{exc}")
+            return
         if found is None:
             self.log("未自动找到 PotPlayer，请点击「浏览…」选择安装目录")
             return

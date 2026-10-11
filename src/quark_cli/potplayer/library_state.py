@@ -15,6 +15,11 @@ only on the next normal write, so an empty startup never rewrites the file):
   ``marks`` list of explicitly watched videos, so a manual watched flag outlives
   the 100-entry recent cap. A mark is keyed by both FID and size: a FID whose
   object was replaced with a different size never inherits the old mark.
+* version 4: adds ``parent_name`` to every recent row, the directory name read
+  from a listing the bridge already fetched, so recent/continue rows can show
+  ``目录名 / 文件名`` without a window title, a guess, or a new cloud request. An
+  older row keeps the original name: its known ``parent`` FID is resolved against
+  favorites or directories already browsed, and an unknown parent stays as is.
 """
 
 from __future__ import annotations
@@ -34,11 +39,19 @@ LIBRARY_NAME = "library.json"
 RECENT_LIMIT = 100
 _LEGACY_VERSION = 1
 _PROGRESS_VERSION = 2
-_DOCUMENT_VERSION = 3
+_MARK_VERSION = 3
+_DOCUMENT_VERSION = 4
 _PROGRESS_FIELDS = ("position_ms", "duration_ms", "progress_at")
 _RECENT_KEYS_V1 = frozenset({"fid", "name", "size", "played_at"})
 _RECENT_KEYS_V2 = _RECENT_KEYS_V1 | set(_PROGRESS_FIELDS)
 _RECENT_KEYS_V3 = _RECENT_KEYS_V2 | {"parent"}
+_RECENT_KEYS_V4 = _RECENT_KEYS_V3 | {"parent_name"}
+_RECENT_KEYS_BY_VERSION = {
+    _LEGACY_VERSION: _RECENT_KEYS_V1,
+    _PROGRESS_VERSION: _RECENT_KEYS_V2,
+    _MARK_VERSION: _RECENT_KEYS_V3,
+    _DOCUMENT_VERSION: _RECENT_KEYS_V4,
+}
 _MARK_KEYS = frozenset({"fid", "name", "size", "watched_at"})
 _CORRUPT = "收藏与最近观看库损坏，已停止；不会覆盖现有文件"
 _UNSUPPORTED = "收藏与最近观看库版本不受支持，已停止"
@@ -79,12 +92,20 @@ def progress_text(position_ms: int, duration_ms: int) -> str:
     return f"{min(100, position_ms * 100 // duration_ms)}%"
 
 
-def display_name(name: str, position_ms: int, duration_ms: int, watched: bool) -> str:
-    """Decorate a row title for the UI; the raw ``name`` is kept for matching."""
+def display_name(
+    name: str, position_ms: int, duration_ms: int, watched: bool, dir_name: str = ""
+) -> str:
+    """Decorate a row title for the UI; the raw ``name`` is kept for matching.
+
+    ``dir_name`` is a verified directory name read from a listing the bridge
+    already fetched. An empty one (an unknown or root-level file, e.g. a movie)
+    leaves the full original name untouched.
+    """
+    title = f"{dir_name} / {name}" if dir_name else name
     if watched:
-        return f"{name} · 已看"
+        return f"{title} · 已看"
     percent = progress_text(position_ms, duration_ms)
-    return name if not percent else f"{name} · 已看 {percent}"
+    return title if not percent else f"{title} · 已看 {percent}"
 
 
 def library_path() -> Path:
@@ -111,6 +132,13 @@ def _parent(value: Any) -> str:
     return _fid(value)
 
 
+def _parent_name(value: Any) -> str:
+    """A stored directory name is text; the empty string means "unknown"."""
+    if not isinstance(value, str):
+        raise LocalIOError(_CORRUPT)
+    return value
+
+
 def _safe_parent(value: Any) -> str:
     """Sanitize a caller-supplied parent: an unusable value means "unknown"."""
     if not isinstance(value, str) or not value:
@@ -119,6 +147,13 @@ def _safe_parent(value: Any) -> str:
         return valid_fid(value)
     except RemoteError:
         return ""
+
+
+def _safe_parent_name(value: Any) -> str:
+    """Sanitize a caller-supplied directory name: an unusable value means "unknown"."""
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
 
 
 def _progress_value(value: Any) -> bool:
@@ -130,15 +165,15 @@ def _checked(document: Any) -> dict[str, Any]:
     if not isinstance(document, dict) or type(document.get("version")) is not int:
         raise LocalIOError(_CORRUPT)
     version = document["version"]
-    if version not in (_LEGACY_VERSION, _PROGRESS_VERSION, _DOCUMENT_VERSION):
+    if version not in _RECENT_KEYS_BY_VERSION:
         raise LocalIOError(_UNSUPPORTED)
     expected = {"version", "favorites", "recent"}
-    if version == _DOCUMENT_VERSION:
+    if version >= _MARK_VERSION:
         expected.add("marks")
     if set(document) != expected:
         raise LocalIOError(_CORRUPT)
     favorites, recent = document["favorites"], document["recent"]
-    marks = document["marks"] if version == _DOCUMENT_VERSION else []
+    marks = document["marks"] if version >= _MARK_VERSION else []
     if not isinstance(favorites, list) or not isinstance(recent, list) or not isinstance(marks, list):
         raise LocalIOError(_CORRUPT)
     return {
@@ -158,11 +193,7 @@ def _favorite(entry: Any) -> dict[str, Any]:
 
 
 def _recent(entry: Any, version: int = _DOCUMENT_VERSION) -> dict[str, Any]:
-    expected = {
-        _LEGACY_VERSION: _RECENT_KEYS_V1,
-        _PROGRESS_VERSION: _RECENT_KEYS_V2,
-        _DOCUMENT_VERSION: _RECENT_KEYS_V3,
-    }[version]
+    expected = _RECENT_KEYS_BY_VERSION[version]
     if not isinstance(entry, dict) or set(entry) != expected:
         raise LocalIOError(_CORRUPT)
     if type(entry["size"]) is not int or entry["size"] < 0 or type(entry["played_at"]) is not int:
@@ -178,7 +209,8 @@ def _recent(entry: Any, version: int = _DOCUMENT_VERSION) -> dict[str, Any]:
         if not _progress_value(value):
             raise LocalIOError(_CORRUPT)
         record[field] = value
-    record["parent"] = _parent(entry["parent"]) if version >= _DOCUMENT_VERSION else ""
+    record["parent"] = _parent(entry["parent"]) if version >= _MARK_VERSION else ""
+    record["parent_name"] = _parent_name(entry["parent_name"]) if version >= _DOCUMENT_VERSION else ""
     return record
 
 
@@ -275,14 +307,19 @@ class Library:
                 self._store(document)
             return [_public_favorite(entry) for entry in favorites]
 
-    def record_recent(self, fid: str, name: str, size: int, parent: str = "") -> list[dict[str, Any]]:
+    def record_recent(
+        self, fid: str, name: str, size: int, parent: str = "", parent_name: str = ""
+    ) -> list[dict[str, Any]]:
         """Put an FID at the front, keep one entry per FID, and cap the list.
 
         A repeat play of the same ``fid`` and ``size`` keeps its saved resume
         point; a different size is a different object, so progress resets and any
         watched mark left by the replaced object is dropped. The real ``parent``
-        directory is captured from a verified listing; an unknown call keeps the
-        parent already on record instead of erasing it.
+        directory and its ``parent_name`` are captured from a verified listing; an
+        unknown parent keeps the association already on record instead of erasing
+        it. A file that reappears under a different known directory never inherits
+        the old directory's name: only a same-directory call refreshes the name.
+        A known name and the saved playback progress never overwrite each other.
         """
         with self._lock:
             document = self._document()
@@ -292,7 +329,20 @@ class Library:
             entry = {"fid": fid, "name": name, "size": size, "played_at": self._clock()}
             for field in _PROGRESS_FIELDS:
                 entry[field] = 0 if keep is None else keep[field]
-            entry["parent"] = _safe_parent(parent) or (keep["parent"] if keep is not None else "")
+            entry["parent"] = _safe_parent(parent)
+            entry["parent_name"] = _safe_parent_name(parent_name)
+            if keep is not None:
+                if not entry["parent"]:
+                    # An unknown parent keeps the verified association; a name the
+                    # caller cannot tie to a known parent is never attached to it.
+                    entry["parent"] = keep["parent"]
+                    entry["parent_name"] = keep["parent_name"]
+                elif entry["parent"] == keep["parent"]:
+                    # The same directory: a fresh verified name wins, otherwise the
+                    # stored one survives.
+                    entry["parent_name"] = entry["parent_name"] or keep["parent_name"]
+                # A different known directory (including the root) never inherits
+                # the previous name.
             recent.insert(0, entry)
             del recent[RECENT_LIMIT:]
             document["recent"] = recent

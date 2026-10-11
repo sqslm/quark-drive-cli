@@ -11,7 +11,13 @@ import unittest
 from pathlib import Path
 
 from quark_cli.errors import LocalIOError
-from quark_cli.potplayer.library_state import RECENT_LIMIT, Library, completed, unfinished
+from quark_cli.potplayer.library_state import (
+    RECENT_LIMIT,
+    Library,
+    completed,
+    display_name,
+    unfinished,
+)
 from quark_cli.state import write_json
 
 
@@ -154,13 +160,15 @@ class LibraryCase(unittest.TestCase):
         self.assertEqual(library.progress("v1", 5), None)
         library.add_favorite("dir-b", "乙")
         stored = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(stored["version"], 3)
+        self.assertEqual(stored["version"], 4)
         self.assertEqual(stored["marks"], [])
         self.assertEqual([entry["fid"] for entry in stored["favorites"]], ["dir-b", "dir-a"])
         self.assertEqual([entry["fid"] for entry in stored["recent"]], ["v1"])
         self.assertEqual(stored["recent"][0]["position_ms"], 0)
         self.assertEqual(stored["recent"][0]["duration_ms"], 0)
         self.assertEqual(stored["recent"][0]["progress_at"], 0)
+        self.assertEqual(stored["recent"][0]["parent"], "")
+        self.assertEqual(stored["recent"][0]["parent_name"], "")
 
     def test_progress_round_trip_keeps_public_view_unchanged(self):
         library = self.library()
@@ -241,14 +249,174 @@ class LibraryCase(unittest.TestCase):
         self.assertEqual(library.progress("v1", 5)["position_ms"], 60_000)
         self.assertFalse(library.is_watched("v1", 5))
         self.assertEqual(self.path.read_text(encoding="utf-8"), before)
-        # The first real write upgrades to v3: parentage defaults to unknown and
-        # the manual marks list starts empty.
+        # The first real write upgrades to v4: parentage and its name default to
+        # unknown and the manual marks list starts empty.
         library.record_recent("v2", "b.mp4", 6)
         stored = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(stored["version"], 3)
+        self.assertEqual(stored["version"], 4)
         self.assertEqual(stored["marks"], [])
         self.assertEqual(stored["recent"][0]["parent"], "")
+        self.assertEqual(stored["recent"][0]["parent_name"], "")
         self.assertEqual(stored["recent"][1]["position_ms"], 60_000)
+
+    # -- directory names in the display title (schema v4) ----------------
+
+    def test_v3_document_reads_without_rewrite_and_keeps_parent_and_marks(self):
+        document = {
+            "version": 3,
+            "favorites": [{"fid": "dir-a", "name": "剧集", "added_at": 7}],
+            "recent": [{
+                "fid": "v1", "name": "01.mkv", "size": 5, "played_at": 9,
+                "position_ms": 60_000, "duration_ms": 1_800_000, "progress_at": 11,
+                "parent": "dir-a",
+            }],
+            "marks": [{"fid": "keep", "name": "旧集.mp4", "size": 9, "watched_at": 3}],
+        }
+        write_json(self.path, document)
+        before = self.path.read_text(encoding="utf-8")
+        library = self.library()
+        row = library.snapshot()["recent"][0]
+        # A v3 row keeps its known parent and gains the "unknown name" marker
+        # without any rewrite of the stored document.
+        self.assertEqual(row["parent"], "dir-a")
+        self.assertEqual(row["parent_name"], "")
+        self.assertEqual(library.progress("v1", 5)["position_ms"], 60_000)
+        self.assertTrue(library.is_watched("keep", 9))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        # The next real write upgrades to v4 and keeps history untouched.
+        library.record_recent("v2", "02.mkv", 6, "dir-a", "剧集")
+        stored = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["version"], 4)
+        self.assertEqual(stored["recent"][1]["parent"], "dir-a")
+        self.assertEqual(stored["recent"][1]["parent_name"], "")
+        self.assertEqual(stored["recent"][1]["position_ms"], 60_000)
+        self.assertEqual(stored["marks"], document["marks"])
+        self.assertEqual(stored["favorites"], document["favorites"])
+
+    def test_recorded_directory_name_survives_a_reload(self):
+        library = self.library()
+        library.record_recent("v1", "01.mkv", 5, "dir-a", "剧集")
+        row = Library(self.path).snapshot()["recent"][0]
+        self.assertEqual(row["parent"], "dir-a")
+        self.assertEqual(row["parent_name"], "剧集")
+        # The public recent view keeps the bridge contract: the raw name is
+        # unchanged and the decoration lives in the caller's display text.
+        self.assertEqual(library.recent()[0]["name"], "01.mkv")
+
+    def test_directory_name_updates_do_not_touch_progress_or_marks(self):
+        library = self.library()
+        library.record_recent("v1", "01.mkv", 5, "dir-a", "剧集")
+        library.save_progress("v1", 5, 45_000, 90_000)
+        library.mark_watched("keep", "旧集.mp4", 9)
+        # An unknown name never erases the one already on record.
+        library.record_recent("v1", "01.mkv", 5, "dir-a")
+        row = library.snapshot()["recent"][0]
+        self.assertEqual(row["parent_name"], "剧集")
+        self.assertEqual(row["position_ms"], 45_000)
+        # A renamed directory refreshes the name and still keeps the progress.
+        library.record_recent("v1", "01.mkv", 5, "dir-a", "剧集(第二季)")
+        row = library.snapshot()["recent"][0]
+        self.assertEqual(row["parent_name"], "剧集(第二季)")
+        self.assertEqual(row["position_ms"], 45_000)
+        self.assertEqual(library.progress("v1", 5)["position_ms"], 45_000)
+        self.assertTrue(library.is_watched("keep", 9))
+
+    def test_moved_file_never_inherits_the_previous_directory_name(self):
+        library = self.library()
+        library.record_recent("v1", "01.mp4", 5, "old-dir", "old-series")
+        library.save_progress("v1", 5, 45_000, 90_000)
+        library.mark_watched("keep", "旧集.mp4", 9)
+        # The same object reappears under a different verified directory with no
+        # name yet: every bit of progress survives, but the stale series name does
+        # not follow it to the new directory.
+        library.record_recent("v1", "01.mp4", 5, "new-dir")
+        row = library.snapshot()["recent"][0]
+        self.assertEqual(row["parent"], "new-dir")
+        self.assertEqual(row["parent_name"], "")
+        self.assertEqual(row["name"], "01.mp4")
+        self.assertEqual(row["position_ms"], 45_000)
+        self.assertEqual(row["duration_ms"], 90_000)
+        self.assertEqual(library.progress("v1", 5)["position_ms"], 45_000)
+        self.assertTrue(library.is_watched("keep", 9))
+
+    def test_moved_to_root_does_not_keep_the_previous_directory_name(self):
+        library = self.library()
+        library.record_recent("v1", "01.mp4", 5, "old-dir", "old-series")
+        library.record_recent("v1", "01.mp4", 5, "0")
+        row = library.snapshot()["recent"][0]
+        self.assertEqual(row["parent"], "0")
+        self.assertEqual(row["parent_name"], "")
+
+    def test_unknown_parent_keeps_the_stored_directory_name(self):
+        library = self.library()
+        library.record_recent("v1", "01.mkv", 5, "dir-a", "剧集")
+        # A repeat without a verified parent keeps the association already stored.
+        library.record_recent("v1", "01.mkv", 5)
+        row = library.snapshot()["recent"][0]
+        self.assertEqual(row["parent"], "dir-a")
+        self.assertEqual(row["parent_name"], "剧集")
+
+    def test_a_name_without_its_parent_is_not_attached_to_the_old_directory(self):
+        library = self.library()
+        library.record_recent("v1", "01.mkv", 5, "dir-a", "剧集")
+        # A name whose parent is unknown cannot label the old verified directory.
+        library.record_recent("v1", "01.mkv", 5, "", "另一部剧")
+        row = library.snapshot()["recent"][0]
+        self.assertEqual(row["parent"], "dir-a")
+        self.assertEqual(row["parent_name"], "剧集")
+
+    def test_blank_directory_name_is_stored_as_unknown(self):
+        library = self.library()
+        library.record_recent("v1", "01.mkv", 5, "dir-a", "   ")
+        row = library.snapshot()["recent"][0]
+        self.assertEqual(row["parent"], "dir-a")
+        self.assertEqual(row["parent_name"], "")
+
+    def test_bad_directory_name_reports_clearly_and_keeps_the_file(self):
+        document = {
+            "version": 4,
+            "favorites": [],
+            "recent": [{
+                "fid": "v1", "name": "01.mkv", "size": 5, "played_at": 9,
+                "position_ms": 0, "duration_ms": 0, "progress_at": 0,
+                "parent": "dir-a", "parent_name": 5,
+            }],
+            "marks": [],
+        }
+        write_json(self.path, document)
+        calls = (self.library().recent, lambda: self.library().add_favorite("dir-b", "乙"))
+        for call in calls:
+            with self.subTest(call=call):
+                with self.assertRaises(LocalIOError):
+                    call()
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), document)
+
+    def test_display_name_prefixes_the_directory_when_it_is_known(self):
+        self.assertEqual(
+            display_name("01.mkv", 500_000, 1_800_000, False, "剧集"),
+            "剧集 / 01.mkv · 已看 27%",
+        )
+        self.assertEqual(display_name("01.mkv", 500_000, 1_800_000, True, "剧集"), "剧集 / 01.mkv · 已看")
+        # No verified directory (an unknown parent or a root-level movie) leaves
+        # the original name in full.
+        self.assertEqual(display_name("01.mkv", 500_000, 1_800_000, False), "01.mkv · 已看 27%")
+        self.assertEqual(display_name("电影.mkv", 0, 0, False, ""), "电影.mkv")
+        self.assertEqual(display_name("电影.mkv", 0, 0, True, ""), "电影.mkv · 已看")
+
+    def test_v3_document_keys_are_not_extended(self):
+        document = {
+            "version": 3,
+            "favorites": [],
+            "recent": [{
+                "fid": "v1", "name": "01.mkv", "size": 5, "played_at": 9,
+                "position_ms": 0, "duration_ms": 0, "progress_at": 0,
+                "parent": "", "parent_name": "",
+            }],
+            "marks": [],
+        }
+        write_json(self.path, document)
+        with self.assertRaises(LocalIOError):
+            self.library().recent()
 
     def test_unfinished_and_completed_share_one_end_rule(self):
         self.assertFalse(unfinished(14_999, 100_000))
@@ -364,7 +532,7 @@ class LibraryCase(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), document)
 
     def test_unknown_document_version_is_refused(self):
-        write_json(self.path, {"version": 4, "favorites": [], "recent": [], "marks": []})
+        write_json(self.path, {"version": 5, "favorites": [], "recent": [], "marks": []})
         with self.assertRaises(LocalIOError):
             self.library().favorites()
 
