@@ -122,3 +122,19 @@ def _videos(files: Files, parent: str) -> list[dict[str, Any]]:
     videos = [entry for entry in entries if is_video(entry["name"])]
     videos.sort(key=order_key)
     return videos
+
+
+def select_continue(episodes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pick the episode a directory should continue with, or ``None`` when done.
+
+    ``episodes`` is the directory's videos in natural order, each carrying
+    ``unfinished`` (a resumable saved point), ``watched`` (an explicit manual
+    mark), and ``progress_at``. The latest unfinished episode wins; otherwise
+    the first episode that was never marked watched; ``None`` means every
+    episode is watched, so the directory is complete.
+    """
+    unfinished = [episode for episode in episodes if episode["unfinished"]]
+    if unfinished:
+        return max(unfinished, key=lambda episode: episode["progress_at"])
+    unwatched = [episode for episode in episodes if not episode["watched"]]
+    return unwatched[0] if unwatched else None

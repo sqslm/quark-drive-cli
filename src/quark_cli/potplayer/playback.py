@@ -5,7 +5,9 @@ session and samples that player's clock every :data:`POLL_INTERVAL` seconds.
 Only genuine samples for the exact registered file are written to the (small,
 URL-free) library document; the native receiver and every disk write run on the
 single worker thread, never while the short monitor lock is held and never on an
-HTTP request thread.
+HTTP request thread. A video carrying an explicit manual watched mark is neither
+resumed nor rewritten: :class:`~.library_state.Library` withholds its resume
+point and refuses its progress writes until the mark is cleared.
 """
 
 from __future__ import annotations
@@ -18,15 +20,15 @@ from typing import Any, Protocol
 from urllib.parse import unquote, urlsplit
 
 from ..errors import LocalIOError, UsageError
-from .library_state import Library
+from .library_state import END_FRACTION, END_MAX_MS, MIN_RESUME_MS, Library
 from .stream import PlaySession
 
 POLL_INTERVAL = 2.0
 SAVE_INTERVAL = 10.0
-MIN_RESUME_MS = 15_000
+#: How long the player must already have been running before a saved point is
+#: still considered "not started yet"; the end rule shared with the continue
+#: list lives in :mod:`library_state`.
 INITIAL_POSITION_MS = 5_000
-END_MAX_MS = 30_000
-END_FRACTION = 0.02
 DURATION_TOLERANCE_MS = 2_000
 DURATION_TOLERANCE_FRACTION = 0.01
 VERIFY_TOLERANCE_MS = 3_000

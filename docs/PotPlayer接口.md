@@ -105,9 +105,9 @@
 
 带 `player_pid`（严格 JSON 整数，`1..4294967295`）时，服务把该播放器窗口进程与本次会话登记为绑定，用于按“PID + 完整逻辑 fid 地址”核对并恢复观看进度；扩展通过启动器本地动作 `--player-pid` 取得该整数，只有验证到拥有 PotPlayer 窗口的进程才发送，取不到时保持仅 `fid` 的旧请求体。省略或旧版调用仍然只在线播放、不绑定、不续播。响应结构不变；`player_pid` 不是该范围的整数（含字符串、布尔、浮点、`0`、负数）→ `400 bad_request`。
 
-## 搜索、收藏与最近观看
+## 搜索、收藏、最近与继续观看
 
-扩展开关在根页面选择类别：`drive`（我的网盘）、`search`（`type=search`，用 Query 输入关键词）、`favorites`、`recent`。搜索只在根页面消费 `Query`；进入结果目录后按 `PathToken` 里的 FID 正常浏览，不再使用 `Query`。
+扩展开关在根页面选择类别：`drive`（我的网盘）、`search`（`type=search`，用 Query 输入关键词）、`favorites`、`recent`、`continue`（继续观看）。搜索只在根页面消费 `Query`；进入结果目录后按 `PathToken` 里的 FID 正常浏览，不再使用 `Query`。
 
 ### `GET /v1/search?q=<keyword>&page=<n>&size=<n>`
 
@@ -126,8 +126,12 @@
 返回已收藏的目录，最近添加在前：
 
 ```json
-{"items":[{"fid":"...","name":"剧集","is_dir":true,"size":0}]}
+{"items":[{"fid":"...","name":"剧集","is_dir":true,"size":0,
+  "last_episode":{"fid":"...","name":"第2集.mp4","is_dir":false,"size":123,"parent":"...",
+    "watched":false,"position_ms":0,"duration_ms":0,"display":"第2集.mp4"}}]}
 ```
+
+`last_episode` 是该目录在最近观看里最新的一集（按记录的实际 `parent` 目录匹配，不会跨目录误配），本地没有记录时为 `null`。
 
 ### `POST /v1/favorites`
 
@@ -142,10 +146,35 @@
 最近**成功播放**过的视频，最近在前，按 FID 去重，最多 `100` 条：
 
 ```json
-{"items":[{"fid":"...","name":"第2集.mp4","is_dir":false,"size":123,"played_at":1699999999}]}
+{"items":[{"fid":"...","name":"第2集.mp4","is_dir":false,"size":123,"played_at":1699999999,
+  "parent":"...","watched":false,"position_ms":0,"duration_ms":0,"display":"第2集.mp4"}]}
 ```
 
-`played_at` 是本机 Unix 秒。条目只有位置信息，用于从该集开始同目录选集。**该接口的返回结构保持不变**：续播位置（`position_ms`、`duration_ms`、`progress_at`）只写入本机 `library.json` 的版本 2 记录，不作为公共响应字段暴露。
+`played_at` 是本机 Unix 秒。`parent` 是该视频真实所在目录的 FID（从未知目录播放时为空串），`watched` 表示手动标记或已基本看完（见下），`position_ms`/`duration_ms` 是本机续播点，`display` 是把进度并入后的显示标题（原始 `name` 保持不变）。条目用于从该集开始同目录选集。
+
+### `GET /v1/continue`
+
+本机历史里**可续播且尚未看完**的视频，最近有进度者在前。过滤规则与播放器的续播判断一致：续播点至少 15 秒，且距结尾仍超过 `min(30 秒, 时长的 2%)`；手动标记为已看或已看完的视频不出现。返回与 `/v1/recent` 相同的行结构（不含 `played_at`）。纯本地读取，不向上游发请求。
+
+### `GET /v1/series?parent=<目录 fid>`
+
+某目录的继续观看目标与逐集状态。`parent` 必填，缺失/非法 → `400 bad_request`。只列出该目录本身一次（按自然顺序的视频），携带进度：
+
+```json
+{"parent":"...","total":3,"watched":1,"complete":false,
+ "continue":{"fid":"...","name":"第10集.mp4","position_ms":90000,"duration_ms":1800000,"display":"第10集.mp4 · 已看 5%"},
+ "episodes":[{"fid":"...","name":"第2集.mp4","size":123,"watched":false,
+   "position_ms":0,"duration_ms":0,"display":"第2集.mp4"}]}
+```
+
+`watched` 为“手动标记已看 **或** 实际播放到结尾”的集数（用同一个 `min(30 秒, 2%)` 结尾窗口判定，位置为 0 或时长未知时不算已看）。`continue` 取进度最新的一集未看完视频；没有未看完的则取自然顺序里第一集未看的；整目录都看完时 `complete` 为 `true`、`continue` 为 `null`，扩展显示完成状态行而不会从头重播。目录中视频的名称、大小与归属只取服务端目录清单，存储里的旧名称/旧目录不会被采信。
+
+### `POST /v1/mark`
+
+请求体 `{"fid":"<视频 fid>","parent":"<目录 fid>","watched":<bool>}`。手动标记某集已看/未看；服务端用 `parent` 目录清单校验 `fid` 确是其中的视频并取其真实名称与大小，**不信任**客户端提供的名称或大小。非该目录中的视频、目录 fid、缺失/非布尔 `watched` → `400 bad_request`。成功返回 `{"fid":"<视频 fid>","watched":<bool>}`。同一目标状态重复执行幂等。
+
+- `watched=true`：该集不再自动续播，也不出现在 `/v1/continue`。
+- `watched=false`：清除该集的手动标记与旧的续播点；此后播放器的真实进度探测可再次写入新的续播点（不会向正在播放的窗口发送跳转）。
 
 ### `POST /v1/recent/clear`
 
@@ -154,7 +183,7 @@
 ### 写入时机与数据边界
 
 - 最近记录在**首个非空媒体块成功转发之后**写入，不等整集传输结束：取链、`HEAD`、未转发任何媒体字节的失败 `GET` 不记录。已经开始传输后再关闭、拖动或遇到上游中断，已写入的记录仍保留；每个 HTTP 请求只记一次，不按分段或数据块重复写盘。
-- 收藏与最近观看存放在插件私有目录 `config_directory()/potplayer/library.json`（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。文件版本 2 起，最近观看条目另含观看进度字段 `position_ms`、`duration_ms`、`progress_at`（本机时间）；版本 1 记录可正常读取，仅在下次写入该条目时才就地升级为版本 2，既有收藏/最近观看不受影响。
+- 收藏与最近观看存放在插件私有目录 `config_directory()/potplayer/library.json`（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。文件版本 3 起，最近观看条目另含观看进度字段 `position_ms`、`duration_ms`、`progress_at`（本机时间）与真实 `parent` 目录 FID，并新增独立的 `marks` 列表保存显式“已看”标记（不受 100 条最近上限影响）；`marks` 按 FID **和大小** 记录，FID 被替换成不同大小的文件时不会继承旧的已看标记。版本 1/2 记录可正常读取，读取时不改写文件，仅在下次正常写入时才就地升级为版本 3，既有收藏/最近观看不受影响。
 - 显式插件退出登录（`POST /v1/auth/logout`）会一并清空这两份列表及其中的观看进度；本地清理失败时返回 `500 local_io_error`，凭证仍已失效，不误报清理成功。登录过期只要求重新扫码，不清空。跨进程重启与升级保留。
 
 ## 播放流
@@ -178,8 +207,8 @@
 
 ### 播放进度（本机）
 
-- 播放期间组件按绑定核对当前播放器进度，并把位置写入 `library.json` 中该最近观看条目的版本 2 字段（`position_ms`、`duration_ms`、`progress_at`）。这些字段只存在于本机记录，**不**通过公共接口暴露（`/v1/recent` 的返回结构保持不变）。
-- 读取频率约每 2 秒一次，落盘约每 10 秒一次，并在暂停、切换集数与关闭时各写一次。保存位置不足 15 秒时不续播；剩余时长不足 `min(30 秒, 时长 2%)` 时不回跳（从 0 开始）；保存时的文件大小或时长与当前明显不符时不套用旧进度。
+- 播放期间组件按绑定核对当前播放器进度，并把位置写入 `library.json` 中该最近观看条目的版本 3 字段（`position_ms`、`duration_ms`、`progress_at`）。显式标记为已看的视频既不续播也不再写入真实进度，直到标记被清除。`/v1/recent`、`/v1/continue`、`/v1/series` 会把这些字段转为只读视图；`progress_at` 本身不作为公共响应字段暴露。
+- 读取频率约每 2 秒一次，落盘约每 10 秒一次，并在暂停、切换集数与关闭时各写一次。保存位置不足 15 秒时不续播；剩余时长不足 `min(30 秒, 时长 2%)` 时不回跳（从 0 开始）也不计为已看完；保存时的文件大小或时长与当前明显不符时不套用旧进度。
 - 首次读到播放器位置已超过约 5 秒（例如用户手动拖过）时，尊重播放器当前位置，组件**不**把它强行拉回保存点。
 - 绑定标识为播放器窗口进程 PID 与完整逻辑 fid 地址（`https://quark.invalid/{video,play}/<fid>`）；不使用文件名、窗口标题或下载字节比例推断归属。同一 fid 被多个实例同时打开时暂停该 fid 的进度写入，实例减少后恢复。
 - 续播依赖 Windows 原生进程读取能力；缺少该能力时组件仍可作为数据源正常播放，只是不记录/恢复进度。此限制只影响本机进度功能，不影响其它平台上的 CLI。
@@ -199,7 +228,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.5.0", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.6.0", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -268,7 +297,7 @@
 - 元数据/取链请求的发起间隔至少 0.5 秒；冷却期内新请求在本地直接拒绝，不触达上游。
 - 上游 `429` 至少暂停 60 秒；账号或扫码 API 的 `403`，或失败业务响应中明确的“访问受限/需要验证”至少暂停 600 秒；更长的 `Retry-After`（秒数或 HTTP 日期）按其执行；`503` 仅在带有效 `Retry-After` 时暂停。
 - 播放/字幕签名地址在一次重新取链后仍连续 `403`，暂停 60 秒新播放/字幕请求。
-- 冷却期间的列表/数据/登录接口返回 `429 rate_limited` 或 `403 access_restricted` 并带 `Retry-After`；`/v1/health`、`/v1/favorites`、`/v1/recent`、`/v1/auth/logout` 等本地接口仍可用。
+- 冷却期间的列表/数据/登录接口返回 `429 rate_limited` 或 `403 access_restricted` 并带 `Retry-After`；`/v1/health`、`/v1/favorites`、`/v1/recent`、`/v1/continue`、`/v1/auth/logout` 等本地接口仍可用。
 - 冷却错误**不会**清除插件凭证、不会打开扫码登录、不会清空收藏/最近记录；`401` 凭证失效的语义不变。
 - 若冷却状态无法写入本机，服务会以 `500 local_io_error` 停止后续自动请求；另一个进程或重启无法得知未写入的冷却，需先修复本机存储并用官方夸克客户端确认账号。
 - 此节奏不改变 4 MiB 串行分段、64 KiB 转发或内嵌字幕/音轨的原生处理，也不新增字节速率限制。以上数值是本工具的保守默认值，不代表夸克官方安全阈值，不能保证账号不被限制。`Retry-After` 定义见 [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#field.retry-after)（`429` 源自 RFC 6585 §4）。
@@ -301,7 +330,7 @@
 
 - 插件凭证：`config_directory()/potplayer/cookie`，由 `QRLogin` 单独保存；`quark` CLI 的 Cookie 从不读取、写入或删除。
 - 运行配置：同目录 `runtime.json`；单实例锁 `service.lock`。
-- 收藏与最近观看：同目录 `library.json`，含 FID、名称、大小与本机时间，版本 2 起另含观看进度（`position_ms`/`duration_ms`/`progress_at`）；显式退出登录清空，过期不清、升级保留。
+- 收藏、最近观看与已看标记：同目录 `library.json`，含 FID、名称、大小与本机时间，版本 3 起另含观看进度（`position_ms`/`duration_ms`/`progress_at`）、真实 `parent` 目录与 `marks` 已看列表；显式退出登录清空，过期不清、升级保留。
 - 视频不落盘：无分片、无磁盘缓存、无转码；仅内存转发请求的字节范围。
 - 内嵌字幕/音轨由播放器原生解码、显示与切换，本插件不替换、不自动选中外挂轨；同目录外挂字幕经原生“字幕搜索”手动选择，只从本桥接读取内存文本——桥接自身不写字幕或视频文件，播放器是否把所选字幕保存到磁盘由 PotPlayer 自身行为决定。
 - 本地凭证与诊断数据保持私有：`/v1/diagnostics/report` 只在用户显式导出时才写文件，且经白名单裁剪，不含 Cookie/令牌/URL/FID/文件名/观看进度/绝对路径。

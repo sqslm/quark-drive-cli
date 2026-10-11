@@ -41,12 +41,20 @@ from ..paths import is_directory
 from ..request_guard import RequestGuard
 from . import SERVICE_VERSION
 from .diagnostics import Diagnostics
-from .library import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, page, playlist, require_fid, search
-from .library_state import Library
+from .library import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
+    page,
+    playlist,
+    require_fid,
+    search,
+    select_continue,
+)
+from .library_state import Library, completed, display_name, unfinished
 from .native_player import NativePlayer
 from .playback import POLL_INTERVAL, PlaybackMonitor
 from .login_gui import QrLoginWindow
-from .naming import content_type
+from .naming import content_type, is_video
 from .plugin_state import (
     acquire_service_lock,
     clear_cookie,
@@ -80,12 +88,17 @@ EXIT_OK = 0
 EXIT_ALREADY_RUNNING = 3
 EXIT_UNAVAILABLE = 5
 UINT32_MAX = 0xFFFFFFFF
+#: How many verified video→directory associations stay in memory. They are only
+#: a free lookup cache for a following ``/v1/play``; the persistent parent is
+#: written with the recent record itself.
+MAX_ASSOCIATIONS = 4096
 
 _CONTROL_ROUTES = frozenset({
     "/v1/auth", "/v1/auth/login", "/v1/auth/logout",
     "/v1/files", "/v1/playlist", "/v1/play", "/v1/shutdown",
     "/v1/search", "/v1/favorites", "/v1/favorites/remove",
-    "/v1/recent", "/v1/recent/clear",
+    "/v1/recent", "/v1/recent/clear", "/v1/continue",
+    "/v1/series", "/v1/mark",
     "/v1/subtitles", "/v1/subtitle",
     "/v1/diagnostics", "/v1/diagnostics/report", "/v1/diagnostics/open",
     "/v1/playback/restart",
@@ -131,6 +144,128 @@ def _parse_pid(value: Any, *, label: str) -> int:
     if type(value) is not int or isinstance(value, bool) or not 1 <= value <= UINT32_MAX:
         raise UsageError(f"{label} 必须是 1 到 {UINT32_MAX} 之间的整数")
     return value
+
+
+def _mark_keys(snapshot: Mapping[str, Any]) -> set[tuple[str, int]]:
+    """Manual watched marks as ``(fid, size)`` so a replaced object is distinct."""
+    return {(mark["fid"], mark["size"]) for mark in snapshot["marks"]}
+
+
+def _watched(entry: Mapping[str, Any], marks: set[tuple[str, int]]) -> bool:
+    """A video counts as watched when manually marked or actually played to the end.
+
+    Both the recent/continue/series views and the directory's continue target
+    share this rule, so a near-end real progress and an explicit mark agree.
+    """
+    if (entry["fid"], entry["size"]) in marks:
+        return True
+    return completed(entry["position_ms"], entry["duration_ms"])
+
+
+def _episode_view(entry: Mapping[str, Any], watched: bool) -> dict[str, Any]:
+    """One video row shared by the recent, continue, and series views."""
+    position, duration = entry["position_ms"], entry["duration_ms"]
+    return {
+        "fid": entry["fid"],
+        "name": entry["name"],
+        "is_dir": False,
+        "size": entry["size"],
+        "parent": entry["parent"],
+        "watched": watched,
+        "position_ms": position,
+        "duration_ms": duration,
+        "display": display_name(entry["name"], position, duration, watched),
+    }
+
+
+def _favorite_items(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Favorites in stored order, each with its last known episode from recent."""
+    marks = _mark_keys(snapshot)
+    items = []
+    for entry in snapshot["favorites"]:
+        last = next((row for row in snapshot["recent"] if row["parent"] == entry["fid"]), None)
+        items.append({
+            "fid": entry["fid"],
+            "name": entry["name"],
+            "is_dir": True,
+            "size": 0,
+            "last_episode": None if last is None else _episode_view(last, _watched(last, marks)),
+        })
+    return items
+
+
+def _recent_items(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+    marks = _mark_keys(snapshot)
+    items = []
+    for entry in snapshot["recent"]:
+        view = _episode_view(entry, _watched(entry, marks))
+        view["played_at"] = entry["played_at"]
+        items.append(view)
+    return items
+
+
+def _continue_items(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Resumable, unfinished, not-yet-watched videos, newest progress first."""
+    marks = _mark_keys(snapshot)
+    items = [
+        _episode_view(entry, False)
+        for entry in sorted(snapshot["recent"], key=lambda row: row["progress_at"], reverse=True)
+        if not _watched(entry, marks) and unfinished(entry["position_ms"], entry["duration_ms"])
+    ]
+    return items
+
+
+def _series_payload(snapshot: Mapping[str, Any], parent: str, videos: list[dict[str, Any]]) -> dict[str, Any]:
+    """Continue target plus per-episode status for one directory listing.
+
+    The trusted listing is the only source of a video's name, size, and parent:
+    a saved recent record contributes only its resume point, so a stale stored
+    name or an old unknown parent can never label or re-associate an episode.
+    """
+    marks = _mark_keys(snapshot)
+    saved = {entry["fid"]: entry for entry in snapshot["recent"]}
+    episodes = []
+    for video in videos:
+        record = saved.get(video["fid"])
+        if record is not None and record["size"] != video["size"]:
+            # A different size is a different object: its saved point is stale.
+            record = None
+        position = record["position_ms"] if record is not None else 0
+        duration = record["duration_ms"] if record is not None else 0
+        entry = {
+            "fid": video["fid"],
+            "name": video["name"],
+            "size": video["size"],
+            "parent": parent,
+            "position_ms": position,
+            "duration_ms": duration,
+        }
+        watched = _watched(entry, marks)
+        view = _episode_view(entry, watched)
+        view["progress_at"] = record["progress_at"] if record is not None else 0
+        view["unfinished"] = not watched and unfinished(position, duration)
+        episodes.append(view)
+    target = select_continue(episodes)
+    return {
+        "parent": parent,
+        "total": len(episodes),
+        "watched": sum(1 for episode in episodes if episode["watched"]),
+        # A listing with no videos (empty or non-video-only) has nothing to
+        # finish: it must not be reported as entirely watched.
+        "complete": target is None and bool(episodes),
+        "continue": None if target is None else {
+            "fid": target["fid"],
+            "name": target["name"],
+            "position_ms": target["position_ms"],
+            "duration_ms": target["duration_ms"],
+            "display": target["display"],
+        },
+        "episodes": [
+            {key: episode[key] for key in
+             ("fid", "name", "size", "watched", "position_ms", "duration_ms", "display")}
+            for episode in episodes
+        ],
+    }
 
 
 class _ObservedClient(QuarkClient):
@@ -288,6 +423,11 @@ class Service:
         self._login_factory = login_factory or (
             lambda: QrLoginWindow(transport=transport, cookie_path=credential_path(), guard=self._guard)
         )
+        # Verified video→directory associations seen in a listing, used only to
+        # stamp a following /v1/play with its real parent. Bounded and memory
+        # only: the durable parent lives on the recent record.
+        self._parents: dict[str, str] = {}
+        self._parent_lock = threading.Lock()
         self._client: QuarkClient | None = None
         self._client_cookie: str | None = None
         self._client_lock = threading.Lock()
@@ -329,6 +469,34 @@ class Service:
 
     def files(self) -> Files:
         return Files(self.client())
+
+    def note_directory(self, parent: str, items: Any) -> None:
+        """Remember the real directory of every video in a response we already read.
+
+        The caller passes an already-fetched listing, so capturing parentage adds
+        no network request; only a real directory FID from server metadata is
+        ever recorded, never a name or a guess.
+        """
+        if not parent:
+            return
+        with self._parent_lock:
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                name, fid = item.get("name"), item.get("fid")
+                if item.get("is_dir") or not isinstance(fid, str) or not fid:
+                    continue
+                if not isinstance(name, str) or not is_video(name):
+                    continue
+                self._parents.pop(fid, None)
+                self._parents[fid] = parent
+                while len(self._parents) > MAX_ASSOCIATIONS:
+                    self._parents.pop(next(iter(self._parents)))
+
+    def parent_of(self, fid: str) -> str:
+        """The last verified directory of ``fid``, or ``""`` when unknown."""
+        with self._parent_lock:
+            return self._parents.get(fid, "")
 
     def require_login(self) -> None:
         """Reject a control call whose data belongs to a signed-in plugin."""
@@ -574,7 +742,9 @@ class _Handler(BaseHTTPRequestHandler):
             parent = require_fid(_first(query, "parent", "0"), label="parent", allow_root=True)
             number = _int_param(query, "page", 1, 1, MAX_PAGE_NUMBER)
             size = _int_param(query, "size", DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE)
-            return self._json(200, page(service.files(), parent, number, size))
+            payload = page(service.files(), parent, number, size)
+            service.note_directory(parent, payload["items"])
+            return self._json(200, payload)
         if route == "/v1/playlist":
             if method not in ("GET", "HEAD"):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
@@ -583,6 +753,7 @@ class _Handler(BaseHTTPRequestHandler):
             parent = require_fid(parent_value, label="parent", allow_root=True) if parent_value is not None else None
             start = require_fid(start_value, label="start") if start_value is not None else None
             resolved, items = playlist(service.files(), parent, start)
+            service.note_directory(resolved, items)
             return self._json(200, {"parent": resolved, "items": items})
         if route == "/v1/play":
             if method != "POST":
@@ -657,7 +828,7 @@ class _Handler(BaseHTTPRequestHandler):
         if route == "/v1/favorites":
             if method in ("GET", "HEAD"):
                 service.require_login()
-                return self._json(200, {"items": service.library.favorites()})
+                return self._json(200, {"items": _favorite_items(service.library.snapshot())})
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET 或 POST"))
             service.require_login()
@@ -668,18 +839,54 @@ class _Handler(BaseHTTPRequestHandler):
             name = info.get("file_name")
             if not isinstance(name, str) or not name:
                 raise RemoteError("目录详情缺少有效名称")
-            return self._json(200, {"items": service.library.add_favorite(fid, name)})
+            service.library.add_favorite(fid, name)
+            return self._json(200, {"items": _favorite_items(service.library.snapshot())})
         if route == "/v1/favorites/remove":
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
             service.require_login()
             fid = require_fid(self._body(raw).get("fid"), label="fid")
-            return self._json(200, {"items": service.library.remove_favorite(fid)})
+            service.library.remove_favorite(fid)
+            return self._json(200, {"items": _favorite_items(service.library.snapshot())})
         if route == "/v1/recent":
             if method not in ("GET", "HEAD"):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
             service.require_login()
-            return self._json(200, {"items": service.library.recent()})
+            return self._json(200, {"items": _recent_items(service.library.snapshot())})
+        if route == "/v1/continue":
+            if method not in ("GET", "HEAD"):
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
+            service.require_login()
+            return self._json(200, {"items": _continue_items(service.library.snapshot())})
+        if route == "/v1/series":
+            if method not in ("GET", "HEAD"):
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
+            service.require_login()
+            parent = require_fid(_first(query, "parent", None), label="parent", allow_root=True)
+            resolved, videos = playlist(service.files(), parent, None)
+            service.note_directory(resolved, videos)
+            return self._json(200, _series_payload(service.library.snapshot(), resolved, videos))
+        if route == "/v1/mark":
+            if method != "POST":
+                return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
+            service.require_login()
+            body = self._body(raw)
+            fid = require_fid(body.get("fid"), label="fid")
+            parent = require_fid(body.get("parent"), label="parent", allow_root=True)
+            watched = body.get("watched")
+            if type(watched) is not bool:
+                raise UsageError("watched 必须是布尔值")
+            # The directory listing is the only authority for the video's real
+            # type and size; no client-supplied name or size is trusted.
+            resolved, videos = playlist(service.files(), parent, None)
+            match = next((video for video in videos if video["fid"] == fid), None)
+            if match is None:
+                raise UsageError("fid 不是该目录中的视频文件")
+            if watched:
+                service.library.mark_watched(fid, match["name"], match["size"])
+            else:
+                service.library.mark_unwatched(fid)
+            return self._json(200, {"fid": fid, "watched": watched})
         if route == "/v1/recent/clear":
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
@@ -811,7 +1018,9 @@ class _Handler(BaseHTTPRequestHandler):
         library being silently reset, and ``/v1/recent``/``/v1/favorites`` keep
         reporting the stored document as broken.
         """
-        self.service.library.record_recent(session.fid, session.name, session.size)
+        self.service.library.record_recent(
+            session.fid, session.name, session.size, self.service.parent_of(session.fid)
+        )
 
     def _record_failure(self, exc: BaseException, *, phase: str | None = None) -> None:
         """Log one fixed, sanitized failure event; never a raw exception or URL."""

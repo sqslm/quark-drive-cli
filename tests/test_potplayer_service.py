@@ -778,7 +778,7 @@ class FavoritesCase(_ServerCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.json(),
-            {"items": [{"fid": "root-dir", "name": "剧集", "is_dir": True, "size": 0}]},
+            {"items": [{"fid": "root-dir", "name": "剧集", "is_dir": True, "size": 0, "last_episode": None}]},
         )
         self.assertEqual(self.api("GET", "/v1/favorites").json(), response.json())
 
@@ -943,9 +943,9 @@ class RecentCase(_ServerCase):
         library = self.service.library
         original = library.record_recent
 
-        def spy(fid, name, size):
+        def spy(fid, name, size, parent=""):
             calls.append(fid)
-            return original(fid, name, size)
+            return original(fid, name, size, parent)
 
         library.record_recent = spy
 
@@ -1020,6 +1020,240 @@ class RecentCase(_ServerCase):
         self.assertEqual(self.api("POST", "/v1/recent/clear", body={}).json(), {"items": []})
 
 
+class SeriesCase(_ServerCase):
+    """Continue/series/mark views: local state, one selected-directory listing."""
+
+    SIZE = len(VIDEO_BYTES)
+
+    def service_kwargs(self) -> dict:
+        return {"transport": self.fixture.transport(), "cookie": COOKIE}
+
+    def save_document(self, recent=(), marks=(), favorites=()):
+        write_json(self.service.library.path, {
+            "version": 3,
+            "favorites": list(favorites),
+            "recent": list(recent),
+            "marks": list(marks),
+        })
+
+    def recent_row(self, fid, name, size=None, *, parent="root-dir", played_at=10,
+                   position_ms=0, duration_ms=0, progress_at=0):
+        return {
+            "fid": fid, "name": name, "size": self.SIZE if size is None else size,
+            "played_at": played_at, "position_ms": position_ms, "duration_ms": duration_ms,
+            "progress_at": progress_at, "parent": parent,
+        }
+
+    def mark_row(self, fid, name, size=None, watched_at=10):
+        return {"fid": fid, "name": name, "size": self.SIZE if size is None else size,
+                "watched_at": watched_at}
+
+    def test_continue_lists_only_resumable_unfinished_videos(self):
+        self.save_document(recent=[
+            self.recent_row("v2", "第2集.mp4", position_ms=60_000, duration_ms=1_800_000, progress_at=30),
+            self.recent_row("v9", "第9集.mkv", position_ms=10_000, duration_ms=1_800_000, progress_at=20),
+            self.recent_row("v10", "第10集.mp4", position_ms=1_790_000, duration_ms=1_800_000, progress_at=10),
+            self.recent_row("zero", "未播.mp4", position_ms=0, duration_ms=0, progress_at=5),
+        ])
+        before = len(self.fixture.requests)
+        payload = self.api("GET", "/v1/continue").json()
+        self.assertEqual([item["fid"] for item in payload["items"]], ["v2"])
+        item = payload["items"][0]
+        self.assertEqual(item["size"], self.SIZE)
+        self.assertFalse(item["watched"])
+        self.assertIn("已看 3%", item["display"])
+        self.assertEqual(len(self.fixture.requests), before)
+
+    def test_continue_excludes_marks_and_orders_by_latest_progress(self):
+        self.save_document(
+            recent=[
+                self.recent_row("v2", "第2集.mp4", position_ms=60_000, duration_ms=1_800_000, progress_at=10),
+                self.recent_row("v9", "第9集.mkv", position_ms=90_000, duration_ms=1_800_000, progress_at=20),
+                self.recent_row("v10", "第10集.mp4", position_ms=120_000, duration_ms=1_800_000, progress_at=30),
+            ],
+            marks=[self.mark_row("v10", "第10集.mp4")],
+        )
+        payload = self.api("GET", "/v1/continue").json()
+        self.assertEqual([item["fid"] for item in payload["items"]], ["v9", "v2"])
+
+    def test_recent_view_counts_manual_and_real_completion_as_watched(self):
+        self.save_document(
+            recent=[
+                self.recent_row("v2", "第2集.mp4", position_ms=1_795_000, duration_ms=1_800_000, progress_at=5),
+                self.recent_row("v9", "第9集.mkv", position_ms=60_000, duration_ms=1_800_000, progress_at=6),
+                self.recent_row("v10", "第10集.mp4", position_ms=0, duration_ms=0, progress_at=0),
+            ],
+            marks=[self.mark_row("v10", "第10集.mp4")],
+        )
+        items = {item["fid"]: item for item in self.api("GET", "/v1/recent").json()["items"]}
+        self.assertTrue(items["v2"]["watched"])
+        self.assertEqual(items["v2"]["display"], "第2集.mp4 · 已看")
+        self.assertFalse(items["v9"]["watched"])
+        self.assertTrue(items["v10"]["watched"])
+
+    def test_series_uses_the_listing_name_size_and_parent(self):
+        # A stored record carries an old name and an unknown parent; the listing
+        # is the authority for the display name and the directory association.
+        self.save_document(recent=[{
+            "fid": "v2", "name": "旧名字.mp4", "size": self.SIZE, "played_at": 1,
+            "position_ms": 60_000, "duration_ms": 1_800_000, "progress_at": 9, "parent": "",
+        }])
+        payload = self.api("GET", "/v1/series?parent=root-dir").json()
+        self.assertEqual(payload["parent"], "root-dir")
+        by_fid = {episode["fid"]: episode for episode in payload["episodes"]}
+        self.assertEqual(by_fid["v2"]["name"], "第2集.mp4")
+        self.assertEqual(by_fid["v2"]["size"], self.SIZE)
+        self.assertEqual(by_fid["v2"]["position_ms"], 60_000)
+        self.assertIn("已看 3%", by_fid["v2"]["display"])
+
+    def test_series_ignores_a_stale_size_record(self):
+        self.save_document(recent=[{
+            "fid": "v9", "name": "第9集.mkv", "size": self.SIZE + 1, "played_at": 1,
+            "position_ms": 1_790_000, "duration_ms": 1_800_000, "progress_at": 9, "parent": "root-dir",
+        }])
+        episodes = {episode["fid"]: episode for episode in
+                    self.api("GET", "/v1/series?parent=root-dir").json()["episodes"]}
+        self.assertEqual(episodes["v9"]["position_ms"], 0)
+        self.assertFalse(episodes["v9"]["watched"])
+
+    def test_series_lists_the_directory_in_natural_order(self):
+        before = len(self.fixture.requests)
+        payload = self.api("GET", "/v1/series?parent=root-dir").json()
+        self.assertEqual([episode["fid"] for episode in payload["episodes"]], ["v2", "v9", "v10"])
+        self.assertEqual(payload["total"], 3)
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["continue"]["fid"], "v2")
+        added = self.fixture.requests[before:]
+        self.assertEqual(len(added), 1)
+        self.assertTrue(added[0].url.path.endswith("/file/sort"))
+
+    def test_series_continues_the_latest_unfinished_episode(self):
+        self.save_document(recent=[
+            self.recent_row("v2", "第2集.mp4", position_ms=60_000, duration_ms=1_800_000, progress_at=10),
+            self.recent_row("v10", "第10集.mp4", position_ms=90_000, duration_ms=1_800_000, progress_at=20),
+        ])
+        payload = self.api("GET", "/v1/series?parent=root-dir").json()
+        self.assertEqual(payload["continue"]["fid"], "v10")
+        self.assertIn("已看 5%", payload["continue"]["display"])
+        self.assertEqual(payload["watched"], 0)
+
+    def test_series_all_manually_watched_reports_complete(self):
+        self.save_document(marks=[
+            self.mark_row("v2", "第2集.mp4"),
+            self.mark_row("v9", "第9集.mkv"),
+            self.mark_row("v10", "第10集.mp4"),
+        ])
+        payload = self.api("GET", "/v1/series?parent=root-dir").json()
+        self.assertTrue(payload["complete"])
+        self.assertIsNone(payload["continue"])
+        self.assertEqual(payload["watched"], 3)
+
+    def test_series_all_completed_by_real_progress_reports_complete(self):
+        self.save_document(recent=[
+            self.recent_row(fid, name, position_ms=1_795_000, duration_ms=1_800_000, progress_at=index)
+            for index, (fid, name) in enumerate(
+                (("v2", "第2集.mp4"), ("v9", "第9集.mkv"), ("v10", "第10集.mp4")), start=1
+            )
+        ])
+        payload = self.api("GET", "/v1/series?parent=root-dir").json()
+        self.assertTrue(payload["complete"])
+        self.assertIsNone(payload["continue"])
+        self.assertEqual(payload["watched"], 3)
+
+    def test_series_directory_without_videos_is_never_complete(self):
+        # An empty directory, or one holding only non-video files, has no
+        # episode to finish: it must not look entirely watched, which the
+        # extension would otherwise turn into a misleading 已全部看完 row.
+        self.fixture.records.extend([
+            record("art-dir", "图片", directory=True),
+            record("only-poster", "封面.jpg", "art-dir", size=32),
+        ])
+        for parent in ("empty-dir", "art-dir"):
+            with self.subTest(parent=parent):
+                payload = self.api("GET", f"/v1/series?parent={parent}").json()
+                self.assertEqual(payload["parent"], parent)
+                self.assertEqual(payload["total"], 0)
+                self.assertEqual(payload["watched"], 0)
+                self.assertEqual(payload["episodes"], [])
+                self.assertFalse(payload["complete"])
+                self.assertIsNone(payload["continue"])
+
+    def test_series_ignores_records_from_another_directory(self):
+        self.save_document(recent=[
+            self.recent_row("other", "别的.mp4", parent="second-dir",
+                            position_ms=60_000, duration_ms=1_800_000, progress_at=99),
+        ])
+        payload = self.api("GET", "/v1/series?parent=root-dir").json()
+        self.assertEqual([episode["fid"] for episode in payload["episodes"]], ["v2", "v9", "v10"])
+        self.assertEqual(payload["continue"]["fid"], "v2")
+
+    def test_series_rejects_a_missing_parent(self):
+        self.assertEqual(self.api("GET", "/v1/series").status_code, 400)
+        self.assertEqual(self.api("POST", "/v1/series?parent=root-dir").status_code, 405)
+
+    def test_favorite_shows_the_last_episode_from_its_own_directory(self):
+        self.save_document(
+            favorites=[{"fid": "root-dir", "name": "剧集", "added_at": 1}],
+            recent=[
+                self.recent_row("v2", "第2集.mp4", played_at=7,
+                                position_ms=60_000, duration_ms=1_800_000, progress_at=5),
+                self.recent_row("other", "别的.mp4", parent="second-dir", played_at=8,
+                                position_ms=90_000, duration_ms=1_800_000, progress_at=9),
+            ],
+        )
+        item = self.api("GET", "/v1/favorites").json()["items"][0]
+        self.assertEqual(item["last_episode"]["fid"], "v2")
+        self.assertIn("已看 3%", item["last_episode"]["display"])
+
+    def test_mark_verifies_the_directory_video_and_is_idempotent(self):
+        first = self.api("POST", "/v1/mark", body={"fid": "v2", "parent": "root-dir", "watched": True})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json(), {"fid": "v2", "watched": True})
+        self.assertTrue(self.service.library.is_watched("v2", self.SIZE))
+        before = self.service.library.path.read_text(encoding="utf-8")
+        again = self.api("POST", "/v1/mark", body={"fid": "v2", "parent": "root-dir", "watched": True})
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(self.service.library.path.read_text(encoding="utf-8"), before)
+
+        self.assertEqual(
+            self.api("POST", "/v1/mark", body={"fid": "root-dir", "parent": "root-dir", "watched": True}).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.api("POST", "/v1/mark", body={"fid": "v2", "parent": "empty-dir", "watched": True}).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.api("POST", "/v1/mark", body={"fid": "v2", "parent": "root-dir", "watched": "yes"}).status_code,
+            400,
+        )
+        self.assertEqual(self.api("POST", "/v1/mark", body={"fid": "v2", "parent": "root-dir"}).status_code, 400)
+
+    def test_mark_unwatched_resets_progress_and_allows_a_future_write(self):
+        library = self.service.library
+        library.record_recent("v2", "第2集.mp4", self.SIZE, "root-dir")
+        self.assertTrue(library.save_progress("v2", self.SIZE, 60_000, 1_800_000))
+        self.api("POST", "/v1/mark", body={"fid": "v2", "parent": "root-dir", "watched": True})
+        self.assertIsNone(library.progress("v2", self.SIZE))
+        self.assertFalse(library.save_progress("v2", self.SIZE, 65_000, 1_800_000))
+
+        cleared = self.api("POST", "/v1/mark", body={"fid": "v2", "parent": "root-dir", "watched": False})
+        self.assertEqual(cleared.json(), {"fid": "v2", "watched": False})
+        self.assertFalse(library.is_watched("v2", self.SIZE))
+        self.assertIsNone(library.progress("v2", self.SIZE))
+        self.assertTrue(library.save_progress("v2", self.SIZE, 70_000, 1_800_000))
+
+    def test_local_views_add_no_upstream_request(self):
+        self.save_document(recent=[
+            self.recent_row("v2", "第2集.mp4", position_ms=60_000, duration_ms=1_800_000, progress_at=1)
+        ])
+        before = len(self.fixture.requests)
+        self.api("GET", "/v1/continue")
+        self.api("GET", "/v1/recent")
+        self.api("GET", "/v1/favorites")
+        self.assertEqual(len(self.fixture.requests), before)
+
+
 class PersistenceCase(_ServerCase):
     """The private document is read back by a fresh service instance."""
 
@@ -1060,7 +1294,8 @@ class AuthGateCase(_ServerCase):
         return {"transport": self.fixture.transport()}
 
     def test_library_endpoints_require_the_token(self):
-        for path in ("/v1/search?q=a", "/v1/favorites", "/v1/recent"):
+        for path in ("/v1/search?q=a", "/v1/favorites", "/v1/recent",
+                     "/v1/continue", "/v1/series?parent=root-dir"):
             with self.subTest(path=path):
                 self.assertEqual(self.client.get(self.base + path).status_code, 401)
 
@@ -1069,9 +1304,12 @@ class AuthGateCase(_ServerCase):
             ("GET", "/v1/search?q=a"),
             ("GET", "/v1/favorites"),
             ("GET", "/v1/recent"),
+            ("GET", "/v1/continue"),
+            ("GET", "/v1/series?parent=root-dir"),
             ("POST", "/v1/favorites"),
             ("POST", "/v1/favorites/remove"),
             ("POST", "/v1/recent/clear"),
+            ("POST", "/v1/mark"),
         )
         for method, path in requests:
             with self.subTest(path=path):

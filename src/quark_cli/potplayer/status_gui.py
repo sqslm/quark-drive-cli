@@ -1,4 +1,4 @@
-"""Standalone Tk status window for the PotPlayer bridge (release 0.5.0).
+"""Standalone Tk status window for the PotPlayer bridge (release 0.6.0).
 
 The service owns the bridge; this module only *observes* it. It loads the
 bridge's private runtime record (``plugin_state.read_runtime``), confirms that

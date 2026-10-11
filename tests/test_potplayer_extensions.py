@@ -655,6 +655,77 @@ class LibraryEntryDesignTests(unittest.TestCase):
         self.assertLess(body.index('Category == "diagnostics"'), body.index("QuarkEnsureLogin()"))
 
 
+class SeriesEntryDesignTests(unittest.TestCase):
+    """The 0.6.0 continue/series entries: native navigation rows, local state only."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.url_raw = read_script(URL_LIST)
+
+    def body(self, signature):
+        return squash(body_raw(self.url_raw, signature))
+
+    def raw(self, signature):
+        return body_raw(self.url_raw, signature)
+
+    def test_continue_category_reads_the_local_list(self):
+        categories = self.body("array<dictionary> GetCategorys()")
+        self.assertRegex(categories, r'resume\["Category"\]\s*=\s*"continue"')
+        body = self.body("array<dictionary> QuarkContinueList()")
+        self.assertIn('QuarkRequest("/v1/continue", "")', body)
+        self.assertIn("QuarkAppendItems(ret, items)", body)
+        # 空列表给一条可读状态，不回退到整盘浏览。
+        self.assertIn("暂无可继续观看的视频", body)
+
+    def test_directory_first_page_adds_continue_and_management_rows(self):
+        listing = self.body(
+            "array<dictionary> QuarkDirectoryList(string PathToken, string page, bool favorite_action)"
+        )
+        self.assertIn("QuarkAppendSeriesRows(ret, PathToken)", listing)
+        rows = self.body("void QuarkAppendSeriesRows(array<dictionary> &ret, string parent)")
+        self.assertIn('"/v1/series?parent=" + HostUrlEncode(parent)', rows)
+        self.assertIn("QUARK_PLAY_PREFIX + fid.asString()", rows)
+        self.assertIn("QUARK_ACTION_SERIES + parent", rows)
+        # “继续观看”必须是媒体行（唯一带 url 的行）；管理行是可导航动作行。
+        self.assertEqual(rows.count('row["url"]'), 1)
+        self.assertIn('manage["folder"] = "1"', rows)
+        self.assertNotIn('manage["url"]', rows)
+
+    def test_all_watched_directory_shows_a_navigation_row_not_a_restart(self):
+        rows = self.body("void QuarkAppendSeriesRows(array<dictionary> &ret, string parent)")
+        self.assertIn("本目录已全部看完", rows)
+        self.assertNotIn('done["url"]', rows)
+        self.assertIn('done["PathToken"] = QUARK_ACTION_SERIES + parent', rows)
+
+    def test_series_page_lists_every_episode_with_a_toggle_token(self):
+        body = self.body("array<dictionary> QuarkSeriesPage(string parent)")
+        self.assertIn('"/v1/series?parent=" + HostUrlEncode(parent)', body)
+        self.assertIn("QuarkWatchToken(!marked, parent, fid.asString())", body)
+        self.assertIn("已看（点击标记未看）", body)
+        self.assertIn("未看（点击标记已看）", body)
+        # 管理页是纯导航：没有媒体地址。
+        self.assertNotIn('row["url"]', body)
+
+    def test_watch_action_replays_the_target_state_idempotently(self):
+        token = self.body("string QuarkWatchToken(bool watched, string parent, string fid)")
+        self.assertIn("QUARK_ACTION_WATCH", token)
+        body = self.raw("array<dictionary> QuarkWatchActionPage(string spec)")
+        self.assertIn('"/v1/mark"', body)
+        self.assertIn('\\"watched\\":', body)
+        self.assertIn("+ flag", body)
+        self.assertIn('state == "1"', body)
+
+    def test_action_tokens_are_dispatched_and_validate_their_pieces(self):
+        body = self.body(
+            "array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)"
+        )
+        self.assertIn("QUARK_ACTION_SERIES", body)
+        self.assertIn("QUARK_ACTION_WATCH", body)
+        self.assertIn('Category == "continue"', body)
+        valid = self.body("bool QuarkValidFid(string fid)")
+        self.assertIn('fid.find("|") >= 0', valid)
+
+
 class DiagnosticsEntryDesignTests(unittest.TestCase):
     """The 0.5.0 diagnostics entry: local-only, folder action row, no invented player APIs."""
 
@@ -667,9 +738,9 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
     def raw_body(self, raw, signature):
         return body_raw(raw, signature)
 
-    def test_versions_report_0_5_0(self):
+    def test_versions_report_the_current_release(self):
         for raw in (self.url_raw, self.play_raw):
-            self.assertIn('return "0.5.0";', self.raw_body(raw, "string GetVersion()"))
+            self.assertIn('return "0.6.0";', self.raw_body(raw, "string GetVersion()"))
 
     def test_diagnostics_category_posts_a_json_body_and_returns_a_back_row(self):
         page = self.raw_body(self.url_raw, "array<dictionary> QuarkDiagnosticsPage()")
@@ -1254,6 +1325,33 @@ class LibraryRouteShapeTests(BridgeCase):
         play = self.post_json("/v1/play", {"fid": "fav-vid"})
         self.assertEqual(self.client.head(self.base + play["url"]).status_code, 200)
         self.assertEqual(self.get_json("/v1/recent")["items"], [])
+
+    def test_continue_and_series_share_progress_display(self):
+        library = self.bridge.service.library
+        library.record_recent("fav-vid", "第1集.mp4", len(VIDEO_BYTES), "fav-dir")
+        self.assertTrue(library.save_progress("fav-vid", len(VIDEO_BYTES), 60_000, 1_800_000))
+
+        cont = self.get_json("/v1/continue")
+        self.assertEqual([item["fid"] for item in cont["items"]], ["fav-vid"])
+        self.assertIn("已看 3%", cont["items"][0]["display"])
+
+        series = self.get_json("/v1/series?parent=fav-dir")
+        self.assertEqual(series["parent"], "fav-dir")
+        self.assertEqual(series["total"], 1)
+        self.assertFalse(series["complete"])
+        self.assertEqual(series["continue"]["fid"], "fav-vid")
+        for key in ("fid", "name", "size", "watched", "position_ms", "duration_ms", "display"):
+            self.assertIn(key, series["episodes"][0])
+
+    def test_mark_route_switches_the_series_watched_state(self):
+        marked = self.post_json("/v1/mark", {"fid": "fav-vid", "parent": "fav-dir", "watched": True})
+        self.assertEqual(marked, {"fid": "fav-vid", "watched": True})
+        series = self.get_json("/v1/series?parent=fav-dir")
+        self.assertTrue(series["complete"])
+        self.assertIsNone(series["continue"])
+        self.assertEqual(series["watched"], 1)
+        self.post_json("/v1/mark", {"fid": "fav-vid", "parent": "fav-dir", "watched": False})
+        self.assertFalse(self.get_json("/v1/series?parent=fav-dir")["complete"])
 
     def test_recent_clear_is_idempotent(self):
         play = self.post_json("/v1/play", {"fid": "fav-vid"})
