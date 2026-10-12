@@ -80,7 +80,8 @@ from pathlib import Path
 from typing import Any
 
 from ..auth import LoginCancelled, get_cookie
-from ..errors import LocalIOError, QuarkError
+from ..errors import LocalIOError, QuarkError, UsageError
+from ..transfer import DEFAULT_DOWNLOAD_CONNECTIONS, MAX_DOWNLOAD_CONNECTIONS
 from ..potplayer.login_gui import QrLoginWindow
 from ..shares import parse_share_url as parse_share_link
 from .core import (
@@ -277,6 +278,10 @@ class DownloaderWindow:
         self._searching = False
         self._output_dir = ""
         self._batch: Batch | None = None
+        self._batch_connections = DEFAULT_DOWNLOAD_CONNECTIONS
+        self._batch_resume_available = True
+        self._connections_var: Any = None
+        self._connections_input: Any = None
         self._downloading = False
         self._stop_requested = False
         self._logging_in = False
@@ -456,6 +461,12 @@ class DownloaderWindow:
         self._open_folder_button.pack(side="left", padx=(0, 6))
         self._output_var = tk.StringVar(value="未选择本地保存目录")
         tk.Label(actions, textvariable=self._output_var, anchor="w").pack(side="left", fill="x", expand=True, padx=6)
+        tk.Label(actions, text="线程数").pack(side="left", padx=(4, 2))
+        self._connections_var = tk.StringVar(value=str(DEFAULT_DOWNLOAD_CONNECTIONS))
+        self._connections_input = tk.ttk.Spinbox(
+            actions, from_=1, to=MAX_DOWNLOAD_CONNECTIONS, width=3, textvariable=self._connections_var
+        )
+        self._connections_input.pack(side="left", padx=(0, 8))
         self._download_button = tk.Button(actions, text=DOWNLOAD_BUTTON_TEXT, width=10, command=self.start_download)
         self._download_button.pack(side="right")
         self._stop_button = tk.Button(
@@ -496,6 +507,8 @@ class DownloaderWindow:
             with contextlib.suppress(Exception):
                 root.destroy()
         self._tree = None
+        self._connections_var = None
+        self._connections_input = None
         self._log = None
         self._progress = None
         self._status_var = None
@@ -602,6 +615,7 @@ class DownloaderWindow:
             self._stop_progress(100.0)
             self._start_next()
         elif isinstance(event, Stopped):
+            self._batch_resume_available = event.resume_available
             # The library ended the item at a checkpoint it had already
             # persisted; the rest of the selection was cleared when the stop was
             # asked for, so the batch closes here unless an item is still owed.
@@ -839,11 +853,20 @@ class DownloaderWindow:
             return
         try:
             folder = output_folder(self._output_dir)
+            value = self._connections_var.get() if self._connections_var is not None else DEFAULT_DOWNLOAD_CONNECTIONS
+            try:
+                connections = int(value)
+            except (TypeError, ValueError):
+                raise UsageError("线程数必须是 1–16 的整数") from None
+            if not 1 <= connections <= MAX_DOWNLOAD_CONNECTIONS:
+                raise UsageError("线程数必须是 1–16 的整数")
         except (QuarkError, OSError) as error:
             self._set_status(describe_error(error, DOWNLOAD_ACTION))
             return
         source = self._share_source
         self._batch = Batch(str(folder), entries)
+        self._batch_connections = connections
+        self._batch_resume_available = True
         self._batch_share = None if source is None else (source, self._share_trail[-1])
         self._stop_requested = False
         self._downloading = True
@@ -910,6 +933,7 @@ class DownloaderWindow:
                     # shown in; an account download keeps the defaults.
                     share_source=None if shared is None else shared[0],
                     share_path=SHARE_ROOT_PATH if shared is None else shared[1],
+                    connections=self._batch_connections,
                 )
             )
             return
@@ -917,7 +941,7 @@ class DownloaderWindow:
     def _finish_batch(self) -> None:
         """Close the click: report what became of every ticked entry."""
         batch = self._batch
-        resume_available = self._batch_share is None
+        resume_available = self._batch_share is None and self._batch_resume_available
         self._batch = None
         self._batch_share = None
         self._stop_requested = False
@@ -1207,6 +1231,7 @@ class DownloaderWindow:
         )
         _set_state(self._stop_button, "normal" if self._downloading and not self._stop_requested else "disabled")
         _set_state(self._select_all_button, "disabled" if busy or not self._entries else "normal")
+        _set_state(self._connections_input, "disabled" if busy else "normal")
         chosen = len(self._checked_entries())
         ready = not busy and bool(self._output_dir) and chosen > 0
         _set_state(self._download_button, "normal" if ready else "disabled")

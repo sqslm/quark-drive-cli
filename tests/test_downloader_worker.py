@@ -173,7 +173,7 @@ class WorkerTests(unittest.TestCase):
 
         progress = worker.events.get(timeout=5)
         self.assertIsInstance(progress, Progress)
-        self.assertEqual(progress.text, "报告.PDF：10 B / 10 B · 1.0 MiB/s")
+        self.assertEqual(progress.text, "报告.PDF：10 B / 10 B · 1.0 MiB/s · 单线程")
         self.assertEqual(progress.fraction, 1.0)
 
         finished = worker.events.get(timeout=5)

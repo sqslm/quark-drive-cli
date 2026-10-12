@@ -327,14 +327,18 @@ def batch_summary(*, succeeded: int, failed: int, stopped: int, skipped: int, re
 def progress_text(event: ProgressEvent) -> str:
     """One status line for a transfer event; never contains a URL or a Cookie."""
     name = display_text(event.name)
+    mode = "单线程" if event.connections == 1 else f"{event.connections} 线程"
+    if event.phase == "non_resumable":
+        mode = "单线程，停止后重新下载"
     if event.phase in ("saving", "cleaning"):
         action = "正在临时转存" if event.phase == "saving" else "正在清理临时目录"
         return f"{name}：{action}"
     if event.total is None:
-        return f"{name}：已传输 {format_bytes(event.transferred)} · {format_speed(event.rate)}"
+        return f"{name}：已传输 {format_bytes(event.transferred)} · {format_speed(event.rate)} · {mode}"
     return (
         f"{name}：{format_bytes(event.transferred)} / {format_bytes(event.total)}"
         f" · {format_speed(event.rate)}"
+        f" · {mode}"
     )
 
 

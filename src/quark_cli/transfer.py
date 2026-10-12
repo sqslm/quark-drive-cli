@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
+from collections import deque
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -20,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote, urlencode, urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 
@@ -61,6 +62,10 @@ class DownloadStopped(QuarkError):
     """
 
     label = "download_stopped"
+
+    def __init__(self, message: str, *, resume_available: bool = True):
+        super().__init__(message)
+        self.resume_available = resume_available
 
 
 def _data(payload: Mapping[str, Any], operation: str) -> Any:
@@ -888,6 +893,172 @@ class Transfer:
             raise RemoteError("分段下载正文与声明范围不符")
         sink.flush()
 
+    def _download_checkpointed_ranges(self, url, expected, part, data, ledger, digest, meter,
+                                      connections, should_stop) -> bool:
+        """Read a bounded window of ranges; only the writer advances the ledger."""
+        offset = data["offset"]
+        chunk = PARALLEL_DOWNLOAD_MIN_CHUNK
+        if connections <= 1 or expected < PARALLEL_DOWNLOAD_MIN_SIZE or expected - offset <= chunk:
+            return False
+        headers = {"Accept-Encoding": "identity", "Range": f"bytes={offset}-{offset}"}
+        if data["etag"] is not None:
+            headers["If-Range"] = data["etag"]
+        with self._download_stream(url, headers) as response:
+            if response.status_code == 200 and offset == 0:
+                return False
+            _range(response, offset, expected, bounded_end=offset)
+            etag = _strong_etag(response.headers.get("etag"))
+            if etag is None:
+                return False
+            if data["etag"] is not None and etag != data["etag"]:
+                raise RemoteError("远端强 ETag 已变化；未追加")
+            if response.headers.get("content-encoding", "identity").lower() not in ("", "identity"):
+                raise RemoteError("下载响应未采用 identity 编码，不能按字节分段")
+            received = 0
+            for block in response.iter_bytes():
+                received += len(block)
+                if received > 1:
+                    raise RemoteError("分段探测正文长度不符")
+            if received != 1:
+                raise RemoteError("分段探测正文长度不符")
+        data.update({"etag": etag, "phase": "streaming"})
+        ledger.persist(data)
+        if not part.exists():
+            fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            os.close(fd)
+        private_path(part)
+        cancel = threading.Event()
+        lock = threading.Lock()
+        errors = []
+        local = threading.local()
+        clients = []
+        workers = min(connections, (expected - offset + chunk - 1) // chunk)
+        meter.connections = workers
+
+        def check_stop():
+            if cancel.is_set() or (should_stop is not None and should_stop()):
+                raise DownloadStopped("下载已停止：已保留安全检查点，再次提交可继续")
+
+        def fetch(start, end):
+            try:
+                check_stop()
+                if not hasattr(local, "client"):
+                    local.client = self.client.new_transfer_client()
+                    with lock:
+                        clients.append(local.client)
+                with self._download_stream(url, {"Accept-Encoding": "identity",
+                                                "Range": f"bytes={start}-{end}", "If-Range": etag},
+                                           storage=local.client) as response:
+                    _, length = _range(response, start, expected, bounded_end=end)
+                    if _strong_etag(response.headers.get("etag")) != etag:
+                        raise RemoteError("并发分段的强 ETag 不一致；拒绝拼接")
+                    if response.headers.get("content-encoding", "identity").lower() not in ("", "identity"):
+                        raise RemoteError("分段下载响应未采用 identity 编码")
+                    body = bytearray()
+                    chunks = response.iter_bytes if response.is_stream_consumed else response.iter_raw
+                    for block in chunks(meter.limiter.chunk_size):
+                        check_stop()
+                        if len(body) + len(block) > length:
+                            raise RemoteError("分段下载正文超过声明范围")
+                        meter.limiter.consume(len(block))
+                        body.extend(block)
+                        with lock:
+                            meter.transferred += len(block)
+                            meter.emit("transferring")
+                    if len(body) != length:
+                        raise RemoteError("分段下载正文与声明范围不符")
+                    return body
+            except BaseException as error:
+                if not isinstance(error, DownloadStopped):
+                    with lock:
+                        errors.append(error)
+                cancel.set()
+                raise
+
+        pool = ThreadPoolExecutor(max_workers=workers)
+        pending = deque()
+        start = offset
+        try:
+            with part.open("ab" if offset else "wb") as sink:
+                for _ in range(workers):
+                    end = min(start + chunk, expected) - 1
+                    pending.append(pool.submit(fetch, start, end))
+                    start = end + 1
+                while pending:
+                    future = pending.popleft()
+                    block = future.result()
+                    check_stop()
+                    if sink.write(block) != len(block):
+                        raise LocalIOError("下载临时文件写入不完整")
+                    digest.update(block)
+                    sink.flush()
+                    os.fsync(sink.fileno())
+                    data.update({"offset": data["offset"] + len(block), "prefix_sha256": digest.hexdigest()})
+                    ledger.persist(data)
+                    with lock:
+                        first_checkpoint = meter.confirmed == offset
+                        meter.confirmed = data["offset"]
+                        meter.emit("checkpoint", force=first_checkpoint)
+                    del block, future
+                    if start < expected:
+                        end = min(start + chunk, expected) - 1
+                        pending.append(pool.submit(fetch, start, end))
+                        start = end + 1
+            return True
+        except BaseException:
+            cancel.set()
+            if errors:
+                raise errors[0]
+            raise
+        finally:
+            cancel.set()
+            pool.shutdown(wait=True, cancel_futures=True)
+            self.client.release_transfer_clients(clients)
+
+    def _download_unversioned(self, response, fid, target, expected, length, overwrite, ledger, data,
+                              meter, scope, should_stop):
+        """A fresh single response may finish, but cannot create a resume prefix."""
+        part = ledger.part_path
+        if not part.exists():
+            fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            os.close(fd)
+        private_path(part)
+        written = 0
+        digest = hashlib.sha256()
+        meter.emit("non_resumable", force=True)
+        try:
+            with part.open("wb") as sink:
+                chunks = response.iter_bytes if response.is_stream_consumed else response.iter_raw
+                for block in chunks(meter.limiter.chunk_size):
+                    if should_stop is not None and should_stop():
+                        raise DownloadStopped("下载已停止：该对象不支持安全续传，需重新下载", resume_available=False)
+                    if (length is not None and written + len(block) > length) or written + len(block) > expected:
+                        raise RemoteError("下载正文超过声明长度")
+                    meter.limiter.consume(len(block))
+                    if sink.write(block) != len(block):
+                        raise LocalIOError("下载临时文件写入不完整")
+                    digest.update(block)
+                    written += len(block)
+                    meter.transferred = written
+                    meter.emit("non_resumable")
+                sink.flush()
+                os.fsync(sink.fileno())
+            if written != expected or (length is not None and written != length):
+                raise RemoteError("下载正文与声明长度不符")
+            if _remote_identity(Files(self.client).info(fid)) != data["remote"]:
+                raise RemoteError("传输期间远端文件身份变化；未发布")
+            self._scope(fid, scope, data["scope_fid"])
+            _publish(part, target, overwrite)
+            # Only the empty, task-owned ledger exists; no offset was promised.
+            ledger.path.unlink()
+            meter.confirmed = written
+            meter.emit("completed", force=True)
+            result = _download_result(fid, target, written, True, False, digest.hexdigest())
+            result["resumable"] = False
+            return result
+        finally:
+            part.unlink(missing_ok=True)
+
     def download(self, fid: str, output: str | Path, *, overwrite: bool = False, resume: bool = False,
                  limit_rate: int | None = None, progress: Callable[[ProgressEvent], None] | None = None,
                  scope: Scope | None = None, limiter: RateLimiter | None = None,
@@ -989,6 +1160,22 @@ class Transfer:
             meter.transferred = meter.confirmed = offset
             written = offset
             try:
+                if resume and not published and self._download_checkpointed_ranges(
+                    url, expected, temporary, data, ledger, digest, meter, connections, should_stop
+                ):
+                    fresh = _remote_identity(Files(self.client).info(fid))
+                    self._scope(fid, scope, data["scope_fid"])
+                    if fresh != data["remote"]:
+                        raise RemoteError("传输期间远端文件身份变化；未发布")
+                    data.update({"phase": "payload_verified", "payload_sha256": digest.hexdigest()})
+                    ledger.persist(data)
+                    data["phase"] = "publishing"
+                    ledger.persist(data)
+                    _publish(temporary, target, overwrite)
+                    data["phase"] = "completed"
+                    ledger.persist(data)
+                    meter.emit("completed", force=True)
+                    return _download_result(fid, target, data["offset"], True, resumed, digest.hexdigest())
                 with self._download_stream(url, headers) as response:
                     etag = _strong_etag(response.headers.get("etag"))
                     if response.headers.get("content-encoding", "identity").lower() not in ("", "identity"):
@@ -1034,6 +1221,9 @@ class Transfer:
                             raise RemoteError(f"下载失败（HTTP {response.status_code}）")
                         if resume:
                             if etag is None:
+                                if offset == 0 and data["etag"] is None:
+                                    return self._download_unversioned(response, fid, target, expected, length,
+                                                                      overwrite, ledger, data, meter, scope, should_stop)
                                 raise RemoteError("该对象没有强 ETag，无法安全建立续传检查点")
                             if data["etag"] is not None and etag != data["etag"]:
                                 raise RemoteError("远端强 ETag 已变化；未追加")

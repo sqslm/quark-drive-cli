@@ -12,7 +12,7 @@ import httpx
 from quark_cli.client import QUARK_DESKTOP_USER_AGENT, QuarkClient
 from quark_cli.errors import AuthenticationError, LocalIOError, RateLimitError, RemoteError, UsageError
 from quark_cli.transfer import Transfer, UPLOAD_READBACK_ATTEMPTS, UPLOAD_READBACK_INTERVAL, _SHA1State
-from quark_cli.transfer_state import DownloadLedger, TransferLedger, UploadLedger
+from quark_cli.transfer_state import TransferLedger
 from quark_cli.transfer_progress import RateLimiter
 from quark_cli.files import Files
 from quark_cli.paths import RemotePaths, Scope
@@ -660,8 +660,10 @@ class TransferTests(unittest.TestCase):
         for etag in (None, 'W/"weak"'):
             with self.subTest(etag=etag), tempfile.TemporaryDirectory() as directory:
                 root, server = Path(directory), DownloadServer(b"bytes", etag=etag)
-                with self.assertRaisesRegex(RemoteError, "强 ETag"):
-                    self._transfer(server, root / "state").download("download-id", root / "out", resume=True)
+                result = self._transfer(server, root / "state").download("download-id", root / "out", resume=True)
+                self.assertEqual((root / "out").read_bytes(), b"bytes")
+                self.assertFalse(result["resumable"])
+                self.assertFalse(list((root / "state").glob("download-*.json")))
                 self.assertFalse(list(root.glob("*.part")))
 
     def test_download_checkpoint_tamper_is_rejected_before_storage_get(self):

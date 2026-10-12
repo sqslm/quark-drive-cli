@@ -389,7 +389,7 @@ class ShareTestBase(unittest.TestCase):
         return ShareSource(SHARE_URL, PASSCODE)
 
     def request(self, fixture: ShareDownloadFixture, *, fid: str, name: str, recursive: bool = False,
-                share_path: str = "/", overwrite: bool = False) -> Download:
+                share_path: str = "/", overwrite: bool = False, connections: int = 4) -> Download:
         return Download(
             fid=fid,
             target=str(self.output / name),
@@ -398,6 +398,7 @@ class ShareTestBase(unittest.TestCase):
             name=name,
             share_source=self.source(),
             share_path=share_path,
+            connections=connections,
         )
 
     def isolate_output(self, label: str) -> Path:
@@ -507,7 +508,7 @@ class ShareDownloadTests(ShareTestBase):
     def test_a_share_folder_is_downloaded_recursively_and_published_under_its_name(self):
         fixture = ShareDownloadFixture()
         target = self.output / "资料"
-        request = self.request(fixture, fid="share-dir", name="资料", recursive=True)
+        request = self.request(fixture, fid="share-dir", name="资料", recursive=True, connections=8)
         with patch("quark_cli.downloader.share.RecursiveTransfer", StubTree):
             result = self.backend(fixture).download(request, None)  # noqa: E501
         self.assertEqual((target / "内部.txt").read_bytes(), b"inside")
@@ -517,6 +518,7 @@ class ShareDownloadTests(ShareTestBase):
         self.assertEqual(fid, fixture.copy_fid)
         self.assertTrue(options["resume"])
         self.assertFalse(options["overwrite"])
+        self.assertEqual(options["connections"], 8)
         self.assertTrue(staged.is_relative_to(self.output))
         self.assert_staging_removed()
 

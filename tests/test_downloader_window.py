@@ -464,6 +464,26 @@ class RenderingTests(WindowCase):
 
 
 class DownloadTests(WindowCase):
+    def test_connections_are_validated_and_frozen_for_the_batch(self):
+        window = self._window()
+        self._listing(window, Entry("f1", "a.bin", False, 4), Entry("f2", "b.bin", False, 4))
+        window._output_dir = str(self.output)
+        self._tick(window, "f1", "f2")
+        window._connections_var = _FakeVar("17")
+        window._connections_input = _FakeButton()
+        window.start_download()
+        self.assertIn("1–16", window._status_var.get())
+        self.assertFalse(window._downloading)
+        window._connections_var.set("8")
+        window.start_download()
+        self.assertEqual(self._submitted(window).connections, 8)
+        self.assertEqual(window._connections_input.state, "disabled")
+        window._connections_var.set("2")
+        window._handle(Finished(DOWNLOAD_ACTION, "done"))
+        self.assertEqual(self._submitted(window).connections, 8)
+        window._handle(Finished(DOWNLOAD_ACTION, "done"))
+        self.assertEqual(window._connections_input.state, "normal")
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -1799,6 +1819,8 @@ class WindowSmokeTests(unittest.TestCase):
             observed["share"] = window._share_button.cget("text")
             observed["drive"] = window._drive_button.cget("text")
             observed["passcode_mask"] = window._passcode_entry.cget("show")
+            observed["connections"] = window._connections_var.get()
+            observed["connections_max"] = window._connections_input.cget("to")
             observed["stop_text"] = str(window._stop_button.cget("text"))
             observed["stop_state"] = str(window._stop_button.cget("state"))
             window.close()
@@ -1813,6 +1835,8 @@ class WindowSmokeTests(unittest.TestCase):
         self.assertEqual(observed.get("share"), "打开分享")
         self.assertEqual(observed.get("drive"), "我的网盘")
         self.assertEqual(observed.get("passcode_mask"), "*")
+        self.assertEqual(observed.get("connections"), "4")
+        self.assertEqual(int(observed.get("connections_max")), 16)
         self.assertEqual(observed.get("stop_text"), "停止下载")
         self.assertEqual(observed.get("stop_state"), "disabled")
 

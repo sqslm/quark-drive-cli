@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import unicodedata
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, TextIO
 
@@ -22,6 +23,7 @@ class ProgressEvent:
     total: int | None
     rate: float
     confirmed_parts: int = 0
+    connections: int = 1
 
 
 class RateLimiter:
@@ -62,16 +64,22 @@ class Progress:
         self.initial_bytes = limiter.transferred
         self.last_emit = self.started - 1
         self.transferred = self.confirmed = self.confirmed_parts = 0
+        self.connections = 1
+        self._samples = deque([(self.started, 0)])
 
     def emit(self, phase: str, *, force: bool = False) -> None:
         now = self.limiter.clock()
         if self.callback is None or (not force and now - self.last_emit < 0.5):
             return
         self.last_emit = now
-        elapsed = now - self.started
+        transferred = self.limiter.transferred - self.initial_bytes
+        self._samples.append((now, transferred))
+        while len(self._samples) > 2 and self._samples[1][0] <= now - 5:
+            self._samples.popleft()
+        elapsed = now - self._samples[0][0]
         event = ProgressEvent(self.direction, phase, self.name, self.transferred, self.confirmed, self.total,
-                              (self.limiter.transferred - self.initial_bytes) / elapsed if elapsed > 0 else 0.0,
-                              self.confirmed_parts)
+                              (transferred - self._samples[0][1]) / elapsed if elapsed > 0 else 0.0,
+                              self.confirmed_parts, self.connections)
         self.callback(event)
 
 

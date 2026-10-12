@@ -301,12 +301,12 @@ class ProgressTests(unittest.TestCase):
 
     def test_known_size_renders_bytes_and_rate(self):
         event = ProgressEvent("download", "transferring", "报告.bin", 512, 512, 1024, 1048576.0)
-        self.assertEqual(progress_text(event), "报告.bin：512 B / 1.0 KiB · 1.0 MiB/s")
+        self.assertEqual(progress_text(event), "报告.bin：512 B / 1.0 KiB · 1.0 MiB/s · 单线程")
         self.assertEqual(progress_fraction(event), 0.5)
 
     def test_unknown_size_renders_transferred_bytes_only(self):
         event = ProgressEvent("download", "transferring", "报告.bin", 3, 3, None, 1048576.0)
-        self.assertEqual(progress_text(event), "报告.bin：已传输 3 B · 1.0 MiB/s")
+        self.assertEqual(progress_text(event), "报告.bin：已传输 3 B · 1.0 MiB/s · 单线程")
         self.assertIsNone(progress_fraction(event))
 
     def test_fraction_is_bounded_and_refuses_malformed_sizes(self):

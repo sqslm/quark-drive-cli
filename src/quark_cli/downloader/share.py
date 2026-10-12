@@ -51,7 +51,7 @@ from ..shares import (
     ShareSaver,
     _optional_created_fid,
 )
-from ..transfer import DownloadStopped, Transfer, safe_transfer_name, _publish
+from ..transfer import DEFAULT_DOWNLOAD_CONNECTIONS, MAX_DOWNLOAD_CONNECTIONS, DownloadStopped, Transfer, safe_transfer_name, _publish
 from ..transfer_progress import ProgressEvent
 from ..transfer_state import safe_local_path
 from .core import ROOT_FID
@@ -138,6 +138,7 @@ class ShareDownloader:
         share_path: str = "/",
         progress: Callable[[ProgressEvent], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        connections: int = DEFAULT_DOWNLOAD_CONNECTIONS,
     ) -> dict[str, Any]:
         """Download the one selected share item to ``target``, then clean up.
 
@@ -146,6 +147,8 @@ class ShareDownloader:
         before the temporary drive folder is created, and a stop that is already
         requested ends the request before any cloud write is made.
         """
+        if type(connections) is not int or not 1 <= connections <= MAX_DOWNLOAD_CONNECTIONS:
+            raise UsageError("下载并发连接数必须是 1 到 16 之间的整数")
         original = safe_transfer_name(name)
         destination = safe_local_path(target)
         if destination.name != original:
@@ -174,7 +177,7 @@ class ShareDownloader:
             # here still skips the save and the cleanup below removes the folder.
             self._stop_requested(should_stop, "下载已停止：未提交转存")
             account_fid = self._save_selection(selected, temp_fid, original, recursive)
-            result = self._transfer(account_fid, destination, original, recursive, progress, should_stop)
+            result = self._transfer(account_fid, destination, original, recursive, progress, should_stop, connections)
         except BaseException as error:
             primary = error
 
@@ -333,6 +336,7 @@ class ShareDownloader:
         recursive: bool,
         progress: Callable[[ProgressEvent], None] | None,
         should_stop: Callable[[], bool] | None,
+        connections: int,
     ) -> dict[str, Any]:
         """Download the account copy inside a temporary staging area, then publish.
 
@@ -349,7 +353,7 @@ class ShareDownloader:
             payload_dir = root / "payload"
             payload_dir.mkdir()
             staged = payload_dir / name
-            options: dict[str, Any] = {"resume": True, "overwrite": False}
+            options: dict[str, Any] = {"resume": True, "overwrite": False, "connections": connections}
             if progress is not None:
                 options["progress"] = progress
             if should_stop is not None:

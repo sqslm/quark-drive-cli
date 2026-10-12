@@ -34,7 +34,7 @@ from ..files import Files
 from ..paths import RemotePaths, is_directory
 from ..recursive import RecursiveTransfer
 from ..shares import ShareSaver
-from ..transfer import DownloadStopped, Transfer
+from ..transfer import DEFAULT_DOWNLOAD_CONNECTIONS, DownloadStopped, Transfer
 from ..transfer_progress import ProgressEvent
 from .core import (
     BROWSE_ACTION,
@@ -97,6 +97,7 @@ class Download:
     name: str
     share_source: ShareSource | None = None
     share_path: str = "/"
+    connections: int = DEFAULT_DOWNLOAD_CONNECTIONS
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,7 @@ class Stopped:
 
     action: str
     message: str
+    resume_available: bool = True
 
 
 class Backend(Protocol):
@@ -282,7 +284,8 @@ class DriveBackend:
         progress: Callable[[ProgressEvent], None] | None,
         should_stop: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
-        options: dict[str, Any] = {"overwrite": request.overwrite, "resume": True}
+        options: dict[str, Any] = {"overwrite": request.overwrite, "resume": True,
+                                  "connections": request.connections}
         if progress is not None:
             options["progress"] = progress
         if should_stop is not None:
@@ -304,6 +307,7 @@ class DriveBackend:
                     share_path=request.share_path,
                     progress=progress,
                     should_stop=should_stop,
+                    connections=request.connections,
                 )
             transfer = Transfer(client)
             if request.recursive:
@@ -447,7 +451,8 @@ class Worker:
                 if request.share_source is not None
                 else str(stopped) or "下载已停止：安全检查点已保留"
             )
-            self.events.put(Stopped(DOWNLOAD_ACTION, message))
+            self.events.put(Stopped(DOWNLOAD_ACTION, message,
+                                   request.share_source is None and stopped.resume_available))
             return
         except Exception as error:
             self.events.put(Failed(DOWNLOAD_ACTION, describe_error(error, DOWNLOAD_ACTION)))
