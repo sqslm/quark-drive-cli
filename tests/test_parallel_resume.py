@@ -196,4 +196,3 @@ class ParallelResumeTests(unittest.TestCase):
                 Download("f", str(self.root / "test.bin"), False, False, "test.bin", connections=2), None)
         self.assertEqual(result["sha256"], hashlib.sha256(source.body).hexdigest())
         self.assertEqual(source.peak, 2)
-

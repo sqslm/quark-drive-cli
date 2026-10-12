@@ -284,6 +284,21 @@ class TransferProgressTests(unittest.TestCase):
         progress.emit("part_confirmed", force=True)
         self.assertEqual(len(events), 2)
 
+    def test_recent_speed_tracks_last_five_seconds_and_reports_connection_mode(self):
+        now, events = [0.0], []
+        limiter = RateLimiter(clock=lambda: now[0])
+        progress = Progress("download", "file", 2000, limiter, events.append)
+        progress.connections = 4
+        for second in range(1, 8):
+            now[0] = float(second)
+            limiter.consume(500 if second == 7 else 100)
+            progress.emit("transferring")
+        self.assertEqual(events[-1].rate, 180.0)
+        self.assertEqual(events[-1].connections, 4)
+        now[0] = 13.0
+        progress.emit("transferring")
+        self.assertEqual(events[-1].rate, 0.0)
+
     def test_stderr_renderer_removes_c0_del_c1_controls_and_keeps_unicode(self):
         stream = io.StringIO()
         event = ProgressEvent("download", "transferring", "中文\x1b[31m\r\n\x7f\x85\x9b[2J\u202e", 4, 4, None, 3.0)

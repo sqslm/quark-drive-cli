@@ -28,6 +28,7 @@ from quark_cli.downloader.app import (
     DownloaderWindow,
     match_text,
     parse_share_url,
+    parse_share_input,
 )
 from quark_cli.downloader.core import DOWNLOAD_ACTION, ROOT_FID, Entry
 from quark_cli.downloader.share import ShareSource
@@ -106,6 +107,19 @@ class ShareWindowCase(WindowCase):
 
 
 class ShareLinkTests(unittest.TestCase):
+    def test_a_complete_share_message_extracts_one_link_and_code(self):
+        for text in (f"链接：{SHARE_LINK}\n提取码：{PASSCODE}，复制这段文字",
+                     f"分享「资料」（{SHARE_LINK}?pwd={PASSCODE}）",
+                     f"{SHARE_LINK} 密码: {PASSCODE}"):
+            source = parse_share_input(text)
+            self.assertEqual(source.passcode, PASSCODE)
+            self.assertTrue(source.url.startswith(SHARE_LINK))
+        self.assertEqual(parse_share_input(f"{SHARE_LINK}?pwd=auto", "edited").passcode, "edited")
+        for text in (f"{SHARE_LINK} {OTHER_LINK}", f"{SHARE_LINK}?pwd=auto 提取码：other",
+                     "https://[broken", "https://evil.invalid/s/a", f"{SHARE_LINK}/extra"):
+            with self.subTest(text=text), self.assertRaises(UsageError):
+                parse_share_input(text)
+
     """The link the window accepts is the library's own strict one."""
 
     def test_a_link_is_normalised_and_only_a_strict_one_is_taken(self):
@@ -133,6 +147,16 @@ class ShareLinkTests(unittest.TestCase):
 
 
 class ShareImportTests(ShareWindowCase):
+    def test_paste_fills_the_code_and_a_manual_edit_wins_when_opening(self):
+        window = self._window()
+        window._share_var.set(f"我分享了「资料」\n链接：{SHARE_LINK}\n提取码：{PASSCODE}")
+        self.assertEqual(window._passcode_var.get(), PASSCODE)
+        window._passcode_var.set("edited")
+        window.open_share()
+        request = self._submitted(window)
+        self.assertEqual(request, BrowseShare(ShareSource(SHARE_LINK, "edited"), "/"))
+        self.assertNotIn("edited", window._log.content)
+
     def test_importing_ends_the_account_search_and_opens_the_share_root(self):
         window = self._window()
         self._listing(window, Entry("d", "账号目录", True), Entry("f", "报告.bin", False, 4))
@@ -288,7 +312,7 @@ class ShareControlTests(ShareWindowCase):
         for button in (window._up_button, window._refresh_button, window._share_button, window._drive_button, window._login_button, window._select_all_button):
             self.assertEqual(button.state, "disabled")
         # A drive search would read the account instead of the share.
-        for button in (window._search_button, window._search_tree_button):
+        for button in (window._search_button, window._scope_combo):
             self.assertEqual(button.state, "disabled")
         window.go_up()
         window.refresh()

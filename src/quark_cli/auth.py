@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 import sys
 import tempfile
 import time
@@ -409,6 +408,22 @@ def _get_without_redirects(
             raise RemoteError(f"夸克{operation}返回了不安全的重定向")
         current_url = next_url
     raise RemoteError(f"夸克{operation}重定向失败")
+
+
+def get_account_nickname(cookie: str, *, transport: httpx.BaseTransport | None = None,
+                         guard: RequestGuard | None = None) -> str:
+    """Read the nickname from Quark's fixed account host without saving cookies."""
+    guard = guard or default_guard(transport, None)
+    headers = {**DEFAULT_HEADERS, "cookie": _validate_cookie(cookie)}
+    with httpx.Client(headers=headers, transport=transport, timeout=10.0, follow_redirects=False) as session:
+        response = _get_without_redirects(session, ACCOUNT_INFO_URL, params={"fr": "pc", "platform": "pc"},
+                                          allowed_host="pan.quark.cn", operation="账号昵称", guard=guard)
+        payload = _json_response(response)
+    data = payload.get("data")
+    nickname = data.get("nickname") if isinstance(data, dict) else None
+    if not isinstance(nickname, str) or not nickname.strip():
+        raise RemoteError("夸克未返回有效的账号昵称")
+    return nickname.strip()
 
 
 def _cookie_from_jar(session: httpx.Client) -> str:

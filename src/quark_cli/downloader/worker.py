@@ -28,7 +28,8 @@ from typing import Any, Protocol
 
 import httpx
 
-from ..client import QuarkClient
+from ..auth import get_account_nickname
+from ..client import QuarkClient, default_guard
 from ..errors import RemoteError, UsageError
 from ..files import Files
 from ..paths import RemotePaths, is_directory
@@ -53,6 +54,18 @@ from .core import (
 from .share import ShareDownloader, ShareSource
 
 SHARE_BROWSE_ACTION = "读取分享"
+
+
+@dataclass(frozen=True)
+class LoadAccountProfile:
+    generation: int
+
+
+@dataclass(frozen=True)
+class AccountProfile:
+    generation: int
+    nickname: str | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +177,7 @@ class Backend(Protocol):
     """The library calls the window drives; injectable for offline tests."""
 
     def listing(self, fid: str) -> list[Entry]: ...
+    def account_nickname(self) -> str: ...
 
     def share_listing(self, source: ShareSource, path: str) -> list[Entry]: ...
 
@@ -197,9 +211,13 @@ class DriveBackend:
     ) -> None:
         self._cookie = cookie
         self._transport = transport
+        self._guard = default_guard(transport, None)
 
     def _client(self) -> QuarkClient:
-        return QuarkClient(self._cookie(), transport=self._transport)
+        return QuarkClient(self._cookie(), transport=self._transport, guard=self._guard)
+
+    def account_nickname(self) -> str:
+        return get_account_nickname(self._cookie(), transport=self._transport, guard=self._guard)
 
     def listing(self, fid: str) -> list[Entry]:
         with self._client() as client:
@@ -375,8 +393,20 @@ class Worker:
         self._requests.put(None)
         thread.join(timeout)
 
-    def submit(self, request: Browse | BrowseShare | Search | Download) -> None:
+    def submit(self, request: Browse | BrowseShare | Search | Download | LoadAccountProfile) -> None:
+        if isinstance(request, LoadAccountProfile):
+            # The read-only profile has a short timeout and never holds up files.
+            threading.Thread(target=self._load_profile, args=(request,), name="quark-profile", daemon=True).start()
+            return
         self._requests.put(request)
+
+    def _load_profile(self, request: LoadAccountProfile) -> None:
+        try:
+            nickname = self._backend.account_nickname()
+        except Exception as error:
+            self.events.put(AccountProfile(request.generation, error=describe_error(error, "读取账号昵称")))
+            return
+        self.events.put(AccountProfile(request.generation, nickname))
 
     def request_stop(self) -> None:
         """Ask the download in flight to end at its persisted checkpoint.

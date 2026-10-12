@@ -46,6 +46,7 @@ from quark_cli.downloader.core import (
 )
 from quark_cli.downloader.worker import (
     Browse,
+    AccountProfile,
     Download,
     Failed,
     Finished,
@@ -190,6 +191,12 @@ class _FakeButton:
         if "text" in options:
             self.text = options["text"]
 
+    def pack(self, **_options):
+        self.visible = True
+
+    def pack_forget(self):
+        self.visible = False
+
 
 class _FakeCombo(_FakeButton):
     """A ``ttk.Combobox`` stand-in: it records its state and its bindings."""
@@ -264,6 +271,9 @@ class _FakeLog:
 
 
 class _Backend:
+    def account_nickname(self):
+        return "测试账号"
+
     """A backend that answers immediately; the window tests never start the thread."""
 
     def __init__(self, rows: list[Entry] | None = None) -> None:
@@ -306,6 +316,10 @@ class WindowCase(unittest.TestCase):
         window._count_var = _FakeVar()
         window._share_var = _FakeVar()
         window._passcode_var = _FakeVar()
+        window._nickname_var = _FakeVar("未登录")
+        window._scope_var = _FakeVar("全盘")
+        window._scope_combo = _FakeCombo()
+        window._share_var.trace_add("write", window._on_share_input_change)
         # ``_build`` ties the keyword box to the local filter; the fake widgets
         # repeat that here, so setting the variable behaves like typing. The real
         # wiring is covered by the Tk smoke tests.
@@ -322,7 +336,6 @@ class WindowCase(unittest.TestCase):
             "_download_button",
             "_stop_button",
             "_search_button",
-            "_search_tree_button",
             "_return_button",
             "_share_button",
             "_drive_button",
@@ -755,6 +768,22 @@ class MatchTextTests(unittest.TestCase):
 
 
 class SearchTests(WindowCase):
+    def test_search_uses_the_scope_selector_and_only_results_show_return(self):
+        window = self._window()
+        self._listing(window, Entry("d", "目录", True))
+        self.assertFalse(window._return_button.visible)
+        window._tree.selection_ids = ("row0",)
+        window._on_activate(None)
+        self._submitted(window)
+        window._scope_var.set("当前目录及子目录")
+        window._search_var.set("目标")
+        window.search()
+        self.assertEqual(self._submitted(window), Search("d", "目标"))
+        self.assertTrue(window._return_button.visible)
+        window._handle(SearchResults("d", "目标", ()))
+        window.leave_search()
+        self.assertFalse(window._return_button.visible)
+
     """Submitting a search, and what its answer does to the table."""
 
     def test_the_subdirectories_button_searches_the_folder_shown(self):
@@ -980,7 +1009,7 @@ class SearchTests(WindowCase):
             window.search_subdirectories()
             self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告"))
             self.assertEqual(window._search_button.state, "disabled")
-            self.assertEqual(window._search_tree_button.state, "disabled")
+            self.assertEqual(window._scope_combo.state, "disabled")
             self.assertEqual(window._return_button.state, "disabled")
             self.assertEqual(window._up_button.state, "disabled")
             self.assertEqual(window._refresh_button.state, "disabled")
@@ -1568,6 +1597,22 @@ class StartupTests(WindowCase):
 
 
 class LoginTests(WindowCase):
+    def test_old_profile_results_are_ignored_and_failure_preserves_download_state(self):
+        window = self._window()
+        window._profile_generation = 2
+        window._nickname_var.set("读取昵称…")
+        window._handle(AccountProfile(1, "旧账号"))
+        self.assertEqual(window._nickname_var.get(), "读取昵称…")
+        window._handle(AccountProfile(2, "新账号"))
+        self.assertEqual(window._nickname_var.get(), "新账号")
+        window._downloading = True
+        window._status_var.set("正在下载")
+        window._handle(AccountProfile(2, error="昵称读取失败"))
+        self.assertEqual(window._nickname_var.get(), "昵称暂不可用")
+        self.assertEqual(window._status_var.get(), "正在下载")
+        self.assertTrue(window._downloading)
+        self.assertIn("昵称读取失败", window._log.content)
+
     def test_a_successful_login_browses_the_folder_that_is_shown(self):
         login = _LoginWindow()
         window = self._window(login_window_factory=lambda root: login)
@@ -1608,6 +1653,41 @@ class LoginTests(WindowCase):
 
 @unittest.skipUnless(_TK, "Tkinter with a display is required")
 class WindowSmokeTests(unittest.TestCase):
+    def test_handled_login_errors_release_tk_before_background_collection(self):
+        import subprocess
+        import sys
+        import textwrap
+
+        script = textwrap.dedent('''
+            import gc, threading, time, sys
+            from quark_cli.downloader.app import DownloaderWindow, _tkinter
+            from quark_cli.auth import LoginCancelled
+            from quark_cli.errors import LocalIOError
+            class Backend:
+                def account_nickname(self): return 'test'
+            class Login:
+                def __init__(self, parent):
+                    self.parent = parent
+                    self.error = (LoginCancelled if sys.argv[1] == 'cancel' else LocalIOError)('offline login failure')
+                def run(self):
+                    try: raise ValueError('inner failure')
+                    except ValueError as error: raise self.error from error
+            def exercise():
+                tk = _tkinter(); root = tk.Tk()
+                window = DownloaderWindow(cookie=lambda:'sid=offline', backend_factory=lambda c:Backend(),
+                                          root_factory=lambda:root, login_window_factory=Login)
+                window._root = root; window._build(tk); window.login(); time.sleep(.03); window.close()
+            exercise()
+            thread = threading.Thread(target=gc.collect); thread.start(); thread.join()
+            print('released')
+        ''')
+        for kind in ("cancel", "failure"):
+            with self.subTest(kind=kind):
+                result = subprocess.run([sys.executable, "-c", script, kind], capture_output=True,
+                                        text=True, encoding="utf-8", timeout=20)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("released", result.stdout)
+
     def test_the_window_browses_the_root_and_closes(self):
         rows = [Entry("d", "目录", True, None), Entry("f", "f.bin", False, 4)]
         root = _tk_root()
@@ -1650,7 +1730,7 @@ class WindowSmokeTests(unittest.TestCase):
         def snapshot_and_close() -> None:
             observed["status"] = window._status_var.get()
             observed["rows"] = list(window._tree.get_children())
-            observed["login_state"] = window._login_button["state"]
+            observed["login_state"] = str(window._login_button["state"])
             window.close()
 
         root.after(100, snapshot_and_close)
@@ -1760,7 +1840,11 @@ class WindowSmokeTests(unittest.TestCase):
             if not children:
                 root.after(50, begin)
                 return
+            root.update_idletasks()
             box = window._tree.bbox(children[0], "check")
+            if not box:
+                root.after(50, begin)
+                return
             window._on_click(SimpleNamespace(x=box[0] + box[2] // 2, y=box[1] + box[3] // 2))
             self.assertTrue(window._checked)
             window.start_download()
@@ -1776,10 +1860,11 @@ class WindowSmokeTests(unittest.TestCase):
                 root.after(50, finish)
                 return
             observed["done_status"] = window._status_var.get()
+            root.after_cancel(watchdog)
             window.close()
 
         root.after(50, begin)
-        root.after(5000, root.quit)
+        watchdog = root.after(5000, root.quit)
         window.run()
 
         self.assertTrue(observed.get("alive"), "the window closed under a running download")
@@ -1812,6 +1897,9 @@ class WindowSmokeTests(unittest.TestCase):
         observed: dict = {}
 
         def snapshot_and_close() -> None:
+            if window._profile_pending:
+                root.after(50, snapshot_and_close)
+                return
             observed["selectmode"] = str(window._tree.cget("selectmode"))
             observed["check_heading"] = window._tree.heading("check", "text")
             observed["select_all"] = window._select_all_button.cget("text")
@@ -1821,6 +1909,7 @@ class WindowSmokeTests(unittest.TestCase):
             observed["passcode_mask"] = window._passcode_entry.cget("show")
             observed["connections"] = window._connections_var.get()
             observed["connections_max"] = window._connections_input.cget("to")
+            observed["nickname"] = window._nickname_var.get()
             observed["stop_text"] = str(window._stop_button.cget("text"))
             observed["stop_state"] = str(window._stop_button.cget("state"))
             window.close()
@@ -1837,7 +1926,8 @@ class WindowSmokeTests(unittest.TestCase):
         self.assertEqual(observed.get("passcode_mask"), "*")
         self.assertEqual(observed.get("connections"), "4")
         self.assertEqual(int(observed.get("connections_max")), 16)
-        self.assertEqual(observed.get("stop_text"), "停止下载")
+        self.assertIn(observed.get("nickname"), ("测试账号", "读取昵称…"))
+        self.assertEqual(observed.get("stop_text"), "停止")
         self.assertEqual(observed.get("stop_state"), "disabled")
 
     def test_the_keyword_box_filters_the_real_table_and_the_save_folder_opens(self):
@@ -1863,7 +1953,8 @@ class WindowSmokeTests(unittest.TestCase):
                 return
             observed["path_heading"] = str(window._tree.heading("path", "text"))
             observed["search_text"] = str(window._search_button.cget("text"))
-            observed["subtree_text"] = str(window._search_tree_button.cget("text"))
+            observed["scopes"] = list(window._scope_combo.cget("values"))
+            observed["return_visible"] = bool(window._return_button.winfo_manager())
             observed["return_text"] = str(window._return_button.cget("text"))
             observed["kinds"] = list(window._kind_combo.cget("values"))
             observed["open_state"] = str(window._open_folder_button.cget("state"))
@@ -1883,8 +1974,9 @@ class WindowSmokeTests(unittest.TestCase):
         window.run()
 
         self.assertEqual(observed.get("path_heading"), "路径")
-        self.assertEqual(observed.get("search_text"), "搜索全盘")
-        self.assertEqual(observed.get("subtree_text"), "搜索子目录")
+        self.assertEqual(observed.get("search_text"), "搜索")
+        self.assertEqual(observed.get("scopes"), ["全盘", "当前目录及子目录"])
+        self.assertFalse(observed.get("return_visible"))
         self.assertEqual(observed.get("return_text"), "返回目录")
         self.assertEqual(observed.get("kinds"), [KIND_ALL, KIND_FILES, KIND_DIRECTORIES])
         self.assertEqual(observed.get("open_state"), "disabled")

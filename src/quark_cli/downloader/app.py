@@ -1,13 +1,14 @@
 """The downloader's Tkinter window (``python -m quark_cli.downloader``).
 
-Every network call and every byte of a download runs on the worker thread of
-:mod:`quark_cli.downloader.worker`. The Tk thread only submits requests and
+Browsing and the file queue run on the worker thread of
+:mod:`quark_cli.downloader.worker`; payload readers and nickname lookup run in
+their own background threads. The Tk thread only submits requests and
 renders the events that come back on a queue, so a folder listing or a file
 transfer never blocks the window.
 
 One click downloads the whole multi-selection: the entries are frozen in the
 order the table shows them, served one at a time, and every outcome is appended
-to the item log while the status line follows the item in flight. ``停止下载``
+to the item log while the status line follows the item in flight. ``停止``
 drops the items that have not started and asks the worker to end the one in
 flight at the checkpoint the library already persisted, so the same selection
 can be submitted again to continue.
@@ -22,8 +23,8 @@ is no second credential file to keep in sync.
 
 Searching and filtering stay local until the user asks for a request: the
 keyword box and the type box re-render the rows the window already holds through
-:func:`~quark_cli.downloader.core.filter_entries`, and only ``搜索全盘`` (the
-whole drive) or ``搜索子目录`` (the folder shown and everything below it)
+:func:`~quark_cli.downloader.core.filter_entries`, and only ``搜索`` with a
+whole-drive or current-folder-and-descendants scope
 submits a :class:`~quark_cli.downloader.worker.Search`. One search is in flight
 at a time: an answer is applied only while its fid and keyword still match the
 request the window submitted, so a late answer can never fill the table with the
@@ -35,12 +36,12 @@ Following a different folder — entering one, ``返回上级``, ``返回目录`
 both local filters, because the keyword box is also the query that would hide
 the rows of the folder just opened; ``刷新`` keeps them and re-runs the search
 the table shows. A search that matched nothing says so in the count line, while
-an empty folder keeps reporting its real counts. ``打开保存目录`` opens the
+an empty folder keeps reporting its real counts. ``打开目录`` opens the
 frozen save folder on the user's click, through an injectable opener, so no test
 needs a desktop.
 
 A shared link is browsed in place, never saved into the drive: ``打开分享``
-accepts only the strict ``https://pan.quark.cn/s/<分享ID>`` URL the CLI accepts
+extracts a strict ``https://pan.quark.cn/s/<分享ID>`` URL from a link or message
 and marks the table as a share view, whose folders are read with
 :class:`~quark_cli.downloader.worker.BrowseShare` and whose own folder chain is
 kept apart from the account's (a share FID means nothing to the account API).
@@ -75,9 +76,11 @@ import contextlib
 import copy
 import os
 import queue
+import re
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..auth import LoginCancelled, get_cookie
 from ..errors import LocalIOError, QuarkError, UsageError
@@ -105,6 +108,8 @@ from .share import ShareSource
 from .worker import (
     SHARE_BROWSE_ACTION,
     Backend,
+    AccountProfile,
+    LoadAccountProfile,
     Browse,
     BrowseShare,
     Download,
@@ -122,8 +127,8 @@ from .worker import (
 
 WINDOW_TITLE = "夸克网盘下载器"
 POLL_MILLISECONDS = 120
-IDLE_STATUS = "请勾选一个或多个文件或目录，然后点击「下载选中」"
-LOGIN_HINT = "尚未登录：请点击「扫码登录」，用手机夸克 App 扫码"
+IDLE_STATUS = "请勾选文件或目录，然后点击「下载」"
+LOGIN_HINT = "尚未登录：请点击「登录」，用手机夸克 App 扫码"
 CLOSE_BUSY_STATUS = "正在下载：请等待当前下载完成后再关闭窗口"
 STOPPING_STATUS = "正在停止：当前项目将在已保存的检查点结束，请稍候"
 SEARCHING_STATUS = "正在搜索……"
@@ -149,8 +154,8 @@ SHARE_DOWNLOAD_HINT = "分享下载将临时转存，结束后自动清理；停
 CHECK_COLUMN = "#1"
 CHECKED_MARK = "☑"
 UNCHECKED_MARK = "□"
-DOWNLOAD_BUTTON_TEXT = "下载选中"
-SELECT_ALL_TEXT = "全选/取消全选"
+DOWNLOAD_BUTTON_TEXT = "下载"
+SELECT_ALL_TEXT = "全选"
 
 #: The type filter's labels and the ``kind`` each one asks
 #: :func:`~quark_cli.downloader.core.filter_entries` for.
@@ -181,6 +186,24 @@ def parse_share_url(url: str, passcode: str | None = None) -> ShareSource:
     return ShareSource(url=url.strip(), passcode=link.passcode or None)
 
 
+def parse_share_input(text: str, passcode: str | None = None) -> ShareSource:
+    """Extract one Quark URL and code from a pasted link or share message."""
+    candidates = re.findall(r'https?://[^\s<>"\'，。；、（）【】「」]+', text, re.IGNORECASE)
+    try:
+        urls = [url.rstrip(".,;:!?)]}") for url in candidates if urlsplit(url).hostname == "pan.quark.cn"]
+    except ValueError:
+        raise UsageError("分享链接格式无效") from None
+    if len(urls) != 1:
+        raise UsageError("请输入单个夸克分享链接或分享文案")
+    linked = parse_share_url(urls[0])
+    codes = set(re.findall(r"(?:提取码|提取碼|密码)\s*[:：]?\s*([A-Za-z0-9]+)", text))
+    if linked.passcode:
+        codes.add(linked.passcode)
+    if not passcode and len(codes) > 1:
+        raise UsageError("分享文案中的提取码不一致，请手动填写正确提取码")
+    return parse_share_url(urls[0], passcode or next(iter(codes), None))
+
+
 def default_folder_opener(path: str) -> None:
     """Open one existing folder with the desktop's own file manager.
 
@@ -196,6 +219,18 @@ def default_folder_opener(path: str) -> None:
 def _set_state(widget: Any, state: str) -> None:
     if widget is not None:
         widget.configure(state=state)
+
+
+def _release_exception_frames(error: BaseException) -> None:
+    """Handled login errors must not keep Tk owners alive until background GC."""
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        pending.extend(cause for cause in (current.__cause__, current.__context__) if cause is not None)
+        current.__traceback__ = None
 
 
 def _tkinter() -> Any:
@@ -285,6 +320,11 @@ class DownloaderWindow:
         self._downloading = False
         self._stop_requested = False
         self._logging_in = False
+        self._profile_generation = 0
+        self._profile_pending = False
+        self._nickname_var: Any = None
+        self._scope_var: Any = None
+        self._scope_combo: Any = None
         self._indeterminate = False
         self._root: Any = None
         self._tree: Any = None
@@ -308,7 +348,6 @@ class DownloaderWindow:
         self._up_button: Any = None
         self._refresh_button: Any = None
         self._search_button: Any = None
-        self._search_tree_button: Any = None
         self._return_button: Any = None
         self._login_button: Any = None
         self._output_button: Any = None
@@ -352,137 +391,116 @@ class DownloaderWindow:
         root = self._root
         root.title(WINDOW_TITLE)
         root.geometry("860x620")
-        root.minsize(700, 520)
+        root.minsize(760, 540)
+        ttk = tk.ttk
 
-        toolbar = tk.Frame(root)
-        toolbar.pack(fill="x", padx=12, pady=(12, 6))
-        self._up_button = tk.Button(toolbar, text="返回上级", width=10, command=self.go_up)
-        self._refresh_button = tk.Button(toolbar, text="刷新", width=8, command=self.refresh)
-        self._login_button = tk.Button(toolbar, text="扫码登录", width=10, command=self.login)
-        for button in (self._up_button, self._refresh_button, self._login_button):
-            button.pack(side="left", padx=(0, 6))
+        toolbar = ttk.Frame(root)
+        toolbar.pack(fill="x", padx=12, pady=(10, 6))
+        self._up_button = ttk.Button(toolbar, text="上级", width=6, command=self.go_up)
+        self._up_button.pack(side="left", padx=(0, 4))
+        self._refresh_button = ttk.Button(toolbar, text="刷新", width=6, command=self.refresh)
+        self._refresh_button.pack(side="left", padx=(0, 8))
+        self._login_button = ttk.Button(toolbar, text="登录", width=6, command=self.login)
+        self._login_button.pack(side="right")
+        self._nickname_var = tk.StringVar(value="未登录")
+        ttk.Label(toolbar, textvariable=self._nickname_var).pack(side="right", padx=8)
+        self._return_button = ttk.Button(toolbar, text="返回目录", width=8, command=self.leave_search)
         self._location_var = tk.StringVar(value=self._location.title)
-        tk.Label(toolbar, textvariable=self._location_var, anchor="w").pack(
-            side="left", fill="x", expand=True, padx=(6, 0)
-        )
+        ttk.Label(toolbar, textvariable=self._location_var, anchor="w").pack(side="left", fill="x", expand=True)
 
-        # The share link is only ever read for browsing: the passcode box is
-        # masked, and none of this text is echoed into the status line or the log.
-        shared = tk.Frame(root)
+        shared = ttk.Frame(root)
         shared.pack(fill="x", padx=12, pady=(0, 6))
-        tk.Label(shared, text="分享链接").pack(side="left")
+        ttk.Label(shared, text="分享").pack(side="left", padx=(0, 4))
         self._share_var = tk.StringVar()
-        self._share_entry = tk.Entry(shared, textvariable=self._share_var, width=40)
-        self._share_entry.pack(side="left", padx=(4, 6))
-        tk.Label(shared, text="提取码").pack(side="left")
         self._passcode_var = tk.StringVar()
-        self._passcode_entry = tk.Entry(
-            shared, textvariable=self._passcode_var, width=10, show="*"
-        )
+        self._share_var.trace_add("write", self._on_share_input_change)
+        self._share_entry = ttk.Entry(shared, textvariable=self._share_var, width=32)
+        self._share_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Label(shared, text="提取码（可选）").pack(side="left")
+        self._passcode_entry = ttk.Entry(shared, textvariable=self._passcode_var, width=7, show="*")
         self._passcode_entry.pack(side="left", padx=(4, 6))
-        self._share_button = tk.Button(shared, text="打开分享", width=8, command=self.open_share)
-        self._drive_button = tk.Button(shared, text="我的网盘", width=8, command=self.open_drive)
-        for button in (self._share_button, self._drive_button):
-            button.pack(side="left", padx=(0, 6))
+        self._share_button = ttk.Button(shared, text="打开分享", width=8, command=self.open_share)
+        self._share_button.pack(side="left", padx=(0, 4))
+        self._drive_button = ttk.Button(shared, text="我的网盘", width=8, command=self.open_drive)
+        self._drive_button.pack(side="left")
 
-        # The keyword box filters the rows the window already holds as it is
-        # typed, and doubles as the query of the two search buttons.
-        find = tk.Frame(root)
+        find = ttk.Frame(root)
         find.pack(fill="x", padx=12, pady=(0, 6))
-        tk.Label(find, text="关键词").pack(side="left")
+        ttk.Label(find, text="名称").pack(side="left", padx=(0, 4))
         self._search_var = tk.StringVar()
         self._search_var.trace_add("write", self._on_filter_change)
-        self._keyword_entry = tk.Entry(find, textvariable=self._search_var, width=22)
-        self._keyword_entry.pack(side="left", padx=(4, 6))
-        self._search_button = tk.Button(find, text="搜索全盘", width=8, command=self.search)
-        self._search_tree_button = tk.Button(
-            find, text="搜索子目录", width=10, command=self.search_subdirectories
-        )
-        self._return_button = tk.Button(find, text="返回目录", width=10, command=self.leave_search)
-        for button in (self._search_button, self._search_tree_button, self._return_button):
-            button.pack(side="left", padx=(0, 6))
-        tk.Label(find, text="类型").pack(side="left")
+        self._keyword_entry = ttk.Entry(find, textvariable=self._search_var, width=18)
+        self._keyword_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._scope_var = tk.StringVar(value="全盘")
+        self._scope_combo = ttk.Combobox(find, textvariable=self._scope_var, width=16,
+                                         values=("全盘", "当前目录及子目录"), state="readonly")
+        self._scope_combo.pack(side="left", padx=(0, 4))
+        self._search_button = ttk.Button(find, text="搜索", width=6, command=self.search)
+        self._search_button.pack(side="left", padx=(0, 6))
         self._kind_var = tk.StringVar(value=KIND_CHOICES[0][0])
-        self._kind_combo = tk.ttk.Combobox(
-            find,
-            textvariable=self._kind_var,
-            values=[label for label, _kind in KIND_CHOICES],
-            state="readonly",
-            width=6,
-        )
+        self._kind_combo = ttk.Combobox(find, textvariable=self._kind_var,
+                                        values=[label for label, _ in KIND_CHOICES], width=7, state="readonly")
+        self._kind_combo.pack(side="left", padx=(0, 6))
         self._kind_combo.bind("<<ComboboxSelected>>", self._on_filter_change)
-        self._kind_combo.pack(side="left", padx=(4, 6))
-        self._select_all_button = tk.Button(find, text=SELECT_ALL_TEXT, width=14, command=self.toggle_all)
+        self._select_all_button = ttk.Button(find, text=SELECT_ALL_TEXT, width=8, command=self.toggle_all)
         self._select_all_button.pack(side="left", padx=(0, 6))
         self._count_var = tk.StringVar(value=match_text(0, 0))
-        tk.Label(find, textvariable=self._count_var, anchor="e").pack(side="right")
+        ttk.Label(find, textvariable=self._count_var, anchor="e").pack(side="right")
 
-        tree = self._tree = tk.ttk.Treeview(
-            root,
-            columns=("check", "path", "type", "size"),
-            show="tree headings",
-            selectmode="extended",
-        )
+        listing = ttk.Frame(root)
+        listing.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        tree = ttk.Treeview(listing, columns=("check", "path", "type", "size"), show="tree headings", selectmode="extended")
         tree.heading("#0", text="名称")
-        tree.heading("check", text="选择")
-        tree.heading("path", text="路径")
-        tree.heading("type", text="类型")
-        tree.heading("size", text="大小")
-        tree.column("#0", width=240, anchor="w")
-        tree.column("check", width=48, anchor="center", stretch=False)
-        tree.column("path", width=260, anchor="w")
-        tree.column("type", width=80, anchor="center", stretch=False)
-        tree.column("size", width=120, anchor="e", stretch=False)
-        tree.pack(fill="both", expand=True, padx=12, pady=6)
-        tree.bind("<Double-1>", self._on_activate)
-        tree.bind("<<TreeviewSelect>>", self._on_selection)
-        # The tick is taken from the ``选择`` column, never from the highlight:
-        # a click there toggles the row and leaves the selection to navigation.
+        tree.column("#0", width=260, minwidth=160)
+        for key, text, width in (("check", "选择", 48), ("path", "路径", 300),
+                                  ("type", "类型", 70), ("size", "大小", 95)):
+            tree.heading(key, text=text)
+            tree.column(key, width=width, minwidth=width if key != "path" else 80,
+                        stretch=key == "path", anchor="center" if key in ("check", "type") else "w")
+        scroll = ttk.Scrollbar(listing, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
         tree.bind("<Button-1>", self._on_click)
+        tree.bind("<Double-1>", self._on_activate)
         tree.bind("<space>", self._on_space)
+        tree.bind("<<TreeviewSelect>>", self._on_selection)
+        self._tree = tree
+        self._progress = ttk.Progressbar(root, mode="determinate", maximum=100.0)
+        self._progress.pack(fill="x", padx=12, pady=(0, 4))
+        self._log = tk.Text(root, height=4, wrap="word", state="disabled")
+        self._log.pack(fill="x", padx=12, pady=(0, 6))
 
-        bar = tk.Frame(root)
-        bar.pack(fill="x", padx=12, pady=(0, 4))
-        self._progress = tk.ttk.Progressbar(bar, mode="determinate", maximum=100.0)
-        self._progress.pack(fill="x")
-
-        # One line per finished item: the status line only ever describes the item
-        # in flight, so this is where per-item successes and failures accumulate.
-        self._log = tk.Text(root, height=5, wrap="word", state="disabled")
-        self._log.pack(fill="x", padx=12, pady=(0, 4))
-
-        actions = tk.Frame(root)
-        actions.pack(fill="x", padx=12, pady=(4, 4))
-        self._output_button = tk.Button(actions, text="选择保存目录", width=12, command=self.choose_output)
-        self._output_button.pack(side="left", padx=(0, 6))
-        self._open_folder_button = tk.Button(
-            actions, text="打开保存目录", width=12, command=self.open_output_folder, state="disabled"
-        )
-        self._open_folder_button.pack(side="left", padx=(0, 6))
+        destination = ttk.Frame(root)
+        destination.pack(fill="x", padx=12, pady=(0, 6))
+        self._open_folder_button = ttk.Button(destination, text="打开目录", width=8,
+                                               command=self.open_output_folder, state="disabled")
+        self._open_folder_button.pack(side="right")
+        self._output_button = ttk.Button(destination, text="更改", width=6, command=self.choose_output)
+        self._output_button.pack(side="right", padx=(0, 4))
+        ttk.Label(destination, text="保存到").pack(side="left", padx=(0, 6))
         self._output_var = tk.StringVar(value="未选择本地保存目录")
-        tk.Label(actions, textvariable=self._output_var, anchor="w").pack(side="left", fill="x", expand=True, padx=6)
-        tk.Label(actions, text="线程数").pack(side="left", padx=(4, 2))
+        ttk.Label(destination, textvariable=self._output_var, anchor="w").pack(side="left", fill="x", expand=True)
+        actions = ttk.Frame(root)
+        actions.pack(fill="x", padx=12, pady=(0, 6))
+        ttk.Label(actions, text="线程数").pack(side="left", padx=(0, 4))
         self._connections_var = tk.StringVar(value=str(DEFAULT_DOWNLOAD_CONNECTIONS))
-        self._connections_input = tk.ttk.Spinbox(
-            actions, from_=1, to=MAX_DOWNLOAD_CONNECTIONS, width=3, textvariable=self._connections_var
-        )
-        self._connections_input.pack(side="left", padx=(0, 8))
-        self._download_button = tk.Button(actions, text=DOWNLOAD_BUTTON_TEXT, width=10, command=self.start_download)
+        self._connections_input = ttk.Spinbox(actions, from_=1, to=MAX_DOWNLOAD_CONNECTIONS,
+                                               width=3, textvariable=self._connections_var)
+        self._connections_input.pack(side="left")
+        self._download_button = ttk.Button(actions, text=DOWNLOAD_BUTTON_TEXT, width=12, command=self.start_download)
         self._download_button.pack(side="right")
-        self._stop_button = tk.Button(
-            actions, text="停止下载", width=10, command=self.stop_download, state="disabled"
-        )
-        self._stop_button.pack(side="right", padx=(0, 6))
-
+        self._stop_button = ttk.Button(actions, text="停止", width=8, command=self.stop_download, state="disabled")
+        self._stop_button.pack(side="right", padx=(0, 4))
         self._status_var = tk.StringVar(value=IDLE_STATUS)
-        tk.Label(root, textvariable=self._status_var, anchor="w", wraplength=780, justify="left").pack(
-            fill="x", padx=12, pady=(0, 12)
-        )
+        ttk.Label(root, textvariable=self._status_var, anchor="w", wraplength=810, justify="left").pack(
+            fill="x", padx=12, pady=(0, 10))
         root.protocol("WM_DELETE_WINDOW", self.close)
 
     def _initialise(self) -> None:
         self._sync_controls()
         if self._credential_available():
+            self._profile_pending = True
             self._open(ROOT_FID)
         else:
             self._set_status(LOGIN_HINT)
@@ -509,6 +527,9 @@ class DownloaderWindow:
         self._tree = None
         self._connections_var = None
         self._connections_input = None
+        self._nickname_var = None
+        self._scope_var = None
+        self._scope_combo = None
         self._log = None
         self._progress = None
         self._status_var = None
@@ -529,7 +550,6 @@ class DownloaderWindow:
         self._up_button = None
         self._refresh_button = None
         self._search_button = None
-        self._search_tree_button = None
         self._return_button = None
         self._login_button = None
         self._output_button = None
@@ -556,7 +576,15 @@ class DownloaderWindow:
             self._handle(event)
 
     def _handle(self, event: Any) -> None:
-        if isinstance(event, SearchResults):
+        if isinstance(event, AccountProfile):
+            if event.generation != self._profile_generation:
+                return
+            if self._nickname_var is not None:
+                name = display_text(event.nickname) if event.nickname else "昵称暂不可用"
+                self._nickname_var.set(name if len(name) <= 24 else name[:24] + "…")
+            if event.error:
+                self._append_log(event.error)
+        elif isinstance(event, SearchResults):
             # A search reads the account drive, so its answer never belongs to
             # the table while that table shows a share.
             if self._share_source is not None:
@@ -607,6 +635,9 @@ class DownloaderWindow:
             self._render_listing(event)
             self._set_status(IDLE_STATUS)
             self._sync_controls()
+            if self._profile_pending:
+                self._profile_pending = False
+                self._request_profile()
         elif isinstance(event, Progress):
             self._set_status(self._item_line(event.text))
             self._show_progress(event.fraction)
@@ -713,7 +744,7 @@ class DownloaderWindow:
         url = self._share_var.get() if self._share_var is not None else ""
         passcode = self._passcode_var.get() if self._passcode_var is not None else ""
         try:
-            source = parse_share_url(url, passcode if passcode else None)
+            source = parse_share_input(url, passcode if passcode else None)
         except QuarkError as error:
             self._set_status(describe_error(error, SHARE_IMPORT_ACTION))
             return
@@ -751,7 +782,25 @@ class DownloaderWindow:
 
     def search(self) -> None:
         """Search the whole drive for the keyword in the filter box."""
-        self._submit_search(ROOT_FID)
+        scope = self._scope_var.get() if self._scope_var is not None else "全盘"
+        self._submit_search(ROOT_FID if scope == "全盘" else self._location.fid)
+
+    def _on_share_input_change(self, *_event: Any) -> None:
+        if self._busy() or self._share_var is None or self._passcode_var is None:
+            return
+        try:
+            source = parse_share_input(self._share_var.get())
+        except (UsageError, ValueError):
+            # Incomplete typing is left intact; opening reports invalid input.
+            return
+        if source.passcode:
+            self._passcode_var.set(source.passcode)
+
+    def _request_profile(self) -> None:
+        self._profile_generation += 1
+        if self._nickname_var is not None:
+            self._nickname_var.set("读取昵称…")
+        self._worker.submit(LoadAccountProfile(self._profile_generation))
 
     def search_subdirectories(self) -> None:
         """Search the folder shown and every folder below it (the root is all)."""
@@ -964,23 +1013,34 @@ class DownloaderWindow:
             # a share view, whose controls are the ones for leaving it.
             return
         self._logging_in = True
+        self._profile_generation += 1
+        if self._nickname_var is not None:
+            self._nickname_var.set("登录中…")
         self._sync_controls()
         succeeded = False
         try:
             self._login_window_factory(self._root).run()
             succeeded = True
-        except LoginCancelled:
+        except LoginCancelled as error:
             self._set_status("已取消扫码登录")
+            _release_exception_frames(error)
         except Exception as error:
             # ``LoginCancelled`` is checked first; every other failure (a typed
             # QuarkError, an OSError, or anything unexpected) becomes one
             # readable line instead of a traceback in a windowed program.
             self._set_status(describe_error(error, "扫码登录"))
+            # A login provider may retain its error. Its traceback can retain
+            # Tk widgets; release those frames on the Tk thread, not later GC.
+            _release_exception_frames(error)
         finally:
             self._logging_in = False
             self._sync_controls()
         if succeeded:
             self._open(self._location.fid)
+        if self._credential_available():
+            self._request_profile()
+        elif self._nickname_var is not None:
+            self._nickname_var.set("未登录")
 
     # -- rendering -------------------------------------------------------
 
@@ -1218,7 +1278,12 @@ class DownloaderWindow:
         # A drive search would read the account instead of the share, so both
         # buttons are out of reach while the table shows a share.
         _set_state(self._search_button, "disabled" if busy or share else "normal")
-        _set_state(self._search_tree_button, "disabled" if busy or share else "normal")
+        _set_state(self._scope_combo, "disabled" if busy or share else "readonly")
+        if self._return_button is not None:
+            if self._origin is not None and not share:
+                self._return_button.pack(side="left", before=self._login_button, padx=(0, 4))
+            else:
+                self._return_button.pack_forget()
         _set_state(self._keyword_entry, free)
         _set_state(self._kind_combo, "disabled" if busy else "readonly")
         _set_state(self._share_entry, free)
@@ -1231,6 +1296,9 @@ class DownloaderWindow:
         )
         _set_state(self._stop_button, "normal" if self._downloading and not self._stop_requested else "disabled")
         _set_state(self._select_all_button, "disabled" if busy or not self._entries else "normal")
+        if self._select_all_button is not None:
+            selected_all = bool(self._entries) and all(entry.fid in self._checked for entry in self._entries.values())
+            self._select_all_button.configure(text="取消全选" if selected_all else SELECT_ALL_TEXT)
         _set_state(self._connections_input, "disabled" if busy else "normal")
         chosen = len(self._checked_entries())
         ready = not busy and bool(self._output_dir) and chosen > 0

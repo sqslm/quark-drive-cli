@@ -76,7 +76,7 @@ class Progress:
         self._samples.append((now, transferred))
         while len(self._samples) > 2 and self._samples[1][0] <= now - 5:
             self._samples.popleft()
-        elapsed = now - self._samples[0][0]
+        elapsed = min(5.0, now - self._samples[0][0])
         event = ProgressEvent(self.direction, phase, self.name, self.transferred, self.confirmed, self.total,
                               (transferred - self._samples[0][1]) / elapsed if elapsed > 0 else 0.0,
                               self.confirmed_parts, self.connections)
