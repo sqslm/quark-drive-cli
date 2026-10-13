@@ -87,6 +87,7 @@ from ..errors import LocalIOError, QuarkError, UsageError
 from ..transfer import DEFAULT_DOWNLOAD_CONNECTIONS, MAX_DOWNLOAD_CONNECTIONS
 from ..potplayer.login_gui import QrLoginWindow
 from ..shares import parse_share_url as parse_share_link
+from ..state import config_directory
 from .core import (
     DOWNLOAD_ACTION,
     ROOT_FID,
@@ -106,6 +107,7 @@ from .core import (
     output_folder,
 )
 from .share import ShareSource
+from .preferences import Preferences, load_preferences, save_preferences
 
 from .worker import (
     SHARE_BROWSE_ACTION,
@@ -272,6 +274,7 @@ class DownloaderWindow:
         root_factory: Callable[[], Any] | None = None,
         transport: Any = None,
         folder_opener: Callable[[str], None] | None = None,
+        preferences_path: Path | None = None,
     ) -> None:
         self._cookie = get_cookie if cookie is None else cookie
         factory = backend_factory or (lambda loader: DriveBackend(loader, transport=transport))
@@ -279,6 +282,10 @@ class DownloaderWindow:
         self._login_window_factory = login_window_factory or default_login_window
         self._root_factory = root_factory
         self._folder_opener = folder_opener or default_folder_opener
+        self._preferences_path = preferences_path
+        self._preferences = Preferences()
+        self._preferences_save_allowed = False
+        self._preferences_warning = ""
         self._location = Location()
         # The share view: ``None`` means the table follows the account drive.
         # The share's own folder chain is kept apart from ``_location``, because
@@ -380,6 +387,7 @@ class DownloaderWindow:
         try:
             try:
                 self._root = (self._root_factory or tk.Tk)()
+                self._load_preferences()
                 self._build(tk)
             except tk.TclError:
                 raise LocalIOError("无法创建下载窗口，请检查桌面环境") from None
@@ -401,13 +409,69 @@ class DownloaderWindow:
         if self._downloading:
             self._set_status(STOPPING_STATUS if self._stop_requested else CLOSE_BUSY_STATUS)
             return
+        if not self._save_preferences():
+            import tkinter.messagebox as messagebox
+
+            messagebox.showwarning("下载器设置", self._preferences_warning + "\n本次设置未保存。", parent=self._root)
         self._shutdown()
+
+    def _load_preferences(self) -> None:
+        try:
+            if self._preferences_path is None:
+                self._preferences_path = config_directory() / "downloader" / "preferences.json"
+            self._preferences = load_preferences(self._preferences_path)
+            self._preferences_save_allowed = True
+            if self._preferences.output_dir:
+                if Path(self._preferences.output_dir).is_dir():
+                    self._output_dir = self._preferences.output_dir
+                else:
+                    self._preferences_warning = "记住的保存目录已不可用，请重新选择"
+        except (QuarkError, OSError) as error:
+            self._preferences = Preferences()
+            self._preferences_save_allowed = False
+            self._preferences_warning = describe_error(error, "读取下载器设置") + "；使用默认设置，原设置未改写"
+
+    def _save_preferences(self, *, connections: int | None = None) -> bool:
+        if not self._preferences_save_allowed or self._preferences_path is None:
+            return True
+        if connections is None:
+            try:
+                connections = self._download_connections()
+            except UsageError:
+                # A half-edited spinbox must not replace the last valid value.
+                connections = self._preferences.connections
+        width, height = self._preferences.width, self._preferences.height
+        if self._root is not None and self._root.winfo_width() > 1:
+            width, height = self._root.winfo_width(), self._root.winfo_height()
+        preferences = Preferences(self._output_dir, connections, width, height)
+        try:
+            save_preferences(self._preferences_path, preferences)
+        except (QuarkError, OSError) as error:
+            self._preferences_warning = describe_error(error, "保存下载器设置")
+            self._append_log(self._preferences_warning)
+            self._set_status(self._preferences_warning)
+            return False
+        self._preferences = preferences
+        return True
+
+    def _remember_connections(self, *_event: Any) -> None:
+        if self._frozen():
+            return
+        try:
+            connections = self._download_connections()
+        except UsageError as error:
+            self._set_status(str(error))
+            return
+        self._save_preferences(connections=connections)
 
     def _build(self, tk: Any) -> None:
         root = self._root
         root.title(WINDOW_TITLE)
-        root.geometry("860x620")
-        root.minsize(760, 540)
+        screen_width = root.winfo_screenwidth()
+        screen_height = max(1, root.winfo_screenheight() - 80)
+        root.geometry(f"{min(max(760, self._preferences.width), screen_width)}x"
+                      f"{min(max(540, self._preferences.height), screen_height)}")
+        root.minsize(min(760, screen_width), min(540, screen_height))
         ttk = tk.ttk
 
         toolbar = ttk.Frame(root)
@@ -527,15 +591,18 @@ class DownloaderWindow:
         self._output_button = ttk.Button(destination, text="更改", width=6, command=self.choose_output)
         self._output_button.pack(side="right", padx=(0, 4))
         ttk.Label(destination, text="保存到").pack(side="left", padx=(0, 6))
-        self._output_var = tk.StringVar(value="未选择本地保存目录")
+        self._output_var = tk.StringVar(value=display_text(self._output_dir) or "未选择本地保存目录")
         ttk.Label(destination, textvariable=self._output_var, anchor="w").pack(side="left", fill="x", expand=True)
         actions = ttk.Frame(root)
         actions.pack(fill="x", padx=12, pady=(0, 6))
         ttk.Label(actions, text="线程数").pack(side="left", padx=(0, 4))
-        self._connections_var = tk.StringVar(value=str(DEFAULT_DOWNLOAD_CONNECTIONS))
+        self._connections_var = tk.StringVar(value=str(self._preferences.connections))
         self._connections_input = ttk.Spinbox(actions, from_=1, to=MAX_DOWNLOAD_CONNECTIONS,
-                                               width=3, textvariable=self._connections_var)
+                                               width=3, textvariable=self._connections_var,
+                                               command=self._remember_connections)
         self._connections_input.pack(side="left")
+        self._connections_input.bind("<FocusOut>", self._remember_connections)
+        self._connections_input.bind("<Return>", self._remember_connections)
         self._download_button = ttk.Button(actions, text=DOWNLOAD_BUTTON_TEXT, width=12, command=self.start_download)
         self._download_button.pack(side="right")
         self._stop_button = ttk.Button(actions, text="停止", width=8, command=self.stop_download, state="disabled")
@@ -552,6 +619,9 @@ class DownloaderWindow:
             self._open(ROOT_FID)
         else:
             self._set_status(LOGIN_HINT)
+        if self._preferences_warning:
+            self._append_log(self._preferences_warning)
+            self._set_status(self._preferences_warning)
 
     def _shutdown(self) -> None:
         """Release the Tk objects on the thread that created them, bounded.
@@ -611,6 +681,7 @@ class DownloaderWindow:
         self._open_folder_button = None
         self._download_button = None
         self._stop_button = None
+        self._preferences_save_allowed = False
         self._worker.stop()
 
     # -- event loop ------------------------------------------------------
@@ -919,6 +990,7 @@ class DownloaderWindow:
             return
         self._output_dir = chosen
         self._output_var.set(display_text(chosen))
+        self._save_preferences()
         self._sync_controls()
 
     def open_output_folder(self) -> None:
@@ -1008,6 +1080,7 @@ class DownloaderWindow:
         self._begin_batch(task_ids, connections)
 
     def _begin_batch(self, task_ids: list[int], connections: int) -> None:
+        self._save_preferences(connections=connections)
         self._active_task_ids = task_ids
         self._batch = Batch(self._task_output_dir, (self._tasks[index].entry for index in task_ids))
         self._batch_connections = connections

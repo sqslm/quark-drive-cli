@@ -407,6 +407,15 @@ class _ShareBackend(_Backend):
 
 @unittest.skipUnless(_TK, "Tkinter with a display is required")
 class ShareWindowSmokeTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environment = patch.dict("os.environ", {"QUARK_CONFIG_DIR": directory.name})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_the_real_window_imports_a_share_walks_it_and_returns_to_the_drive(self):
         root = _tk_root()
         window = DownloaderWindow(

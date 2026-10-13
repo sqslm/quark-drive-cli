@@ -1663,6 +1663,15 @@ class LoginTests(WindowCase):
 
 @unittest.skipUnless(_TK, "Tkinter with a display is required")
 class WindowSmokeTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environment = patch.dict("os.environ", {"QUARK_CONFIG_DIR": directory.name})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_handled_login_errors_release_tk_before_background_collection(self):
         import subprocess
         import sys
