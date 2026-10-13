@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import stat
 import tempfile
 import unicodedata
@@ -50,11 +49,14 @@ def _safe_path(path: Path) -> None:
             raise UsageError("目录传输拒绝符号链接、junction 和重解析点")
 
 
-def _hashes(path: Path) -> dict[str, str]:
+def _hashes(path: Path, should_stop=None) -> dict[str, str]:
     digests = {name: hashlib.new(name) for name in ("sha256", "md5", "sha1")}
     try:
         with path.open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
+                if should_stop is not None and should_stop():
+                    from .transfer import UploadStopped
+                    raise UploadStopped("已暂停目录上传，可继续")
                 for digest in digests.values():
                     digest.update(block)
     except OSError:
@@ -62,7 +64,7 @@ def _hashes(path: Path) -> dict[str, str]:
     return {name: digest.hexdigest() for name, digest in digests.items()}
 
 
-def _local_tree(source: Path) -> tuple[Path, list[dict[str, Any]]]:
+def _local_tree(source: Path, should_stop=None) -> tuple[Path, list[dict[str, Any]]]:
     source = source.absolute()
     _safe_path(source)
     if not source.is_dir():
@@ -70,6 +72,9 @@ def _local_tree(source: Path) -> tuple[Path, list[dict[str, Any]]]:
     local_name(source.name)
     nodes, stack = [], [(source, "", 0)]
     while stack:
+        if should_stop is not None and should_stop():
+            from .transfer import UploadStopped
+            raise UploadStopped("已暂停目录上传，可继续")
         path, relative, depth = stack.pop()
         if depth > 1024 or len(nodes) >= 100000:
             raise UsageError("本地目录树超过安全上限")
@@ -84,7 +89,7 @@ def _local_tree(source: Path) -> tuple[Path, list[dict[str, Any]]]:
             elif stat.S_ISREG(metadata.st_mode):
                 if metadata.st_size == 0:
                     raise UsageError("夸克网页版不支持零字节上传；空目录可以递归传输")
-                identity = {"size": metadata.st_size, "mtime_ns": metadata.st_mtime_ns, "device": metadata.st_dev, "inode": metadata.st_ino, **_hashes(path)}
+                identity = {"size": metadata.st_size, "mtime_ns": metadata.st_mtime_ns, "device": metadata.st_dev, "inode": metadata.st_ino, **_hashes(path, should_stop)}
                 if any(identity[key] < 0 for key in ("size", "mtime_ns", "device", "inode")):
                     raise UsageError("本地文件身份字段不支持安全续传")
                 after = path.lstat()
@@ -359,10 +364,18 @@ class RecursiveTransfer:
                     raise UsageError("完成目标被同名新 FID 替换")
         return planned
 
-    def upload_tree(self, source, parent="0", *, resume=False, dry_run=False, limit_rate=None, progress=None, scope=None):
+    def upload_tree(self, source, parent="0", *, resume=False, dry_run=False, limit_rate=None, progress=None, scope=None,
+                    should_stop=None):
         from .transfer_progress import RateLimiter
+        from .transfer import UploadStopped
+        if should_stop is not None and not resume:
+            raise UsageError("可暂停目录上传必须启用续传")
+        def check_stop():
+            if should_stop is not None and should_stop():
+                raise UploadStopped("已暂停目录上传，已确认状态保留，可继续")
+        check_stop()
         limiter = RateLimiter(limit_rate)
-        source, nodes = _local_tree(Path(source))
+        source, nodes = _local_tree(Path(source), should_stop)
         parent = self.paths.resolve(parent, directory=True).fid
         directory, state_path, lock_name = self._state("upload", str(source), parent, source.name)
         total = sum(node.get("identity", {}).get("size", 0) for node in nodes)
@@ -425,6 +438,7 @@ class RecursiveTransfer:
             done, saved = sum(node["identity"]["size"] for node in nodes if node["path"] in document["files"]), 0
             for node in nodes:
                 relative = node["path"]
+                check_stop()
                 parent_relative = relative.rsplit("/", 1)[0] if "/" in relative else ""
                 container = parent if not relative else document["directories"][parent_relative]["fid"]
                 name = source.name if not relative else relative.rsplit("/", 1)[-1]
@@ -453,12 +467,13 @@ class RecursiveTransfer:
                     document["directories"][relative], document["pending"] = binding, None
                     write_json(state_path, document)
                 elif relative not in document["files"]:
-                    if _local_tree(source)[1] != nodes:
+                    if _local_tree(source, should_stop)[1] != nodes:
                         raise UsageError("上传固定树在执行期间发生变化")
                     document["pending"] = {"kind": "upload", "path": relative, "parent": container, "name": name, "fid": None, "before": []}
                     write_json(state_path, document)
                     result = self.transfer.upload(source / relative, container, resume=resume, remote_name=name, limiter=limiter,
-                                                  progress=self._progress(progress, relative, done, total), scope=boundaries if boundaries.scopes else None)
+                                                  progress=self._progress(progress, relative, done, total), scope=boundaries if boundaries.scopes else None,
+                                                  **({"should_stop": should_stop} if should_stop is not None else {}))
                     fid = valid_fid(result.get("fid"))
                     identity = _remote_identity(self.paths.ancestry(fid)[0].item or {})
                     if identity["parent"] != container or identity["name"] != name or identity["size"] != node["identity"]["size"]:

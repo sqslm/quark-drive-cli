@@ -11,6 +11,7 @@ const bridge: Bridge = {
     return () => ipcRenderer.removeListener('quark:event', handler);
   },
   chooseFolder: () => ipcRenderer.invoke('quark:choose-folder'),
+  chooseFiles: () => ipcRenderer.invoke('quark:choose-files'),
   openFolder: (path) => ipcRenderer.invoke('quark:open-folder', path),
   copyText: (text) => ipcRenderer.invoke('quark:copy-text', text),
 };

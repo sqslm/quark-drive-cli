@@ -13,6 +13,8 @@ let window: BrowserWindow;
 let backend: ChildProcessWithoutNullStreams;
 const pending = new Map<string, { resolve: (data: unknown) => void; reject: (error: Error) => void }>();
 let stopping = false;
+if (!app.requestSingleInstanceLock()) app.exit(0);
+app.on('second-instance', () => { if (window && !window.isDestroyed()) { window.restore(); window.focus(); } });
 function failPending(message: string) {
   for (const job of pending.values()) job.reject(new Error(message));
   pending.clear();
@@ -79,6 +81,11 @@ app.whenReady().then(async () => {
     trusted(event);
     if (typeof folder !== 'string' || !path.isAbsolute(folder) || !(await stat(folder)).isDirectory()) throw new Error('保存目录不存在');
     const error = await shell.openPath(folder); if (error) throw new Error('无法打开保存目录');
+  });
+  ipcMain.handle('quark:choose-files', async event => {
+    trusted(event);
+    const result = await dialog.showOpenDialog(window, { properties: ['openFile', 'multiSelections'] });
+    return result.canceled ? [] : result.filePaths;
   });
   startBackend();
   ipcMain.handle('quark:copy-text', (event, text: string) => {

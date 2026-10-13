@@ -20,17 +20,18 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     const page = await browser.newPage({ viewport: { width: 1180, height: 780 } });
     const errors = []; page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(() => {
-      const listeners = new Set(); let cancelled = false;
+      const listeners = new Set(); let cancelled = false; let tasks = [];
       const rows = Array.from({ length: 10000 }, (_, index) => ({ fid: String(index), name: `知否 ${String(index).padStart(5,'0')}.txt`, directory: false, size: index + 1, path: '', location: [] }));
       const preferences = { output_dir: 'C:\\Downloads', connections: 4, limit_rate: null, width: 1180, height: 780 };
       window.testCalls = [];
       window.quark = {
         onEvent: callback => { listeners.add(callback); return () => listeners.delete(callback); },
-        chooseFolder: async () => 'C:\\Downloads', openFolder: async () => {}, copyText:async text => { window.testCalls.push({method:'clipboard',params:{text}}); },
+        chooseFolder: async () => 'C:\\Downloads', chooseFiles:async () => ['C:\\Uploads\\测试.txt'], openFolder: async () => {}, copyText:async text => { window.testCalls.push({method:'clipboard',params:{text}}); },
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
           if(method === 'hello') return { protocol: 1, preferences };
           if(method === 'account') return { nickname: '测试账号' };
+          if(method === 'tasks') return tasks.map(task => ({...task}));
           if(method === 'browse') return rows.map(row => ({...row}));
           if(method === 'file.mkdir') { rows.push({fid:'new',name:params.name,directory:true,size:null,path:'',location:[]}); return {fid:'new'}; }
           if(method === 'file.rename') { const row = rows.find(row => row.fid === params.entries[0].fid); row.name = params.name; return [{ name:row.name,state:'done',detail:'操作完成'}]; }
@@ -46,7 +47,10 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
           if(method === 'share.parse') return { url:'https://pan.quark.cn/s/abcdef', passcode:'1234' };
           if(method === 'share.open') return { handle:'share', entries:rows.slice(0,2) };
           if(method === 'preferences.save') return { preferences:params, persisted:true, warning:'' };
-          if(method === 'download') return [{ id:'task', name: params.entries[0].name, state:'waiting', detail:'', target:'C:\\Downloads\\test.txt', valid:true }];
+          if(method === 'download') { tasks.push({ id:'task', name: params.entries[0].name, state:'waiting', detail:'', target:'C:\\Downloads\\test.txt', valid:true,direction:'download',revision:1 }); return tasks.map(task => ({...task})); }
+          if(method === 'upload') { tasks.push({ id:'upload-task',name:'测试.txt',state:'waiting',detail:'',target:'/测试.txt',valid:true,direction:'upload',revision:1 }); return tasks.map(task => ({...task})); }
+          if(method === 'tasks.cancel') { tasks = tasks.map(task => params.ids.includes(task.id) ? {...task,state:'cancelled',revision:task.revision+1} : task); return tasks.map(task => ({...task})); }
+          if(method === 'download.stop') { tasks = tasks.map(task => task.state === 'cancelled' ? task : {...task,state:'stopped',revision:task.revision+1}); tasks.forEach(task => listeners.forEach(callback => callback({id:null,event:'task',data:task}))); listeners.forEach(callback => callback({id:null,event:'batch.finished',data:{stopped:true}})); return true; }
           if(method === 'login') throw new Error('登录服务暂时不可用');
           return [];
         }
@@ -73,6 +77,16 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('heading', { name:'传输任务' }).waitFor();
     const downloaded = await page.evaluate(() => window.testCalls.find(call => call.method === 'download').params.entries);
     assert.equal(downloaded.length, 1); assert.equal(downloaded[0].fid, '0');
+    await page.getByRole('button', {name:'我的文件',exact:true}).click();
+    await page.getByRole('button', {name:'上传文件',exact:true}).click();
+    await page.getByRole('heading', {name:'传输任务'}).waitFor();
+    await page.getByText('测试.txt',{exact:true}).waitFor();
+    const uploaded = await page.evaluate(() => window.testCalls.find(call => call.method === 'upload'));
+    assert.equal(uploaded.params.parent,'0'); assert.deepEqual(uploaded.params.sources,['C:\\Uploads\\测试.txt']);
+    await page.locator('.task-row').filter({hasText:'测试.txt'}).getByRole('button',{name:'取消',exact:true}).click();
+    await page.getByText('已取消',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'暂停全部',exact:true}).click();
+    await page.getByText('已暂停',{exact:true}).waitFor();
     await page.getByRole('button', { name:'分享链接', exact:true }).click();
     await page.getByLabel('分享链接或文案').fill('https://pan.quark.cn/s/abcdef 提取码 1234');
     await page.getByLabel('提取码', { exact:true }).click();
@@ -89,7 +103,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
 test('packaged Electron starts its bundled backend with sandbox and no external Python', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'quark-electron-test-'));
   const executable = path.resolve(__dirname, '../out/Quark Drive Client-win32-x64/QuarkDriveClient.exe');
-  const app = await _electron.launch({ executablePath: executable, env:{ ...process.env,
+  const app = await _electron.launch({ executablePath: executable, args:['--user-data-dir=' + path.join(directory,'electron')], env:{ ...process.env,
     QUARK_CONFIG_DIR: directory, QUARK_COOKIE:'', QUARK_COOKIE_FILE:'', QUARK_DESKTOP_PYTHON:'Z:\\no-python.exe' } });
   try {
     const page = await app.firstWindow();

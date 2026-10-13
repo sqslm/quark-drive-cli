@@ -68,6 +68,12 @@ class DownloadStopped(QuarkError):
         self.resume_available = resume_available
 
 
+class UploadStopped(DownloadStopped):
+    """An upload paused at a known, persisted protocol state."""
+
+    label = "upload_stopped"
+
+
 def _data(payload: Mapping[str, Any], operation: str) -> Any:
     if "data" not in payload:
         raise RemoteError(f"{operation}响应缺少 data 字段")
@@ -318,7 +324,7 @@ class Transfer:
         RemotePaths(Files(self.client)).resolve(fid, directory=True)
         self._scope(fid, scope, saved, write=True)
 
-    def _fingerprint(self, path: Path) -> dict[str, Any]:
+    def _fingerprint(self, path: Path, should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
         try:
             path = safe_local_path(path)
             before = path.stat()
@@ -330,6 +336,8 @@ class Transfer:
                 if (os.fstat(source.fileno()).st_dev, os.fstat(source.fileno()).st_ino) != (before.st_dev, before.st_ino):
                     raise LocalIOError("上传源文件已被替换")
                 while block := source.read(STREAM_CHUNK_SIZE):
+                    if should_stop is not None and should_stop():
+                        raise UploadStopped("已暂停上传，可继续")
                     count += len(block)
                     for digest in hashes:
                         digest.update(block)
@@ -462,14 +470,21 @@ class Transfer:
 
     def upload(self, source: str | Path, parent: str = "0", *, resume: bool = False, limit_rate: int | None = None,
                progress: Callable[[ProgressEvent], None] | None = None, scope: Scope | None = None,
-               remote_name: str | None = None, limiter: RateLimiter | None = None) -> dict[str, Any]:
+               remote_name: str | None = None, limiter: RateLimiter | None = None,
+               should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
+        if should_stop is not None and not resume:
+            raise UsageError("可暂停上传必须启用续传")
+        def check_stop():
+            if should_stop is not None and should_stop():
+                raise UploadStopped("已暂停上传，已确认状态保留，可继续")
+        check_stop()
         path = safe_local_path(source)
         name = safe_transfer_name(path.name if remote_name is None else remote_name)
         parent = valid_fid(parent)
         pacing = _limiter(limit_rate, limiter)
         ledger = UploadLedger({"source": str(path), "parent": parent, "name": name}, directory=self.state_dir)
         with ledger.lock:
-            local = self._fingerprint(path)
+            local = self._fingerprint(path, should_stop=should_stop) if should_stop is not None else self._fingerprint(path)
             if local["size"] == 0:
                 raise UsageError("夸克不支持上传空文件")
             data = ledger.load()
@@ -558,6 +573,7 @@ class Transfer:
                 data["phase"] = "pre_confirmed"
                 ledger.persist(data)
             upload = data["upload"]
+            check_stop()
             task_id, part_count = upload["task_id"], upload["part_count"]
             if data["phase"] == "pre_confirmed":
                 self._parent(parent, scope, data["scope_fid"])
@@ -595,6 +611,7 @@ class Transfer:
                 meter.emit("resuming" if resumed else "starting", force=True)
                 contexts = _part_contexts(path, local["size"], upload["part_size"], part_count) if part_count > 1 else {}
                 for part in data["parts"]:
+                    check_stop()
                     if part["confirmed"]:
                         continue
                     self._parent(parent, scope, data["scope_fid"])
@@ -607,8 +624,10 @@ class Transfer:
                     def blocks() -> Iterator[bytes]:
                         for block in _stream_file(path, part["offset"], part["length"]):
                             for start in range(0, len(block), pacing.chunk_size):
+                                check_stop()
                                 chunk = block[start:start + pacing.chunk_size]
                                 pacing.consume(len(chunk))
+                                check_stop()
                                 meter.transferred += len(chunk)
                                 meter.emit("transferring")
                                 yield chunk
@@ -623,6 +642,7 @@ class Transfer:
                     meter.confirmed = confirmed_before + part["length"]
                     meter.confirmed_parts += 1
                     meter.emit("part_confirmed", force=True)
+                check_stop()
                 if self._fingerprint(path) != local:
                     raise LocalIOError("上传期间本地文件发生变化；未合并")
                 root = ET.Element("CompleteMultipartUpload")
@@ -641,6 +661,7 @@ class Transfer:
                 data["phase"] = "merge_confirmed"
                 ledger.persist(data)
             if data["phase"] == "merge_confirmed":
+                check_stop()
                 if self._fingerprint(path) != local:
                     raise LocalIOError("上传源文件发生变化；未确认完成")
                 self._parent(parent, scope, data["scope_fid"])

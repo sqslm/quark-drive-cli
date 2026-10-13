@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import sys
 import threading
@@ -11,10 +12,14 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Callable
 
-from ..auth import QRLogin, get_cookie, load_saved_cookie
+from ..auth import QRLogin, LoginCancelled, get_cookie, load_saved_cookie
 from ..errors import QuarkError, UsageError
 from ..state import config_directory
-from ..transfer import DownloadStopped
+from ..transfer import DownloadStopped, Transfer
+from ..recursive import RecursiveTransfer
+from ..paths import RemotePaths, valid_fid
+from ..files import Files
+from ..shares import parse_share_url
 from ..downloader.core import Entry, EXTENSION_GROUPS, describe_error, download_plan, progress_text, summary_text
 from ..downloader.preferences import Preferences, _validated, load_preferences, save_preferences
 from ..downloader.share import ShareSource
@@ -22,6 +27,7 @@ from ..downloader.share_input import parse_share_input
 from ..downloader.search import SearchCancelled
 from ..downloader.worker import Download, DriveBackend, Search
 from .file_operations import FileOperations
+from .tasks import TaskStore, Upload
 
 
 class DesktopService:
@@ -38,7 +44,13 @@ class DesktopService:
         self.search_cancel = threading.Event()
         self.login_cancel = threading.Event()
         self.stop = threading.Event()
-        self.tasks: list[dict] = []
+        self.task_store = TaskStore(self.directory / "tasks.json")
+        self.tasks: list[dict] = self.task_store.load()
+        for task in self.tasks:
+            task["valid"] = False
+            task["_cancel"] = threading.Event()
+        self.pending_count = 0
+        self.active_id = None
         self.sources: dict[str, ShareSource] = {}
         self.busy = False
         self.logging_in = False
@@ -104,6 +116,8 @@ class DesktopService:
             self.send({"id": identifier, "result": result})
         except SearchCancelled:
             self.send({"id": identifier, "result": {"cancelled": True}})
+        except LoginCancelled:
+            self.send({"id": identifier, "result": {"cancelled": True}})
         except Exception as error:
             self.send({"id": identifier, "error": describe_error(error, "操作")})
         finally:
@@ -115,9 +129,10 @@ class DesktopService:
         if method.startswith("file."):
             if p.get("handle"):
                 raise UsageError("分享文件只读，不能修改")
-            with self.writes, self.lock:
-                if (self.busy or self.logging_in) and method != "file.info":
-                    raise UsageError("请先停止传输再修改网盘文件")
+            with self.writes:
+                with self.lock:
+                    if (self.busy or self.logging_in) and method != "file.info":
+                        raise UsageError("请先停止传输再修改网盘文件")
                 with self.backend._client() as client:
                     operations = FileOperations(client)
                     if method == "file.info":
@@ -127,7 +142,7 @@ class DesktopService:
                     return operations.apply(method[5:], p["entries"], name=p.get("name"), target=p.get("target"))
         if method == "hello":
             return {"protocol": 1, "preferences": asdict(self.current_preferences()), "extension_groups": EXTENSION_GROUPS,
-                    "warning": self.preferences_warning}
+                    "warning": "; ".join(value for value in (self.preferences_warning, self.task_store.warning) if value)}
         if method == "account":
             return {"nickname": self.backend.account_nickname()}
         if method == "browse":
@@ -185,12 +200,79 @@ class DesktopService:
             except Exception:
                 nickname = "昵称暂不可用"
             return {"nickname": nickname}
+        if method == "upload":
+            with self.lock:
+                if self.logging_in or (self.busy and self.stop.is_set()):
+                    raise UsageError("请等待登录或停止操作结束")
+            context = self.context()
+            preferences = self.current_preferences()
+            sources = [Path(value).absolute() for value in p["sources"]]
+            parent = str(p.get("parent", "0"))
+            tasks = []
+            with self.backend._client() as client:
+                paths = RemotePaths(Files(client))
+                parent = paths.resolve(parent, directory=True).fid
+                target = paths.absolute_path(parent).rstrip("/")
+                for source in sources:
+                    if not source.exists():
+                        raise UsageError("上传来源不存在")
+                    request = Upload(str(source), valid_fid(parent), source.is_dir(), source.name, preferences.limit_rate)
+                    # New directory uploads never merge into an unrelated existing folder.
+                    if request.recursive:
+                        transfer = RecursiveTransfer(client)
+                        _, state_path, _ = transfer._state("upload", str(source), parent, source.name)
+                        if not state_path.exists():
+                            FileOperations(client).available(parent, source.name)
+                    tasks.append({"id":uuid.uuid4().hex,"name":source.name,"state":"waiting","detail":"",
+                        "target":target + "/" + source.name,"request":request,"valid":True,"revision":0,
+                        "context":context,"direction":"upload","_cancel":threading.Event(),"share_url":""})
+            with self.lock:
+                if self.logging_in or (self.busy and self.stop.is_set()) or context != self.context():
+                    raise UsageError("登录或队列状态已经变化，请重新提交")
+                self.tasks.extend(tasks)
+                self.start_tasks(tasks)
+                return [self.public_task(task) for task in self.tasks]
         if method == "tasks":
+            self.refresh_task_context()
             return [self.public_task(task) for task in self.tasks]
-        if method == "download":
+        if method == "tasks.cancel":
+            with self.lock:
+                for task in self.tasks:
+                    if task["id"] in p.get("ids", []) and task["state"] not in ("done", "cancelled"):
+                        task["_cancel"].set()
+                        if task["id"] != self.active_id:
+                            task["state"] = "cancelled"
+                            task["revision"] += 1
+                            self.event(None, "task", self.public_task(task))
+                self.persist_tasks()
+                return [self.public_task(task) for task in self.tasks]
+        if method == "tasks.clear":
+            with self.lock:
+                if self.busy:
+                    raise UsageError("请在本批次结束后清理记录")
+                self.tasks = [task for task in self.tasks if task["state"] not in ("done", "cancelled")]
+                self.persist_tasks()
+                return [self.public_task(task) for task in self.tasks]
+        if method == "tasks.authorize":
             with self.lock:
                 if self.busy or self.logging_in:
-                    raise UsageError("传输正在进行，请先停止")
+                    raise UsageError("请在传输和登录结束后重新授权")
+                source = self.sources[p["handle"]]
+                self.verify_context()
+                for task in self.tasks:
+                    if task["id"] in p["ids"]:
+                        if task["context"] != self.context() or not task["share_url"]:
+                            raise UsageError("登录上下文不同，请在当前账号重新选择下载")
+                        if parse_share_url(source.url).pwd_id != parse_share_url(task["share_url"]).pwd_id:
+                            raise UsageError("重新授权的分享链接与原任务不一致")
+                        task["request"] = replace(task["request"], share_source=source)
+                        task["valid"] = True
+                        task["revision"] += 1
+                return [self.public_task(task) for task in self.tasks]
+        if method == "download":
+            with self.lock:
+                if self.logging_in or (self.busy and self.stop.is_set()):
+                    raise UsageError("请等待登录或停止操作结束")
                 entries = [self.entry(row) for row in p["entries"]]
                 if not entries:
                     raise UsageError("请先勾选文件或目录")
@@ -202,19 +284,23 @@ class DesktopService:
                     request = Download(entry.fid, str(plan.target), plan.recursive, False, entry.name,
                         source, str(p.get("path", "/")), preferences.connections, preferences.limit_rate)
                     tasks.append({"id": uuid.uuid4().hex, "name": entry.name, "state": "waiting", "detail": "",
-                        "target": str(plan.target), "request": request, "valid": True, "revision": 0})
-                self.tasks = tasks
+                        "target": str(plan.target), "request": request, "valid": True, "revision": 0,
+                        "context": self.context(), "direction": "download", "_cancel": threading.Event(),
+                        "share_url": f"https://pan.quark.cn/s/{parse_share_url(source.url).pwd_id}" if source else ""})
+                self.tasks.extend(tasks)
                 self.start_tasks(tasks)
-                return [self.public_task(task) for task in tasks]
+                return [self.public_task(task) for task in self.tasks]
         if method == "tasks.retry":
             with self.lock:
                 if self.busy or self.logging_in:
                     raise UsageError("传输正在进行")
+                self.verify_context()
+                self.refresh_task_context()
                 tasks = [task for task in self.tasks if task["valid"] and task["state"] in ("failed", "stopped", "waiting")
                          and (not p.get("ids") or task["id"] in p["ids"])]
                 preferences = self.current_preferences()
                 for task in tasks:
-                    task["request"] = replace(task["request"], connections=preferences.connections, limit_rate=preferences.limit_rate)
+                    task["request"] = replace(task["request"], **({"connections": preferences.connections} if task["direction"] == "download" else {}), limit_rate=preferences.limit_rate)
                 self.start_tasks(tasks)
                 return [self.public_task(task) for task in self.tasks]
         raise UsageError("不支持的请求")
@@ -224,45 +310,101 @@ class DesktopService:
         return Entry(str(row["fid"]), str(row["name"]), bool(row["directory"]), row.get("size"),
                      str(row.get("path", "")), tuple(tuple(item) for item in row.get("location", ())))
 
+    def context(self):
+        return hashlib.sha256(self.cookie().encode("utf-8")).hexdigest()
+
+    def verify_context(self):
+        with self.backend._client() as client:
+            client.auth_status()
+
+    def refresh_task_context(self):
+        try:
+            context = self.context()
+        except QuarkError:
+            context = None
+        for task in self.tasks:
+            task["valid"] = task["context"] == context and not (
+                task["share_url"] and task["request"].share_source is None)
+
     @staticmethod
     def public_task(task):
-        return {key: task[key] for key in ("id", "name", "state", "detail", "target", "valid", "revision")}
+        output = {key: task[key] for key in ("id", "name", "state", "detail", "target", "valid", "revision", "direction")}
+        output["needs_authorization"] = bool(task["state"] not in ("done", "cancelled") and task["share_url"] and task["request"].share_source is None)
+        output["share_url"] = task["share_url"]
+        output["local_dir"] = str(Path(task["request"].source).parent if task["direction"] == "upload" else
+            Path(task["target"]) if task["request"].recursive and task["state"] == "done" else Path(task["target"]).parent)
+        return output
+
+    def persist_tasks(self):
+        if not self.task_store.save(self.tasks):
+            self.event(None, "warning", self.task_store.warning)
 
     def start_tasks(self, tasks):
         if not tasks:
-            raise UsageError("没有可继续的任务")
+            raise UsageError("没有可继续的任务；分享任务需重新授权，登录不同请重新选择")
+        if not self.busy:
+            self.stop.clear()
         self.busy = True
-        self.stop.clear()
         for task in tasks:
             task["state"] = "waiting"
+            task["_cancel"].clear()
             task["revision"] += 1
-        self.transfers.submit(self.run_tasks, tasks)
+            self.pending_count += 1
+        self.persist_tasks()
+        for task in tasks:
+            self.transfers.submit(self.run_task, task)
 
-    def run_tasks(self, tasks):
+    def run_task(self, task):
         try:
-            for task in tasks:
-                if self.stop.is_set():
-                    break
+            with self.lock:
+                if task["_cancel"].is_set() or self.stop.is_set():
+                    task["state"] = "cancelled" if task["_cancel"].is_set() else "stopped"
+                    task["revision"] += 1
+                    self.persist_tasks()
+                    self.event(None, "task", self.public_task(task))
+                    return
+                self.active_id = task["id"]
                 task["state"] = "running"
                 task["revision"] += 1
+                self.persist_tasks()
                 self.event(None, "task", self.public_task(task))
-                def progress(event):
+            def stopped():
+                return self.stop.is_set() or task["_cancel"].is_set()
+            def progress(event):
+                with self.lock:
                     task["detail"] = progress_text(event)
                     task["revision"] += 1
                     self.event(None, "task", self.public_task(task))
-                try:
-                    result = self.backend.download(task["request"], progress, self.stop.is_set)
-                    task["state"], task["detail"] = "done", summary_text(result, task["name"])
-                except DownloadStopped as error:
-                    task["state"], task["detail"] = "stopped", str(error)
-                except Exception as error:
-                    task["state"], task["detail"] = "failed", describe_error(error, "下载")
+            try:
+                if task["context"] != self.context():
+                    raise UsageError("登录上下文已变化，请重新选择任务")
+                if task["direction"] == "upload":
+                    request = task["request"]
+                    with self.backend._client() as client:
+                        if request.recursive:
+                            result = RecursiveTransfer(client).upload_tree(request.source, request.parent, resume=True,
+                                limit_rate=request.limit_rate, progress=progress, should_stop=stopped)
+                        else:
+                            result = Transfer(client).upload(request.source, request.parent, resume=True,
+                                limit_rate=request.limit_rate, progress=progress, should_stop=stopped)
+                else:
+                    result = self.backend.download(task["request"], progress, stopped)
+                task["state"], task["detail"] = "done", summary_text({**result, "path": task["name"], "size": result.get("size", result.get("file_size"))}, task["name"]).replace("已下载", "已上传", 1) if task["direction"] == "upload" else summary_text(result, task["name"])
+            except DownloadStopped as error:
+                task["state"], task["detail"] = ("cancelled" if task["_cancel"].is_set() else "stopped"), str(error)
+            except Exception as error:
+                task["state"], task["detail"] = "failed", describe_error(error, "传输")
+            with self.lock:
                 task["revision"] += 1
+                self.persist_tasks()
                 self.event(None, "task", self.public_task(task))
         finally:
             with self.lock:
-                self.busy = False
-            self.event(None, "batch.finished", {"stopped": self.stop.is_set()})
+                self.active_id = None
+                self.pending_count -= 1
+                self.busy = self.pending_count > 0
+                if not self.busy:
+                    self.event(None, "batch.finished", {"stopped": self.stop.is_set()})
 
     def shutdown(self):
         self.closed = True
@@ -275,7 +417,8 @@ class DesktopService:
 
 METHODS = frozenset({"hello", "account", "browse", "search", "search.cancel", "locate", "share.parse",
     "share.open", "share.browse", "preferences.save", "login", "login.cancel", "download", "download.stop", "tasks", "tasks.retry",
-    "file.info", "file.mkdir", "file.rename", "file.move", "file.delete"})
+    "file.info", "file.mkdir", "file.rename", "file.move", "file.delete",
+    "upload", "tasks.cancel", "tasks.clear", "tasks.authorize"})
 
 
 def main():

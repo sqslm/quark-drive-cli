@@ -39,6 +39,7 @@ class DesktopTests(unittest.TestCase):
         self.messages = []
         self.backend = Backend()
         self.service = DesktopService(self.messages.append, backend=self.backend, directory=Path(self.tmp.name) / "state")
+        self.service.saved_cookie = "sid=test"
         self.addCleanup(self.service.shutdown)
     def wait_result(self, identifier):
         until = time.monotonic() + 3
