@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, net, protocol, shell } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, net, protocol, shell } from 'electron';
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -7,6 +7,7 @@ import { stat } from 'node:fs/promises';
 import { METHODS } from './types';
 import { randomUUID } from 'node:crypto';
 import { officialLogin } from './WebLogin';
+import { appearanceColors, loadAppearance, saveAppearance, validAppearance } from './Appearance';
 
 declare const MAIN_WINDOW_WEBPACK_ENTRY: string;
 declare const MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
@@ -16,6 +17,16 @@ let backend: ChildProcessWithoutNullStreams;
 const pending = new Map<string, { resolve: (data: unknown) => void; reject: (error: Error) => void }>();
 let stopping = false;
 let webLoginRunning = false;
+let appearanceWarning = '';
+let appearanceSaving = false;
+function appearance() {return {source:nativeTheme.themeSource,dark:nativeTheme.shouldUseDarkColors,warning:appearanceWarning};}
+function syncAppearance() {
+  if(!window || window.isDestroyed()) return;
+  const colors=appearanceColors(nativeTheme.shouldUseDarkColors);
+  window.setBackgroundColor(colors.background);
+  window.setTitleBarOverlay({color:colors.title,symbolColor:colors.symbol,height:34});
+  window.webContents.send('quark:event',{id:null,event:'appearance',data:appearance()});
+}
 if (!app.requestSingleInstanceLock()) app.exit(0);
 app.on('second-instance', () => { if (window && !window.isDestroyed()) { window.restore(); window.focus(); } });
 function failPending(message: string) {
@@ -57,6 +68,10 @@ function backendRequest(method:string,params:Record<string,unknown>={},id=random
   });
 }
 app.whenReady().then(async () => {
+  const savedAppearance=await loadAppearance();
+  appearanceWarning=savedAppearance.warning;
+  nativeTheme.themeSource=savedAppearance.source;
+  const colors=appearanceColors(nativeTheme.shouldUseDarkColors);
   if (app.isPackaged) {
     const root = path.dirname(path.dirname(fileURLToPath(MAIN_WINDOW_WEBPACK_ENTRY)));
     protocol.handle('quark', request => {
@@ -67,13 +82,27 @@ app.whenReady().then(async () => {
     });
   }
   window = new BrowserWindow({ width: 1180, height: 780, minWidth: 860, minHeight: 600,
-    title: '夸克网盘客户端', backgroundColor: '#ffffff', titleBarStyle:'hidden',
-    titleBarOverlay:{color:'#f6f8fc',symbolColor:'#35435c',height:34},
+    title: '夸克网盘客户端', backgroundColor: colors.background, titleBarStyle:'hidden',
+    titleBarOverlay:{color:colors.title,symbolColor:colors.symbol,height:34},
     webPreferences: { preload: MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY, contextIsolation: true, nodeIntegration: false, sandbox: true } });
   window.setMenuBarVisibility(false);
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', event => event.preventDefault());
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  nativeTheme.on('updated',syncAppearance);
+  ipcMain.handle('quark:appearance.get',event => {trusted(event);return appearance();});
+  ipcMain.handle('quark:appearance.set',async (event,source) => {
+    trusted(event);
+    if(!validAppearance(source)) throw new Error('外观选项无效');
+    if(appearanceSaving) throw new Error('正在保存外观，请稍后再试');
+    appearanceSaving=true;
+    nativeTheme.themeSource=source;
+    syncAppearance();
+    try {await saveAppearance(source);appearanceWarning='';}
+    catch {appearanceWarning='外观已切换，但未能保存；本次窗口内有效';}
+    finally {appearanceSaving=false;}
+    return appearance();
+  });
   ipcMain.handle('quark:call', (event, message) => {
     trusted(event);
     if (!message || typeof message.id !== 'string' || message.id.length > 128 || pending.has(message.id) || !METHODS.includes(message.method)) throw new Error('无效操作');

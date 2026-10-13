@@ -5,6 +5,8 @@ export type Task = { id: string; name: string; state: string; detail: string; ta
 export type Event = { id: string | null; event: string; data: unknown };
 export type Cut = {id:string;entries:Entry[];blocked:boolean};
 export type Favorite = {fid:string;name:string};
+export type AppearanceSource = 'system'|'dark'|'light';
+export type Appearance = {source:AppearanceSource;dark:boolean;warning:string};
 export const METHODS = ['hello','account','browse','locate','search','search.cancel','share.parse','share.open','share.browse',
   'preferences.save','login','login.cancel','download','download.stop','tasks','tasks.retry',
   'file.info','file.mkdir','file.rename','file.move','file.delete','upload','tasks.cancel','tasks.clear','tasks.authorize',
@@ -18,6 +20,8 @@ export interface Bridge {
   chooseFiles(): Promise<string[]>;
   openFolder(path: string): Promise<void>;
   copyText(text: string): Promise<void>;
+  getAppearance():Promise<Appearance>;
+  setAppearance(source:AppearanceSource):Promise<Appearance>;
   officialLogin(mode:'mobile'|'wechat'):Promise<{nickname?:string;logged_in?:boolean;cancelled?:boolean;warning?:string}>;
 }
 declare global { interface Window { quark: Bridge } }

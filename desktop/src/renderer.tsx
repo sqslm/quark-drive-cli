@@ -1,8 +1,9 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Entry, Event, Preferences, Task, Cut, Favorite } from './types';
+import { Entry, Event, Preferences, Task, Cut, Favorite, Appearance, AppearanceSource } from './types';
 import './style.css';
+import './theme.css';
 import { FileDialog, FileAction } from './FileDialog';
 import { TasksPanel } from './TasksPanel';
 import { CatalogPanel } from './CatalogPanel';
@@ -11,14 +12,42 @@ import { FeedbackProvider, useFeedback, Tone } from './Feedback';
 import { formatSize as units } from './size';
 
 function FileIcon({ folder }: { folder: boolean }) {
-  return <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-    {folder ? <path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3V7Z" fill="#fff0c6" stroke="#c49b37" strokeWidth="1.5" /> :
-      <><path d="M6 3h8l4 4v14H6V3Z" fill="#eef3ff" stroke="#8193ba" strokeWidth="1.5" /><path d="M14 3v5h4M9 12h6M9 16h6" stroke="#8193ba" strokeWidth="1.5" /></>}
+  return <svg className={folder ? 'folder-icon' : 'document-icon'} width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    {folder ? <path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3V7Z" fill="var(--folder-fill)" stroke="var(--folder-stroke)" strokeWidth="1.5" /> :
+      <><path d="M6 3h8l4 4v14H6V3Z" fill="var(--document-fill)" stroke="var(--document-stroke)" strokeWidth="1.5" /><path d="M14 3v5h4M9 12h6M9 16h6" stroke="var(--document-stroke)" strokeWidth="1.5" /></>}
   </svg>;
+}
+function NavigationIcon({name}:{name:string}) {
+  const paths:Record<string,string>={
+    drive:'M3 7h7l2 3h9v10H3V7Z M3 7V4h7l2 3',
+    share:'M10 14l4-4 M8 16l-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0 M16 8l1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0',
+    shares:'M8 12l8-5 M8 12l8 5 M7 12a2 2 0 1 1-4 0 2 2 0 0 1 4 0 M20 6a2 2 0 1 1-4 0 2 2 0 0 1 4 0 M20 18a2 2 0 1 1-4 0 2 2 0 0 1 4 0',
+    recycle:'M4 6h16 M9 3h6 M6 6l1 15h10l1-15 M10 10v7 M14 10v7',
+    tasks:'M7 3v14 M3 13l4 4 4-4 M17 21V7 M13 11l4-4 4 4',
+    settings:'M4 6h16 M4 12h16 M4 18h16 M8 3v6 M16 9v6 M10 15v6',
+    back:'M14 5l-7 7 7 7',
+    refresh:'M20 7v5h-5 M20 12a8 8 0 1 0-2 6',
+  };
+  return <svg className="ui-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name]}/></svg>;
 }
 function App() {
   const toast = useFeedback();
   const [page, setPage] = useState('drive');
+  const [appearanceSource,setAppearanceSource] = useState<AppearanceSource>('system');
+  const [appearanceSaving,setAppearanceSaving] = useState(false);
+  function acceptAppearance(next:Appearance) {
+    document.documentElement.dataset.theme=next.source;
+    document.documentElement.dataset.colorScheme=next.dark ? 'dark' : 'light';
+    setAppearanceSource(next.source);
+  }
+  async function changeAppearance(source:AppearanceSource) {
+    setAppearanceSaving(true);
+    try {
+      const next=await window.quark.setAppearance(source);acceptAppearance(next);
+      notify(next.warning || '外观已保存',next.warning ? 'warning' : 'success');
+    } catch(error) {notify(error instanceof Error ? error.message : '无法切换外观','error');}
+    finally {setAppearanceSaving(false);}
+  }
   const [nickname, setNickname] = useState('未登录');
   const [rows, setRows] = useState<Entry[]>([]);
   const [trail, setTrail] = useState<[string, string][]>([['0', '我的网盘']]);
@@ -197,8 +226,10 @@ function App() {
     if (saved) { setPreferences(saved.preferences); notify(saved.warning || '设置已保存',saved.warning ? 'warning' : 'success'); return true; } return false;
   }
   useEffect(() => {
+    void action(async () => {const next=await window.quark.getAppearance();acceptAppearance(next);if(next.warning) notify(next.warning,'warning');});
     const off = window.quark.onEvent((event: Event) => {
-      if (event.event === 'task') {
+      if(event.event === 'appearance') acceptAppearance(event.data as Appearance);
+      else if (event.event === 'task') {
         const task = event.data as Task;
         setTasks(old => old.some(row => row.id === task.id) ? old.map(row => row.id === task.id ? task : row) : [...old, task]);
       } else if (event.event === 'batch.finished') { setTransferring(false); notify('本批次已结束，请查看逐项结果'); }
@@ -353,7 +384,7 @@ function App() {
   return <><div className="titlebar"><span>夸克网盘客户端</span></div><div className="app" onKeyDown={shortcut}>
     <aside><div className="brand"><span className="brand-mark">Q</span><div>夸克网盘<small>桌面客户端</small></div></div>
       <nav aria-label="主导航">{[['drive','我的文件'],['share','分享链接'],['shares','我的分享'],['recycle','回收站'],['tasks','传输任务'],['settings','设置']].map(([key,label]) =>
-        <button key={key} className={page === key ? 'nav active' : 'nav'} onClick={() => { cancelSearch(); setPage(key); if(key === 'drive' && share) void browse([['0','我的网盘']]); }}>{label}{key === 'tasks' && tasks.length > 0 && <span>{tasks.length}</span>}</button>)}</nav>
+        <button key={key} className={page === key ? 'nav active' : 'nav'} aria-current={page === key ? 'page' : undefined} onClick={() => { cancelSearch(); setPage(key); if(key === 'drive' && share) void browse([['0','我的网盘']]); }}><NavigationIcon name={key}/>{label}{key === 'tasks' && tasks.length > 0 && <span>{tasks.length}</span>}</button>)}</nav>
       <section className="favorites" aria-label="常用文件夹"><h2>常用文件夹</h2>{!favorites.length && <p>右键目录可添加</p>}{favorites.map(row => <div key={row.fid}><button title={row.name} disabled={loading || loggingIn} onClick={() => void openFavorite(row.fid)}>{row.name}</button><button aria-label={`移除常用 ${row.name}`} disabled={favoriteBusy || loggingIn} onClick={() => void removeFavorite(row.fid)}>×</button></div>)}</section>
       <div className="account-area"><button className="account" aria-label="账号操作" aria-expanded={accountMenu} disabled={transferring || loggingIn} onClick={() => setAccountMenu(old => !old)}><span className="avatar">{nickname.slice(0,1)}</span><span className="account-name" title={nickname}>{nickname}<small>{signedIn ? '夸克网盘账号' : '点击登录账号'}</small></span><span>⌃</span></button>
         {accountMenu && <div className="account-popup" role="menu" aria-label="账号菜单"><button role="menuitem" onClick={() => {setAccountMenu(false);setLoginPicker(true);}}>{signedIn ? '切换账号' : '登录账号'}</button>{signedIn && <button role="menuitem" title="退出本客户端并移除共享的本地扫码凭证" onClick={() => void exitAccount()}>退出账号</button>}</div>}
@@ -361,12 +392,12 @@ function App() {
       <button className="login-button" disabled={transferring || loggingIn} onClick={() => setLoginPicker(true)}>{signedIn ? '切换账号' : '登录账号'}</button>
     </aside>
     <main><header><div><h1>{({drive: share ? '分享文件' : '我的文件', share:'分享链接',shares:'我的分享',recycle:'回收站',tasks:'传输任务',settings:'设置'} as Record<string,string>)[page]}</h1>
-      <p>{page === 'drive' ? `${rows.length} 项${searchView ? ' · 搜索结果' : ''}` : page === 'tasks' ? '下载进度与逐项结果' : page === 'share' ? '粘贴链接或完整分享文案' : '下载与本地保存偏好'}</p></div>
+      <p>{page === 'drive' ? `${rows.length} 项${searchView ? ' · 搜索结果' : ''}` : ({tasks:'下载进度与逐项结果',share:'粘贴链接或完整分享文案',shares:'管理已创建的分享链接',recycle:'恢复文件或清理已删除记录',settings:'按你的习惯，调整外观与传输偏好'} as Record<string,string>)[page]}</p></div>
       <span className="connection">{transferring ? '正在传输' : '就绪'}</span></header>
       {page === 'drive' && <>
         <div className="path-toolbar"><nav className="breadcrumbs" aria-label="文件路径">{(share ? [['/','分享文件'],...sharePath.split('/').filter(Boolean).map((name,index,parts) => ['/'+parts.slice(0,index+1).join('/'),name])] : trail).map(([fid,name],index,chain) => <React.Fragment key={fid}>{index > 0 && <span aria-hidden="true">/</span>}<button aria-current={index === chain.length-1 ? 'location' : undefined} disabled={loggingIn || !signedIn} onClick={() => void (share ? shareBrowse(fid) : browse(trail.slice(0,index+1)))}>{name}</button></React.Fragment>)}</nav>
-          <button className="icon-button" aria-label="返回上级" title="返回上级" disabled={!signedIn || loading || (!!share ? sharePath === '/' : trail.length === 1)} onClick={() => void (share ? shareUp() : browse(trail.slice(0,-1)))}>‹</button>
-          <button className="icon-button" aria-label="刷新" title="刷新" disabled={!signedIn || loading} onClick={() => void (share ? openShare() : searchView ? runSearch() : browse())}>↻</button>
+          <button className="icon-button" aria-label="返回上级" title="返回上级" disabled={!signedIn || loading || (!!share ? sharePath === '/' : trail.length === 1)} onClick={() => void (share ? shareUp() : browse(trail.slice(0,-1)))}><NavigationIcon name="back"/></button>
+          <button className="icon-button" aria-label="刷新" title="刷新" disabled={!signedIn || loading} onClick={() => void (share ? openShare() : searchView ? runSearch() : browse())}><NavigationIcon name="refresh"/></button>
         </div>
         <div className="toolbar file-toolbar">
           {!share && <><details className="upload-picker"><summary role="button" aria-label="上传" aria-disabled={!signedIn || loading || searching || loggingIn} onClick={event => {if(!signedIn || loading || searching || loggingIn) event.preventDefault();}}>＋ 上传 ▾</summary><div><button onClick={event => {event.currentTarget.closest('details')?.removeAttribute('open');void upload(false);}}>上传文件</button><button onClick={event => {event.currentTarget.closest('details')?.removeAttribute('open');void upload(true);}}>上传目录</button></div></details>
@@ -403,8 +434,8 @@ function App() {
         <p className="note">浏览不会转存。分享下载使用临时目录，下载结束、失败或停止后清理。</p></section>}
       {page === 'tasks' && <TasksPanel tasks={tasks} busy={transferring} onTasks={acceptTasks} onStart={() => setTransferring(true)} onEnd={() => setTransferring(false)} onStatus={notify}/>}
       {(page === 'shares' || page === 'recycle') && (signedIn ? <CatalogPanel key={`${page}-${accountRevision}`} mode={page === 'shares' ? 'shares' : 'recycle'} busy={transferring || loggingIn} onStatus={notify}/> : <div className="empty">请先登录账号</div>)}
-      {page === 'settings' && <section className="form-section"><h2>下载设置</h2><label>线程数 <small>1–16，默认 4</small><input type="number" min="1" max="16" disabled={transferring} value={threads} onChange={event => setThreads(event.target.value)} /></label>
-        <label>总限速 <small>MiB/s，0 表示不限速</small><input type="number" min="0" step="0.1" disabled={transferring} value={rate} onChange={event => setRate(event.target.value)} /></label>
+      {page === 'settings' && <section className="form-section settings-section"><h2>外观</h2><p className="section-description">选择适合你的主题，让浏览更舒服。</p><div className="theme-options" role="group" aria-label="外观主题">{([['system','跟随系统'],['light','浅色'],['dark','暗色']] as [AppearanceSource,string][]).map(([source,label]) => <label className={'theme-option'+(appearanceSource === source ? ' chosen' : '')} key={source}><span className={'theme-preview '+source} aria-hidden="true"><i/><span><b/><b/><b/></span></span><span className="theme-option-label"><input type="radio" name="appearance" value={source} checked={appearanceSource === source} disabled={appearanceSaving} onChange={() => void changeAppearance(source)}/>{label}</span></label>)}</div><p className="note">立即生效并自动保存。跟随系统会自动响应 Windows 主题变化。</p><div className="settings-divider"/><h2>下载设置</h2><div className="settings-grid"><label>线程数 <small>1–16，默认 4</small><input type="number" min="1" max="16" disabled={transferring} value={threads} onChange={event => setThreads(event.target.value)} /></label>
+        <label>总限速 <small>MiB/s，0 表示不限速</small><input type="number" min="0" step="0.1" disabled={transferring} value={rate} onChange={event => setRate(event.target.value)} /></label></div>
         <label>保存目录<input value={preferences.output_dir} readOnly /></label><button disabled={transferring} onClick={() => void action(async () => { const folder = await window.quark.chooseFolder(); if (folder) await saveSettings(folder); })}>选择目录</button>
         <button className="primary" disabled={transferring} onClick={() => void saveSettings()}>保存设置</button><p className="note">上传和下载队列逐项执行，线程数作用于单个下载文件。限速对上传和下载均生效，实际速度受账号与服务端限制。</p></section>}
       <div className="status" role="status">{status}</div>

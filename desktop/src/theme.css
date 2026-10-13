@@ -1,0 +1,99 @@
+:root{
+  color-scheme:light;
+  --page:light-dark(#fff,#1b1f27);
+  --primary-hover:light-dark(#254fd2,#365bc9);
+  --surface:light-dark(#fff,#252b36);
+  --text:light-dark(#25324a,#e3e9f3);
+  --control-text:light-dark(#35435c,#d3deef);
+  --blue:light-dark(#315fe9,#4269df);
+  --line:light-dark(#e8edf4,#333c4b);
+  --muted:light-dark(#68778e,#a7b3c7);
+  --control-border:light-dark(#dce3ee,#414d61);
+  --hover:light-dark(#f3f6fb,#303949);
+  --disabled-text:light-dark(#adb5c3,#778499);
+  --disabled-bg:light-dark(#f7f8fa,#222833);
+  --disabled-border:light-dark(#edf0f5,#2b3240);
+  --accent:light-dark(#254fd2,#9db6ff);
+  --disabled-primary:light-dark(#dbe3fd,#2c3a58);
+  --disabled-primary-text:light-dark(#8294c5,#9aa8c4);
+  --focus:light-dark(#c9d7ff,#536fa5);
+  --panel:light-dark(#f6f8fc,#202530);
+  --active:light-dark(#e7eeff,#2b3b5a);
+  --avatar:light-dark(#e5eaf4,#303a4d);
+  --avatar-text:light-dark(#6e7f9b,#b2c3dd);
+  --connection:light-dark(#68778e,#a0acc0);
+  --subtle:light-dark(#f8fafc,#202632);
+  --row-line:light-dark(#f0f3f7,#2b3240);
+  --row-hover:light-dark(#f6f9ff,#232d3b);
+  --selection:light-dark(#edf3ff,#273958);
+  --secondary:light-dark(#68778e,#99a8bf);
+  --empty-text:light-dark(#68778e,#a0acc0);
+  --folder-text:light-dark(#68778e,#9eabc1);
+  --status-bg:light-dark(#fafbfd,#1e232d);
+  --status-text:light-dark(#68778e,#9eabc1);
+  --error:light-dark(#c94e4e,#f08484);
+  --success:light-dark(#428f70,#7ed4a8);
+  --backdrop:light-dark(#1c294354,#030609aa);
+  --shadow-soft:light-dark(#25324a16,#0000004d);
+  --task-tag:light-dark(#f4f7fc,#252e3c);
+  --shadow:light-dark(#25324a24,#00000066);
+  --success-bg:light-dark(#e6f3ec,#1f3d32);
+  --success-strong:light-dark(#28774f,#8fd7b1);
+  --error-bg:light-dark(#fdebec,#482a32);
+  --error-strong:light-dark(#bd3644,#ff9baa);
+  --warning-bg:light-dark(#fff3d8,#493b20);
+  --warning-text:light-dark(#a76d12,#efc676);
+  --breadcrumb:light-dark(#6b7f9e,#a3b6d4);
+  --separator:light-dark(#a0aabb,#71819b);
+  --favorite-text:light-dark(#4c6080,#b4c3db);
+  --favorite-hover:light-dark(#e8efff,#293953);
+  --loading-bg:light-dark(#ffffffed,#1b1f27ed);
+  --folder-fill:light-dark(#f9edcf,#3b3529);
+  --folder-stroke:light-dark(#b38a39,#cba864);
+  --document-fill:light-dark(#eaf0f8,#283b52);
+  --document-stroke:light-dark(#7589ac,#8eabc9);
+  --scrollbar:light-dark(#c4ccda,#4a566a);
+}
+:root[data-theme="dark"]{color-scheme:dark}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark}}
+:root[data-color-scheme="light"]{color-scheme:light}
+:root[data-color-scheme="dark"]{color-scheme:dark}
+.primary{color:#fff}.primary:hover{background:var(--primary-hover)}
+.task-state.running,.breadcrumbs button:hover,.favorites button:hover,.filter-active{color:var(--accent)}
+.modal img{background:#fff;padding:8px;border-radius:6px}.form-section label select{display:block;width:100%;margin-top:9px}.form-section>h2:not(:first-child){margin-top:28px}
+
+/* Keep the list geometry stable; appearance changes only surfaces and controls. */
+:root{font-family:"Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif}
+button,input,select,textarea{border-radius:7px}
+button{transition:border-color .12s,box-shadow .12s}
+button:focus-visible,summary:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+input::placeholder,textarea::placeholder{color:var(--muted)}
+h1{font-size:25px;letter-spacing:0;font-weight:650}h2{font-size:18px;font-weight:600}
+aside{padding-top:28px}.brand{padding-bottom:30px;letter-spacing:.2px}.brand small{letter-spacing:1px}
+.nav{justify-content:flex-start;gap:12px;padding:12px 16px;border-radius:8px;color:var(--favorite-text)}
+.nav span{margin-left:auto}.nav.active{font-weight:600}.ui-icon{flex-shrink:0}
+.favorites{border-top:1px solid var(--line);padding-top:18px;margin-top:24px}
+.account-area{border-top:1px solid var(--line);padding-top:14px}.account-area .account{margin-bottom:10px}
+.connection{display:flex;align-items:center;gap:7px}.connection::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--secondary)}
+.icon-button{display:grid;place-items:center;width:32px;height:32px;padding:6px;color:var(--secondary)}
+.upload-picker summary{background:var(--surface);border-color:var(--control-border);border-radius:7px}
+.file-header{border-radius:7px 7px 0 0}.file-header button{border-radius:0}
+.file-row>span{font-variant-numeric:tabular-nums}.file-scroll,.task-list,.catalog-list{scrollbar-width:thin;scrollbar-color:var(--scrollbar) transparent}
+.modal{border:1px solid var(--line);box-shadow:0 12px 40px var(--shadow)}
+.context-menu{border-radius:10px;padding:6px}.context-menu button{border-radius:5px}
+.form-section{max-width:780px}.form-section input,.form-section textarea{padding:10px 12px}
+.settings-section{padding-top:6px}.settings-section .section-description{margin:8px 0 20px}
+.theme-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.settings-section .theme-option{margin:0;cursor:pointer;padding:8px;border:1px solid var(--control-border);border-radius:10px;background:var(--surface)}
+.theme-option:hover{border-color:var(--breadcrumb)}.settings-section .theme-option.chosen{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue)}
+.theme-preview{display:flex;height:82px;overflow:hidden;border-radius:5px;border:1px solid #bac4d330;background:#f8fafc;gap:12px}
+.theme-preview>i{width:24%;background:#e9eef5}.theme-preview>span{flex:1;display:flex;flex-direction:column;gap:9px;padding:14px 12px 14px 0}
+.theme-preview b{display:block;height:6px;border-radius:2px;background:#d9e1ed}.theme-preview b:first-child{background:#859bcc;width:50%}
+.theme-preview.dark{background:#1b1f27}.theme-preview.dark>i{background:#2a3240}.theme-preview.dark b{background:#3a4558}.theme-preview.dark b:first-child{background:#809bce}
+.theme-preview.system{background:linear-gradient(110deg,#f8fafc 50%,#1b1f27 50%)}.theme-preview.system>i{background:#e9eef5}.theme-preview.system b{background:#7e90ab}
+.theme-option-label{display:flex;align-items:center;gap:8px;padding:12px 4px 4px;font-weight:500}
+.settings-section .theme-option input{display:inline-block;margin:0;width:14px;height:14px;accent-color:var(--blue)}
+.settings-section .note{margin:14px 0 20px}.settings-divider{height:1px;background:var(--line);margin:24px 0}
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.settings-grid label{margin-bottom:0}
+.settings-section .settings-divider+h2{margin-top:0}
+@media(prefers-reduced-motion:reduce){button{transition:none}}

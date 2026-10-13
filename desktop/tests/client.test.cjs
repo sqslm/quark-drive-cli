@@ -1,7 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { chromium, _electron } = require('@playwright/test');
-const { mkdtemp, readFile, rm, mkdir } = require('node:fs/promises');
+const { mkdtemp, readFile, rm, mkdir, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
@@ -17,7 +17,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   try {
-    const page = await browser.newPage({ viewport: { width: 1180, height: 780 },reducedMotion:'no-preference' });
+    const page = await browser.newPage({ viewport: { width: 1180, height: 780 },reducedMotion:'no-preference',colorScheme:'light' });
     const errors = []; page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(() => {
       const listeners = new Set(); let cancelled = false; let tasks = [];let cut=null;let favorites=[];let loggedIn=true;
@@ -27,7 +27,11 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
       const rows = Array.from({ length: 10000 }, (_, index) => ({ fid: String(index), name: `知否 ${String(index).padStart(5,'0')}.txt`, directory: false, size: index + 1, path: '', location: [] }));
       const preferences = { output_dir: 'C:\\Downloads', connections: 4, limit_rate: null, width: 1180, height: 780 };
       window.testCalls = [];
+      let appearanceSource='system';
+      matchMedia('(prefers-color-scheme: dark)').addEventListener('change',event => {if(appearanceSource === 'system') listeners.forEach(listener => listener({id:null,event:'appearance',data:{source:'system',dark:event.matches,warning:''}}));});
       window.quark = {
+        getAppearance:async () => ({source:appearanceSource,dark:matchMedia('(prefers-color-scheme: dark)').matches,warning:''}),
+        setAppearance:async source => {appearanceSource=source;const result={source,dark:source === 'dark' || source === 'system' && matchMedia('(prefers-color-scheme: dark)').matches,warning:window.testAppearanceWarning ? '外观已切换，但未能保存；本次窗口内有效' : ''};listeners.forEach(listener => listener({id:null,event:'appearance',data:result}));return result;},
         onEvent: callback => { listeners.add(callback); return () => listeners.delete(callback); },
         chooseFolder: async () => 'C:\\Downloads', chooseFiles:async () => ['C:\\Uploads\\测试.txt'], openFolder: async () => {}, copyText:async text => { window.testCalls.push({method:'clipboard',params:{text}}); },
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
@@ -244,6 +248,44 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     await page.getByRole('button',{name:'我的文件',exact:true}).click();
     await page.getByRole('button',{name:'设置',exact:true}).click();
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/light-settings.png')});
+    await page.getByRole('radio',{name:'暗色',exact:true}).check();
+    await page.locator('.toast.success').getByText('外观已保存',{exact:true}).waitFor();
+    assert.equal(await page.locator('html').getAttribute('data-theme'),'dark');
+    assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(27, 31, 39)');
+    assert.equal(await page.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(32, 37, 48)');
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('.login-button')).backgroundColor === 'rgb(37, 43, 54)');
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/dark-settings.png')});
+    await page.getByRole('button',{name:'我的文件',exact:true}).click();
+    await page.locator('.file-row').filter({hasText:'知否 00003.txt'}).click({button:'right'});
+    assert.equal(await page.getByRole('menu',{name:'文件操作'}).evaluate(element => getComputedStyle(element).backgroundColor),'rgb(37, 43, 54)');
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/dark-files.png')});
+    await page.getByRole('menuitem',{name:'详细信息',exact:true}).click();
+    await page.getByText('3.25 GB',{exact:true}).waitFor();
+    assert.equal(await page.getByRole('dialog',{name:'文件属性'}).evaluate(element => getComputedStyle(element).backgroundColor),'rgb(37, 43, 54)');
+    await page.getByRole('button',{name:'关闭',exact:true}).click();
+    await page.getByRole('button',{name:'设置',exact:true}).click();
+    await page.emulateMedia({colorScheme:'light'});
+    assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(27, 31, 39)');
+    await page.getByRole('radio',{name:'跟随系统',exact:true}).check();
+    assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(255, 255, 255)');
+    await page.emulateMedia({colorScheme:'dark'});
+    await page.waitForFunction(() => document.documentElement.dataset.colorScheme === 'dark');
+    assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(27, 31, 39)');
+    await page.getByRole('radio',{name:'浅色',exact:true}).check();
+    assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(255, 255, 255)');
+    await page.setViewportSize({width:860,height:600});
+    assert.ok(await page.locator('.theme-options').evaluate(element => element.getBoundingClientRect().right <= innerWidth));
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true);
+    await page.getByRole('button',{name:'保存设置',exact:true}).scrollIntoViewIfNeeded();
+    assert.ok(await page.getByRole('button',{name:'保存设置',exact:true}).isVisible());
+    await page.setViewportSize({width:1180,height:780});
+    await page.evaluate(() => {window.testAppearanceWarning=true;});
+    await page.getByRole('radio',{name:'跟随系统',exact:true}).check();
+    await page.locator('.toast.warning').getByText('外观已切换，但未能保存；本次窗口内有效',{exact:true}).waitFor();
+    await page.evaluate(() => {window.testAppearanceWarning=false;});
+    await page.emulateMedia({colorScheme:'light'});
+    await page.waitForFunction(() => document.documentElement.dataset.colorScheme === 'light');
     await page.getByRole('button',{name:'保存设置',exact:true}).click();
     await page.locator('.toast.success').getByText('设置已保存',{exact:true}).waitFor();
     await page.evaluate(() => {window.testSaveWarning=true;});
@@ -263,6 +305,15 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('heading', { name:'传输任务' }).waitFor();
     const downloaded = await page.evaluate(() => window.testCalls.find(call => call.method === 'download').params.entries);
     assert.equal(downloaded.length, 1); assert.equal(downloaded[0].fid, '0');
+    await page.getByRole('button',{name:'设置',exact:true}).click();
+    assert.ok(await page.getByRole('button',{name:'保存设置',exact:true}).isDisabled());
+    assert.ok(await page.getByRole('radio',{name:'暗色',exact:true}).isEnabled());
+    await page.getByRole('radio',{name:'暗色',exact:true}).check();
+    await page.getByRole('button',{name:/^传输任务/}).click();
+    assert.ok(await page.getByText('正在传输',{exact:true}).isVisible());
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/dark-transfers.png')});
+    await page.getByRole('button',{name:'设置',exact:true}).click();
+    await page.getByRole('radio',{name:'浅色',exact:true}).check();
     await page.getByRole('button', {name:'我的文件',exact:true}).click();
     await page.getByRole('button',{name:'上传',exact:true}).click();
     await page.getByRole('button', {name:'上传文件',exact:true}).click();
@@ -299,6 +350,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button',{name:'我的文件',exact:true}).click();
     await page.getByRole('button',{name:'筛选',exact:true}).click();
     await page.screenshot({path:path.resolve(__dirname,'../test-results/compact-toolbar.png')});
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/light-files.png')});
     await page.getByRole('button',{name:'账号操作',exact:true}).click();
     await page.getByRole('menuitem',{name:'切换账号',exact:true}).click();
     await page.getByRole('dialog',{name:'切换账号',exact:true}).waitFor();
@@ -328,13 +380,31 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
 test('packaged Electron starts its bundled backend with sandbox and no external Python', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'quark-electron-test-'));
   const executable = path.resolve(__dirname, '..', process.env.QUARK_DESKTOP_OUT || 'out', 'Quark Drive Client-win32-x64/QuarkDriveClient.exe');
-  const app = await _electron.launch({ executablePath: executable, args:['--user-data-dir=' + path.join(directory,'electron')], env:{ ...process.env,
-    QUARK_CONFIG_DIR: directory, QUARK_COOKIE:'', QUARK_COOKIE_FILE:'', QUARK_DESKTOP_PYTHON:'Z:\\no-python.exe' } });
+  const launchOptions={ executablePath: executable, args:['--user-data-dir=' + path.join(directory,'electron')], env:{ ...process.env,
+    QUARK_CONFIG_DIR: directory, QUARK_COOKIE:'', QUARK_COOKIE_FILE:'', QUARK_DESKTOP_PYTHON:'Z:\\no-python.exe' } };
+  let app=await _electron.launch(launchOptions);
   try {
     const page = await app.firstWindow();
     await page.getByRole('heading', { name:'我的文件' }).waitFor();
     const hello = await page.evaluate(() => window.quark.call('hello'));
+    const initialAppearance=await page.evaluate(() => window.quark.getAppearance());
+    assert.equal(initialAppearance.source,'system');
+    assert.equal(initialAppearance.dark,await app.evaluate(({nativeTheme}) => nativeTheme.shouldUseDarkColors));
+    await page.waitForFunction(dark => document.documentElement.dataset.colorScheme === (dark ? 'dark' : 'light'),initialAppearance.dark);
+    assert.equal(await page.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),initialAppearance.dark ? 'rgb(32, 37, 48)' : 'rgb(246, 248, 252)');
+    await assert.rejects(page.evaluate(() => window.quark.setAppearance('invalid')),/外观选项无效/);
+    const dark=await page.evaluate(() => window.quark.setAppearance('dark'));
+    assert.equal(dark.warning,'');assert.equal(dark.dark,true);
+    assert.equal(await app.evaluate(({nativeTheme}) => nativeTheme.themeSource),'dark');
+    await page.waitForFunction(() => document.documentElement.dataset.theme === 'dark' && document.documentElement.dataset.colorScheme === 'dark');
+    assert.equal(await page.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(32, 37, 48)');
+    const savedAppearance=JSON.parse(await readFile(path.join(await app.evaluate(({app}) => app.getPath('userData')),'appearance.json'),'utf8'));
+    assert.equal(savedAppearance.source,'dark');
+    await page.evaluate(() => window.quark.setAppearance('light'));
+    assert.equal(await app.evaluate(({nativeTheme}) => nativeTheme.shouldUseDarkColors),false);
+    await page.waitForFunction(() => document.documentElement.dataset.theme === 'light' && document.documentElement.dataset.colorScheme === 'light');
     assert.equal(await page.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(246, 248, 252)');
+    await page.evaluate(() => window.quark.setAppearance('system'));
     assert.ok(await page.evaluate(() => navigator.windowControlsOverlay?.visible));
     assert.equal(hello.protocol, 1);
     assert.equal(await page.evaluate(() => typeof require), 'undefined');
@@ -361,5 +431,31 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
       await app.evaluate(({BrowserWindow}) => BrowserWindow.getAllWindows().find(win => win.webContents.getURL().startsWith('https://pan.quark.cn/')).close());
       assert.equal((await page.evaluate(() => window.loginPromise)).cancelled,true);
     }
+    await page.evaluate(() => window.quark.setAppearance('dark'));
+    const userData=await app.evaluate(({app}) => app.getPath('userData'));
+    await app.close();app=await _electron.launch(launchOptions);
+    const restarted=await app.firstWindow();
+    await restarted.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
+    assert.equal((await restarted.evaluate(() => window.quark.getAppearance())).source,'dark');
+    assert.equal(await app.evaluate(({nativeTheme}) => nativeTheme.themeSource),'dark');
+    await restarted.waitForFunction(() => document.documentElement.dataset.colorScheme === 'dark');
+    assert.equal(await restarted.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(32, 37, 48)');
+    await app.close();
+    await writeFile(path.join(userData,'appearance.json'),'{broken','utf8');
+    app=await _electron.launch(launchOptions);
+    const malformed=await app.firstWindow();
+    await malformed.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
+    const fallback=await malformed.evaluate(() => window.quark.getAppearance());
+    assert.equal(fallback.source,'system');assert.match(fallback.warning,/无法读取/);
+    assert.equal(await readFile(path.join(userData,'appearance.json'),'utf8'),'{broken');
+    await app.close();
+    await rm(path.join(userData,'appearance.json'));
+    await mkdir(path.join(userData,'appearance.json'));
+    app=await _electron.launch(launchOptions);
+    const unavailable=await app.firstWindow();
+    await unavailable.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
+    assert.equal((await unavailable.evaluate(() => window.quark.getAppearance())).source,'system');
+    const unsaved=await unavailable.evaluate(() => window.quark.setAppearance('dark'));
+    assert.equal(unsaved.source,'dark');assert.match(unsaved.warning,/未能保存/);
   } finally { await app.close(); await rm(directory, { recursive:true, force:true }); }
 });
