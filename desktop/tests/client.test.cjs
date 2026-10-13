@@ -29,7 +29,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         chooseFolder: async () => 'C:\\Downloads', chooseFiles:async () => ['C:\\Uploads\\测试.txt'], openFolder: async () => {}, copyText:async text => { window.testCalls.push({method:'clipboard',params:{text}}); },
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1, preferences };
+          if(method === 'hello') return { protocol: 1, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: '测试账号' };
           if(method === 'tasks') return tasks.map(task => ({...task}));
           if(method === 'browse') return rows.map(row => ({...row}));
@@ -59,6 +59,12 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.goto(`http://127.0.0.1:${server.address().port}/main_window/index.html`);
     await page.getByText('显示 10000 项', { exact: true }).waitFor();
     assert.ok(await page.locator('.file-row').count() < 60);
+    await page.getByLabel('格式筛选',{exact:true}).selectOption('视频');
+    await page.getByText('显示 0 项',{exact:true}).waitFor();
+    assert.ok(await page.getByLabel('格式筛选',{exact:true}).locator('option').count() >= 5);
+    await page.getByLabel('格式筛选',{exact:true}).selectOption('文档');
+    await page.getByText('显示 10000 项',{exact:true}).waitFor();
+    await page.getByLabel('格式筛选',{exact:true}).selectOption('');
     await page.getByRole('button',{name:'新建目录',exact:true}).click();
     await page.getByLabel('新名称').fill('新建测试');
     await page.getByRole('button',{name:'确认',exact:true}).click();
@@ -102,13 +108,15 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
 
 test('packaged Electron starts its bundled backend with sandbox and no external Python', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'quark-electron-test-'));
-  const executable = path.resolve(__dirname, '../out/Quark Drive Client-win32-x64/QuarkDriveClient.exe');
+  const executable = path.resolve(__dirname, '..', process.env.QUARK_DESKTOP_OUT || 'out', 'Quark Drive Client-win32-x64/QuarkDriveClient.exe');
   const app = await _electron.launch({ executablePath: executable, args:['--user-data-dir=' + path.join(directory,'electron')], env:{ ...process.env,
     QUARK_CONFIG_DIR: directory, QUARK_COOKIE:'', QUARK_COOKIE_FILE:'', QUARK_DESKTOP_PYTHON:'Z:\\no-python.exe' } });
   try {
     const page = await app.firstWindow();
     await page.getByRole('heading', { name:'我的文件' }).waitFor();
     const hello = await page.evaluate(() => window.quark.call('hello'));
+    assert.equal(await page.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(246, 248, 252)');
+    assert.ok(await page.evaluate(() => navigator.windowControlsOverlay?.visible));
     assert.equal(hello.protocol, 1);
     assert.equal(await page.evaluate(() => typeof require), 'undefined');
     const preferences = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.getLastWebPreferences());

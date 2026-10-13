@@ -1,5 +1,6 @@
 const path = require('node:path');
 module.exports = {
+  outDir: process.env.QUARK_DESKTOP_OUT || 'out',
   packagerConfig: {
     asar: true,
     executableName: 'QuarkDriveClient',

@@ -57,7 +57,8 @@ app.whenReady().then(async () => {
     });
   }
   window = new BrowserWindow({ width: 1180, height: 780, minWidth: 860, minHeight: 600,
-    title: '夸克网盘客户端', backgroundColor: '#ffffff',
+    title: '夸克网盘客户端', backgroundColor: '#ffffff', titleBarStyle:'hidden',
+    titleBarOverlay:{color:'#f6f8fc',symbolColor:'#35435c',height:34},
     webPreferences: { preload: MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY, contextIsolation: true, nodeIntegration: false, sandbox: true } });
   window.setMenuBarVisibility(false);
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));

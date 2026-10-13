@@ -33,6 +33,7 @@ function App() {
   const [searching, setSearching] = useState(false);
   const [searchView, setSearchView] = useState(false);
   const [resultsRecursive,setResultsRecursive] = useState(false);
+  const [format,setFormat] = useState('');
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState('正在启动网盘后端…');
   const [preferences, setPreferences] = useState<Preferences>({ output_dir: '', connections: 4, limit_rate: null, width: 1180, height: 780 });
@@ -70,7 +71,7 @@ function App() {
     const result = await action<Entry[]>(() => call('browse', { fid: chain.at(-1)![0] }));
     if (generation === view.current) {
       setLoading(false);
-      if (result) { setRows(result); setTrail(chain); setShare(null); setQuery(''); setKind('all'); setExtensions(''); setStatus(`已读取 ${result.length} 项`); }
+      if (result) { setRows(result); setTrail(chain); setShare(null); setQuery(''); setKind('all'); setExtensions(''); setFormat(''); setStatus(`已读取 ${result.length} 项`); }
     }
   }
   async function openRow(row: Entry) {
@@ -162,9 +163,10 @@ function App() {
   const filtered = useMemo(() => {
     let result = rows.filter(row => (!query || row.name.toLocaleLowerCase().includes(query.toLocaleLowerCase())) &&
       (kind === 'all' || row.directory === (kind === 'directories')));
-    if (extensions.trim()) {
-      const suffixes = extensionGroups[extensions] || extensions.toLocaleLowerCase().split(/[\s,，;；、]+/).filter(Boolean).map(value => value.replace(/^\./, ''));
-      if (extensions === '无扩展名') result = result.filter(row => !row.directory && (row.name.lastIndexOf('.') <= 0 || row.name.endsWith('.')));
+    const filter = format === 'custom' ? extensions : format;
+    if (filter.trim()) {
+      const suffixes = extensionGroups[filter] || filter.toLocaleLowerCase().split(/[\s,，;；、]+/).filter(Boolean).map(value => value.replace(/^\./, ''));
+      if (filter === '无扩展名') result = result.filter(row => !row.directory && (row.name.lastIndexOf('.') <= 0 || row.name.endsWith('.')));
       else {
       if (suffixes.some(value => !/^[a-z0-9]+(?:\.[a-z0-9]+)*$/.test(value))) return [];
       result = result.filter(row => !row.directory && suffixes.some(value => row.name.toLocaleLowerCase().endsWith('.' + value)));
@@ -180,7 +182,7 @@ function App() {
       return a[sort.key].localeCompare(b[sort.key], undefined, { sensitivity: 'base' }) * (sort.descending ? -1 : 1);
     });
     return result;
-  }, [rows, query, kind, extensions, sort, extensionGroups]);
+  }, [rows, query, kind, extensions, format, sort, extensionGroups]);
   const virtualizer = useVirtualizer({ count: filtered.length, getScrollElement: () => scroll.current, estimateSize: () => 46, overscan: 10 });
   const selected = filtered.filter(row => checked.has(row.fid));
   function fileAction(action:FileAction, entries = selected) { setContext(null); setFileDialog({ action,entries }); }
@@ -216,7 +218,7 @@ function App() {
     const result = await action<{ nickname: string; cancelled?: boolean }>(() => call('login', {}, id));
     if (loginId.current === id) { setLoggingIn(false); setQr(null); if (result && !result.cancelled) { setNickname(result.nickname); acceptTasks(await call('tasks')); await browse([['0','我的网盘']]); } else setNickname('昵称暂不可用'); }
   }
-  return <div className="app">
+  return <><div className="titlebar"><span>夸克网盘客户端</span></div><div className="app">
     <aside><div className="brand"><span className="brand-mark">Q</span><div>夸克网盘<small>桌面客户端</small></div></div>
       <nav aria-label="主导航">{[['drive','我的文件'],['share','分享链接'],['tasks','传输任务'],['settings','设置']].map(([key,label]) =>
         <button key={key} className={page === key ? 'nav active' : 'nav'} onClick={() => { setPage(key); if(key === 'drive' && share) void browse([['0','我的网盘']]); }}>{label}{key === 'tasks' && tasks.length > 0 && <span>{tasks.length}</span>}</button>)}</nav>
@@ -235,7 +237,9 @@ function App() {
           <button className="primary" disabled={!!share} onClick={() => void runSearch()}>搜索</button>
           {searching && <button onClick={() => { cancelSearch(); setStatus('搜索已取消；已读结果可能不完整'); }}>取消搜索</button>}</div>
         <div className="filters"><select aria-label="类型筛选" value={kind} onChange={event => setKind(event.target.value)}><option value="all">全部类型</option><option value="files">仅文件</option><option value="directories">仅目录</option></select>
-          <input aria-label="格式筛选" list="formats" placeholder="格式：mp4, mkv, tar.gz" value={extensions} onChange={event => setExtensions(event.target.value)} /><datalist id="formats">{[...Object.keys(extensionGroups),'无扩展名'].map(value => <option key={value} value={value}/>)}</datalist><span>显示 {filtered.length} 项{selected.length ? ` · 已选 ${selected.length} 项` : ''}</span></div>
+          <select aria-label="格式筛选" value={format} onChange={event => setFormat(event.target.value)}><option value="">全部格式</option>{[...Object.keys(extensionGroups),'无扩展名'].map(value => <option key={value} value={value}>{value}</option>)}<option value="custom">自定义格式</option></select>
+          {format === 'custom' && <input aria-label="自定义扩展名" placeholder="mp4, mkv, tar.gz" value={extensions} onChange={event => setExtensions(event.target.value)}/>}
+          {(format || kind !== 'all') && <button className="clear-filters" onClick={() => {setFormat('');setExtensions('');setKind('all');}}>清除筛选</button>}<span>显示 {filtered.length} 项{selected.length ? ` · 已选 ${selected.length} 项` : ''}</span></div>
         {!share && <div className="file-actions"><button disabled={loading || searching || loggingIn} onClick={() => void upload(false)}>上传文件</button><button disabled={loading || searching || loggingIn} onClick={() => void upload(true)}>上传目录</button><button disabled={loading || searching || transferring} onClick={() => fileAction('mkdir',[])}>新建目录</button>
           <button disabled={loading || searching || transferring || selected.length !== 1} onClick={() => fileAction('rename')}>重命名</button>
           <button disabled={loading || searching || transferring || !selected.length} onClick={() => fileAction('move')}>移动</button>
@@ -275,6 +279,6 @@ function App() {
     {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} parent={trail} close={() => setFileDialog(null)} done={() => { void (searchView ? runSearch() : browse()); }}/ >}
     {loggingIn && <div className="modal-backdrop"><div className="modal"><h2>扫码登录</h2><p>使用手机夸克 App 扫描二维码</p>{qr ? <img src={qr} alt="夸克登录二维码" /> : <div className="qr-loading">正在获取二维码…</div>}
       <button onClick={() => { loginId.current = null; setLoggingIn(false); setQr(null); setNickname('未登录'); void action(() => call('login.cancel')); }}>取消登录</button></div></div>}
-  </div>;
+  </div></>;
 }
 createRoot(document.getElementById('root')!).render(<App />);
