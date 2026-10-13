@@ -1113,6 +1113,13 @@ class Transfer:
             resumed = data is not None
             self._scope(fid, scope, data["scope_fid"] if data else None)
             remote = _remote_identity(Files(self.client).info(fid)) if resume else None
+            # A completed file may have been moved or deleted by the user.
+            # With neither output nor part left, this is a fresh download;
+            # unfinished checkpoints must still prove their persisted prefix.
+            if (data is not None and data["phase"] == "completed" and not target.exists()
+                    and not ledger.part_path.exists() and not ledger.part_path.is_symlink()):
+                data = None
+                resumed = False
             if data is not None and data["remote"] != remote:
                 raise RemoteError("远端文件身份或版本已变化，拒绝恢复")
             published = data is not None and data["phase"] in ("publishing", "completed") and target.exists()

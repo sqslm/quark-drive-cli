@@ -91,6 +91,38 @@ class ParallelResumeTests(unittest.TestCase):
         self.assertEqual(self.ledger()["phase"], "completed")
         self.assertTrue(any(event.connections > 1 for event in events))
 
+    def test_completed_download_removed_locally_starts_fresh(self):
+        base = self.root
+        for connections in (1, 4):
+            with self.subTest(connections=connections):
+                self.root = base / str(connections)
+                self.root.mkdir()
+                source = RangeSource()
+                self.download(source, connections=connections)
+                (self.root / 'test.bin').unlink()
+                split = len(source.requests)
+                result = self.download(source, connections=connections)
+                self.assertFalse(result['resumed'])
+                self.assertEqual((self.root / 'test.bin').read_bytes(), source.body)
+                self.assertEqual(result['sha256'], hashlib.sha256(source.body).hexdigest())
+                requests = [r for r in source.requests[split:] if r.url.host == 'cdn.quark.cn']
+                self.assertTrue(requests)
+                self.assertTrue(any(r.headers.get('range','bytes=0-').startswith('bytes=0-') for r in requests))
+
+    def test_missing_unfinished_part_still_refuses_resume(self):
+        source = RangeSource()
+        stopped = threading.Event()
+        def progress(event):
+            if event.confirmed >= 4096:
+                stopped.set()
+        with self.assertRaises(DownloadStopped):
+            self.download(source, connections=4, progress=progress, should_stop=stopped.is_set)
+        before = self.ledger()
+        next(self.root.glob('.quark-*.part')).unlink()
+        with self.assertRaisesRegex(LocalIOError,'下载检查点数据文件缺失'):
+            self.download(source, connections=4)
+        self.assertEqual(self.ledger(), before)
+
     def test_stop_keeps_only_a_contiguous_prefix_and_resumes_with_another_limit(self):
         source = RangeSource()
         stop = threading.Event()
