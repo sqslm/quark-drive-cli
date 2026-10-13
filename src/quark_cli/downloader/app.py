@@ -101,6 +101,7 @@ from .core import (
     display_text,
     download_plan,
     filter_entries,
+    sort_entries,
     item_status,
     output_folder,
 )
@@ -300,6 +301,8 @@ class DownloaderWindow:
         # always starts from this complete list, never from an already filtered
         # one, so clearing a filter restores every row.
         self._rows: list[Entry] = []
+        self._sort_key: str | None = None
+        self._sort_descending = False
         # The rows the table shows right now, keyed by the iid it shows them
         # under. It is empty until the first listing arrives, and the controls
         # are drawn from it from the very first :meth:`_sync_controls`.
@@ -465,7 +468,7 @@ class DownloaderWindow:
         listing = ttk.Frame(self._notebook)
         self._notebook.add(listing, text="文件")
         tree = ttk.Treeview(listing, columns=("check", "path", "type", "size"), show="tree headings", selectmode="extended")
-        tree.heading("#0", text="名称")
+        tree.heading("#0", text="名称", command=lambda: self.sort_by("name"))
         tree.column("#0", width=260, minwidth=160)
         for key, text, width in (("check", "选择", 48), ("path", "路径", 300),
                                   ("type", "类型", 70), ("size", "大小", 95)):
@@ -481,6 +484,8 @@ class DownloaderWindow:
         tree.bind("<space>", self._on_space)
         tree.bind("<<TreeviewSelect>>", self._on_selection)
         self._tree = tree
+        tree.heading("size", command=lambda: self.sort_by("size"))
+        tree.heading("path", command=lambda: self.sort_by("path"))
         self._task_tab = ttk.Frame(self._notebook)
         self._notebook.add(self._task_tab, text="下载任务")
         task_actions = ttk.Frame(self._task_tab)
@@ -1192,8 +1197,34 @@ class DownloaderWindow:
         on screen, so relaxing a filter brings back every row it had hidden.
         """
         rows = filter_entries(self._rows, query=self._keyword(), kind=self._kind())
+        if self._sort_key is not None:
+            rows = sort_entries(rows, self._sort_key, descending=self._sort_descending)
         self._render_rows(rows)
         self._show_counts(len(rows))
+
+    def sort_by(self, key: str) -> None:
+        """Toggle one local column without moving checks or focus to another FID."""
+        if self._busy():
+            return
+        if key not in ("name", "size", "path"):
+            raise UsageError("排序字段必须是 name、size 或 path")
+        tree = self._tree
+        selected = {self._entries[iid].fid for iid in tree.selection() if iid in self._entries}
+        focused = self._entries.get(tree.focus())
+        self._sort_descending = not self._sort_descending if self._sort_key == key else False
+        self._sort_key = key
+        self._apply_filter()
+        tree.selection_set([iid for iid, entry in self._entries.items() if entry.fid in selected])
+        if focused is not None:
+            for iid, entry in self._entries.items():
+                if entry.fid == focused.fid:
+                    tree.focus(iid)
+                    tree.see(iid)
+                    break
+        for column, field, label in (("#0", "name", "名称"), ("size", "size", "大小"), ("path", "path", "路径")):
+            arrow = " ↓" if self._sort_descending else " ↑"
+            tree.heading(column, text=label + (arrow if field == key else ""))
+        self._sync_controls()
 
     def _render_rows(self, rows: Iterable[Entry]) -> None:
         """Show exactly these rows; the table order is the download order."""

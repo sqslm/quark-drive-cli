@@ -132,6 +132,24 @@ def filter_entries(rows: Iterable[Entry], query: str = "", kind: str = "all") ->
     return selected
 
 
+def sort_entries(rows: Iterable[Entry], key: str, *, descending: bool = False) -> list[Entry]:
+    """Local file-table sorting; folders first and unknown file sizes last."""
+    if key not in ("name", "size", "path"):
+        raise UsageError("排序字段必须是 name、size 或 path")
+    rows = list(rows)
+    folders = [entry for entry in rows if entry.directory]
+    files = [entry for entry in rows if not entry.directory]
+    if key == "size":
+        folders.sort(key=lambda entry: entry.name.casefold())
+        known = sorted((entry for entry in files if entry.size is not None),
+                       key=lambda entry: entry.size, reverse=descending)
+        unknown = sorted((entry for entry in files if entry.size is None), key=lambda entry: entry.name.casefold())
+        return folders + known + unknown
+    folders.sort(key=lambda entry: getattr(entry, key).casefold(), reverse=descending)
+    files.sort(key=lambda entry: getattr(entry, key).casefold(), reverse=descending)
+    return folders + files
+
+
 class Location:
     """Which folder the window shows, built from the folders it entered.
 

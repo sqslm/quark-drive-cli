@@ -132,6 +132,7 @@ class _FakeTree:
         self.selection_ids: tuple[str, ...] = ()
         self.focus_id: str = ""
         self.bindings: dict[str, Any] = {}
+        self.headings: dict[str, dict[str, Any]] = {}
 
     def delete(self, *items: Any) -> None:
         self.rows.clear()
@@ -144,6 +145,15 @@ class _FakeTree:
 
     def selection(self) -> tuple[str, ...]:
         return self.selection_ids
+
+    def selection_set(self, items) -> None:
+        self.selection_ids = tuple(items)
+
+    def heading(self, column: str, **options: Any) -> None:
+        self.headings.setdefault(column, {}).update(options)
+
+    def see(self, item: str) -> None:
+        self.seen_id = item
 
     def focus(self, item: str | None = None) -> str:
         """Read the keyboard cursor back, or move it like ``tree.focus(item)``."""
