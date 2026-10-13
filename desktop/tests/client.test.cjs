@@ -20,7 +20,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     const page = await browser.newPage({ viewport: { width: 1180, height: 780 },reducedMotion:'no-preference' });
     const errors = []; page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(() => {
-      const listeners = new Set(); let cancelled = false; let tasks = [];
+      const listeners = new Set(); let cancelled = false; let tasks = [];let cut=null;
       window.testClockMs = Date.now();Date.now = () => window.testClockMs;
       let shares = [], recycle = [{record_id:'trash-a',fid:'gone-a',name:'测试删除.txt',directory:false,size:4,parent:'0'}, {record_id:'trash-b',fid:'gone-b',name:'测试恢复.txt',directory:false,size:4,parent:'0'}];
       const rows = Array.from({ length: 10000 }, (_, index) => ({ fid: String(index), name: `知否 ${String(index).padStart(5,'0')}.txt`, directory: false, size: index + 1, path: '', location: [] }));
@@ -34,9 +34,12 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
           if(method === 'hello') return { protocol: 1, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: '测试账号' };
           if(method === 'tasks') return tasks.map(task => ({...task}));
-          if(method === 'browse') return rows.map(row => ({...row}));
+          if(method === 'browse') return rows.filter(row => (row.parent || '0') === (params.fid || '0')).map(row => ({...row}));
           if(method === 'file.mkdir') { rows.push({fid:'new',name:params.name,directory:true,size:null,path:'',location:[]}); return {fid:'new'}; }
           if(method === 'file.rename') { const row = rows.find(row => row.fid === params.entries[0].fid); row.name = params.name; return [{ name:row.name,state:'done',detail:'操作完成'}]; }
+          if(method === 'file.cut') {cut={id:'cut-current',entries:params.entries,blocked:false};return cut;}
+          if(method === 'file.clearCut') {cut=null;return null;}
+          if(method === 'file.paste') {const results=cut.entries.map(entry => {rows.find(row => row.fid === entry.fid).parent=params.target;return {fid:entry.fid,name:entry.name,state:'done',detail:'已移动到目标目录'};});cut=null;return {results,clipboard:null};}
           if(method === 'locate') return { ...params.entry, path: '/知否/' + params.entry.name, location: [['0','我的网盘']] };
           if(method === 'search.cancel') { cancelled = true; return true; }
           if(method === 'search') {
@@ -80,6 +83,53 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByText('显示 10001 项',{exact:true}).waitFor();
     const created = await page.evaluate(() => window.testCalls.find(call => call.method === 'file.mkdir'));
     assert.equal(created.params.parent,'0'); assert.equal(created.params.name,'新建测试');
+    await page.getByLabel('选择 知否 00003.txt',{exact:true}).check();
+    const beforeMenu = await page.evaluate(() => window.testCalls.length);
+    await page.locator('.file-row').filter({hasText:'知否 00002.txt'}).click({button:'right'});
+    await page.getByRole('menu',{name:'文件操作'}).waitFor();
+    assert.equal(await page.evaluate(() => window.testCalls.length),beforeMenu);
+    await mkdir(path.resolve(__dirname,'../test-results'),{recursive:true});
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/context-menu.png')});
+    await page.getByRole('menuitem',{name:/^剪切/}).click();
+    await page.locator('.toast.success').getByText('已剪切 1 项，请打开目标目录后粘贴',{exact:true}).waitFor();
+    assert.equal(await page.locator('.file-row.cut').count(),1);
+    const cutCall=await page.evaluate(() => window.testCalls.find(call => call.method==='file.cut'));
+    assert.deepEqual(cutCall.params.entries.map(row => row.fid),['2']);
+    await page.locator('.file-header').getByRole('button',{name:/^名称/}).click();
+    await page.getByRole('button',{name:'新建测试',exact:true}).click();
+    await page.getByText('暂无文件',{exact:true}).waitFor();
+    await page.getByLabel('文件列表',{exact:true}).click({button:'right',position:{x:30,y:40}});
+    await page.getByRole('menuitem',{name:/^粘贴/}).click();
+    await page.getByRole('dialog',{name:'粘贴（移动）'}).getByText('目标：我的网盘 / 新建测试',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'确认',exact:true}).click();
+    await page.getByText('知否 00002.txt：已移动到目标目录',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'关闭',exact:true}).click();
+    const pasteCall=await page.evaluate(() => window.testCalls.find(call => call.method==='file.paste'));
+    assert.equal(pasteCall.params.id,'cut-current');assert.equal(pasteCall.params.target,'new');
+    assert.equal(await page.locator('.cut-bar').count(),0);
+    await page.getByRole('button',{name:'返回上级',exact:true}).click();
+    await page.locator('.file-row').filter({hasText:'知否 00003.txt'}).click({button:'right'});
+    await page.keyboard.press('Escape');
+    assert.equal(await page.getByRole('menu').count(),0);
+    await page.getByLabel('文件列表',{exact:true}).focus();
+    await page.keyboard.press('F2');
+    await page.getByRole('dialog',{name:'重命名'}).waitFor();
+    await page.getByLabel('新名称').fill('编辑输入不剪切云端文件');
+    await page.getByLabel('新名称').press('Control+x');
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method==='file.cut').length),1);
+    await page.getByRole('button',{name:'取消',exact:true}).click();
+    await page.getByLabel('文件列表',{exact:true}).focus();
+    await page.keyboard.press('Delete');
+    await page.getByRole('dialog',{name:'移入回收站'}).waitFor();
+    await page.getByRole('button',{name:'取消',exact:true}).click();
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method==='file.delete').length),0);
+    await page.getByLabel('选择 知否 00003.txt',{exact:true}).uncheck();
+    await page.getByLabel('选择 知否 00001.txt',{exact:true}).check();
+    await page.getByLabel('选择 知否 00003.txt',{exact:true}).check();
+    await page.locator('.file-row').filter({hasText:'知否 00001.txt'}).click({button:'right'});
+    await page.getByRole('menuitem',{name:'下载（2）',exact:true}).waitFor();
+    await page.keyboard.press('Escape');
+    await page.getByLabel('选择 知否 00003.txt',{exact:true}).uncheck();
     await page.getByLabel('选择 知否 00001.txt',{exact:true}).check();
     await page.getByRole('button',{name:'创建分享',exact:true}).click();
     await page.getByLabel('分享有效期').selectOption('30');

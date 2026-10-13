@@ -160,9 +160,14 @@ class Files:
     def move(self, fid: str, target: str, *, poll_interval: float = 0.5, max_polls: int = 60) -> Any:
         if not fid or fid == "0" or not target:
             raise UsageError("源 FID 或目标目录 FID 无效")
+        return self.move_many([fid],target,poll_interval=poll_interval,max_polls=max_polls)
+
+    def move_many(self, fids: list[str], target: str, *, poll_interval: float = 0.5, max_polls: int = 60) -> Any:
+        if not fids or any(not fid or fid == '0' for fid in fids) or not target or len(set(fids)) != len(fids):
+            raise UsageError('源 FID 列表或目标目录 FID 无效')
         payload = self.client.post(
             "file/move",
-            body={"action_type": 1, "to_pdir_fid": target, "filelist": [fid], "exclude_fids": []},
+            body={"action_type": 1, "to_pdir_fid": target, "filelist": fids, "exclude_fids": []},
         )
         data = _data(payload, "移动文件")
         if not isinstance(data, dict):
@@ -182,10 +187,14 @@ class Files:
             if not isinstance(task, dict):
                 raise RemoteError("移动任务响应格式无效")
             state = task.get("status")
+            if state in ('0','1','2','3','4'):
+                state = int(state)
             if state == 2 or task.get("finish") is True:
                 return task
             if state == 3:
                 raise RemoteError("夸克拒绝了移动操作")
+            if state == 4:
+                raise RemoteError("移动任务已暂停，请核实结果；未重新提交")
         raise RemoteError("等待移动任务超时")
 
     def delete(self, fid: str) -> Any:

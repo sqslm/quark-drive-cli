@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import { Entry } from './types';
+import { Entry, Cut } from './types';
 import { Feedback } from './Feedback';
 
-export type FileAction = 'mkdir' | 'rename' | 'move' | 'delete' | 'info';
-export function FileDialog({ action, entries, parent, done, close, onStatus }: {
+export type FileAction = 'mkdir' | 'rename' | 'move' | 'delete' | 'info' | 'paste';
+export function FileDialog({ action, entries, parent, done, close, onStatus,cutId,onCut }: {
   action: FileAction; entries: Entry[]; parent: [string,string][]; done: () => void; close: () => void; onStatus:Feedback;
+  cutId?:string;onCut:(cut:Cut|null)=>void;
 }) {
   const [name,setName] = useState(action === 'rename' ? entries[0].name : '');
   const [trail,setTrail] = useState<[string,string][]>([['0','我的网盘']]);
@@ -13,7 +14,7 @@ export function FileDialog({ action, entries, parent, done, close, onStatus }: {
   const [error,setError] = useState('');
   const [results,setResults] = useState<{ name:string; state:string; detail:string }[] | null>(null);
   const [info,setInfo] = useState<Record<string,unknown> | null>(null);
-  const title = ({ mkdir:'新建目录',rename:'重命名',move:'移动到',delete:'移入回收站',info:'文件属性' })[action];
+  const title = ({ mkdir:'新建目录',rename:'重命名',move:'移动到',delete:'移入回收站',info:'文件属性',paste:'粘贴（移动）' })[action];
   async function loadFolders(chain: [string,string][]) {
     setBusy(true); setError('');
     try { const rows: Entry[] = await window.quark.call('browse',{ fid:chain.at(-1)![0] }); setFolders(rows.filter(row => row.directory)); setTrail(chain); }
@@ -32,6 +33,11 @@ export function FileDialog({ action, entries, parent, done, close, onStatus }: {
     try {
       if(action === 'mkdir') {
         await window.quark.call('file.mkdir',{ parent:parent.at(-1)![0], name }); done(); close();onStatus('目录已创建','success');
+      } else if(action === 'paste') {
+        const response = await window.quark.call('file.paste',{id:cutId,target:parent.at(-1)![0]});
+        onCut(response.clipboard);setResults(response.results);done();
+        const failed=response.results.some((row:{state:string}) => row.state !== 'done');
+        onStatus(failed ? '部分项目未移动，请查看逐项结果' : '已粘贴到目标目录',failed ? 'warning' : 'success');
       } else if(action !== 'info') {
         const result = await window.quark.call(`file.${action}`,{ entries,name,target:trail.at(-1)![0] });
         setResults(result); done();onStatus(result.some((row:{state:string}) => row.state !== 'done') ? '部分项目操作失败，请查看逐项结果' : '文件操作已完成', result.some((row:{state:string}) => row.state !== 'done') ? 'warning' : 'success');
@@ -46,8 +52,9 @@ export function FileDialog({ action, entries, parent, done, close, onStatus }: {
     {action === 'move' && !results && <div className="directory-picker"><div><button disabled={busy || trail.length === 1} onClick={() => void loadFolders(trail.slice(0,-1))}>上级</button><span>{trail.map(item => item[1]).join(' / ')}</span></div>
       <div className="directory-list">{folders.map(row => <button key={row.fid} disabled={busy} onClick={() => void loadFolders([...trail,[row.fid,row.name]])}>{row.name}</button>)}{!folders.length && <p>没有子目录，可以选择当前目录</p>}</div><p>目标：{trail.map(item => item[1]).join(' / ')}</p></div>}
     {action === 'delete' && !results && <p>选中项目将移入回收站，可在回收站中恢复。</p>}
+    {action === 'paste' && !results && <><p>源项目：{entries.map(row => row.path || row.name).join('、')}</p><p>目标：{parent.map(item => item[1]).join(' / ')}</p><p>确认后移动这些项目，同名冲突不覆盖。</p></>}
     {info && <dl className="properties">{Object.entries(info).map(([key,value]) => <React.Fragment key={key}><dt>{({file_name:'名称',path:'路径',size:'大小（字节）',directory:'目录',fid:'FID',pdir_fid:'父目录 FID',updated_at:'修改时间',created_at:'创建时间'} as Record<string,string>)[key] || key}</dt><dd>{String(value)}</dd></React.Fragment>)}</dl>}
-    {results && <div className="operation-results">{results.map((row,index) => <p key={index} className={row.state === 'failed' ? 'error' : ''}>{row.name}：{row.detail}</p>)}</div>}
+    {results && <div className="operation-results">{results.map((row,index) => <p key={index} className={row.state !== 'done' ? 'error' : ''}>{row.name}：{row.detail}</p>)}</div>}
     {error && <p className="error" role="alert">{error}</p>}
     <div className="dialog-actions"><button disabled={busy} onClick={close}>{results || action === 'info' ? '关闭' : '取消'}</button>
       {!results && action !== 'info' && <button className="primary" disabled={busy || ((action === 'mkdir' || action === 'rename') && !name.trim())} onClick={() => void submit()}>{busy ? '处理中…' : action === 'move' ? '移到当前目录' : '确认'}</button>}

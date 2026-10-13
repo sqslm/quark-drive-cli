@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Entry, Event, Preferences, Task } from './types';
+import { Entry, Event, Preferences, Task, Cut } from './types';
 import './style.css';
 import { FileDialog, FileAction } from './FileDialog';
 import { TasksPanel } from './TasksPanel';
@@ -48,10 +48,11 @@ function App() {
   const [transferring, setTransferring] = useState(false);
   const [qr, setQr] = useState<string | null>(null);
   const [loggingIn, setLoggingIn] = useState(false);
-  const [fileDialog,setFileDialog] = useState<{ action:FileAction; entries:Entry[] } | null>(null);
+  const [fileDialog,setFileDialog] = useState<{ action:FileAction; entries:Entry[]; cutId?:string } | null>(null);
+  const [cut,setCut] = useState<Cut|null>(null);
   const [sharingDialog,setSharingDialog] = useState<'create'|'save'|null>(null);
   const [accountRevision,setAccountRevision] = useState(0);
-  const [context,setContext] = useState<{ row:Entry; x:number; y:number } | null>(null);
+  const [context,setContext] = useState<{ row:Entry|null; x:number; y:number } | null>(null);
   const view = useRef(0);
   const searchId = useRef<string | null>(null);
   const loginId = useRef<string | null>(null);
@@ -59,6 +60,8 @@ function App() {
   const shareRevision = useRef(0);
   const codeRevision = useRef(0);
   const scroll = useRef<HTMLDivElement>(null);
+  const menu = useRef<HTMLDivElement>(null);
+  useEffect(() => {if(context) menu.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();},[context]);
   const call = window.quark.call;
   function acceptTasks(next: Task[]) {
     setTasks(old => next.map(task => {
@@ -192,16 +195,65 @@ function App() {
   }, [rows, query, kind, extensions, format, sort, extensionGroups]);
   const virtualizer = useVirtualizer({ count: filtered.length, getScrollElement: () => scroll.current, estimateSize: () => 46, overscan: 10 });
   const selected = filtered.filter(row => checked.has(row.fid));
+  const cutIds = useMemo(() => new Set(cut?.entries.map(row => row.fid) || []),[cut]);
+  const canModify = !share && !transferring && !searching && !loading && !loggingIn;
+  const canDownload = !searching && !loading && !loggingIn && !!preferences.output_dir && selected.length > 0;
+  const canPaste = canModify && !searchView && !!cut && !cut.blocked;
   function fileAction(action:FileAction, entries = selected) { setContext(null); setFileDialog({ action,entries }); }
   async function copyPaths(entries = selected) {
     await action(async () => {
       const generation = view.current;
       const located: Entry[] = [];
-      for(const row of entries) located.push(row.path ? row : await call('locate',{ entry:row }));
+      for(const row of entries) located.push(row.path ? row : share ? {...row,path:sharePath.replace(/\/$/,'')+'/'+row.name} : await call('locate',{ entry:row }));
       if(generation !== view.current) return;
       await window.quark.copyText(located.map(row => row.path).join('\n'));
       notify(`已复制 ${located.length} 项路径`,'success');
     });
+  }
+  async function cutSelected() {
+    setContext(null);
+    if(!canModify || !selected.length) return;
+    const generation = profileGeneration.current;
+    const clipboard = await action<Cut>(() => call('file.cut',{entries:selected}));
+    if(clipboard && generation === profileGeneration.current) {setCut(clipboard);notify(`已剪切 ${clipboard.entries.length} 项，请打开目标目录后粘贴`,'success');}
+  }
+  async function clearCut() {
+    setContext(null);
+    if(!cut) return;
+    await action(async () => {setCut(await call('file.clearCut',{id:cut.id}));notify('已取消剪切');});
+  }
+  function paste() {
+    setContext(null);
+    if(canPaste && cut) setFileDialog({action:'paste',entries:cut.entries,cutId:cut.id});
+  }
+  async function downloadSelected() {
+    setContext(null);
+    if(!canDownload) {notify('请勾选项目并选择保存目录，目录读取完成后再下载','warning');return;}
+    await action(async () => {
+      const alreadyRunning = transferring;
+      if(!alreadyRunning && !await saveSettings()) return;setTransferring(true);
+      try {acceptTasks(await call('download',{entries:selected,handle:share,path:sharePath}));setPage('tasks');notify(`已加入 ${selected.length} 个下载任务`,'success');}
+      catch(error) {if(!alreadyRunning) setTransferring(false);throw error;}
+    });
+  }
+  function contextAt(event:React.MouseEvent,row:Entry|null) {
+    event.preventDefault();event.stopPropagation();
+    if(row && !checked.has(row.fid)) setChecked(new Set([row.fid]));
+    setContext({row,x:Math.max(4,Math.min(event.clientX,window.innerWidth-230)),y:Math.max(39,Math.min(event.clientY,window.innerHeight-460))});
+    scroll.current?.focus();
+  }
+  function shortcut(event:React.KeyboardEvent) {
+    if(event.key === 'Escape' && context) {setContext(null);scroll.current?.focus();event.preventDefault();return;}
+    if(page !== 'drive' || fileDialog || sharingDialog || loggingIn || (event.target as HTMLElement).closest('input:not([type=checkbox]),textarea,select,[contenteditable=true]')) return;
+    if((event.ctrlKey || event.metaKey) && !event.altKey) {
+      const key=event.key.toLowerCase();
+      if(key === 'x' && canModify && selected.length) {event.preventDefault();void cutSelected();}
+      else if(key === 'v' && canPaste) {event.preventDefault();paste();}
+      else if(key === 'c' && event.shiftKey && selected.length) {event.preventDefault();setContext(null);void copyPaths();}
+      else if(key === 'a' && !searching && !loading) {event.preventDefault();setChecked(new Set(filtered.map(row => row.fid)));}
+    } else if(event.key === 'F2' && canModify && selected.length === 1) {event.preventDefault();fileAction('rename');}
+    else if((event.key === 'Delete' || event.key === 'Backspace') && canModify && selected.length) {event.preventDefault();fileAction('delete');}
+    else if(event.key === 'Escape' && cut) {event.preventDefault();void clearCut();}
   }
   const all = filtered.length > 0 && selected.length === filtered.length;
   function toggle(fid: string) { setChecked(old => { const next = new Set(old); if (next.has(fid)) next.delete(fid); else next.add(fid); return next; }); }
@@ -221,11 +273,11 @@ function App() {
     });
   }
   async function login() {
-    cancelSearch(); ++view.current; ++profileGeneration.current; setLoading(false); const id = crypto.randomUUID(); loginId.current = id; setLoggingIn(true); setNickname('正在登录');
+    cancelSearch(); ++view.current; ++profileGeneration.current; setCut(null);setContext(null);setLoading(false); const id = crypto.randomUUID(); loginId.current = id; setLoggingIn(true); setNickname('正在登录');
     const result = await action<{ nickname: string; cancelled?: boolean }>(() => call('login', {}, id));
     if (loginId.current === id) { setLoggingIn(false); setQr(null); if (result && !result.cancelled) { setNickname(result.nickname); setAccountRevision(old => old+1); acceptTasks(await call('tasks')); await browse([['0','我的网盘']]); notify('登录成功','success'); } else setNickname('昵称暂不可用'); }
   }
-  return <><div className="titlebar"><span>夸克网盘客户端</span></div><div className="app">
+  return <><div className="titlebar"><span>夸克网盘客户端</span></div><div className="app" onKeyDown={shortcut}>
     <aside><div className="brand"><span className="brand-mark">Q</span><div>夸克网盘<small>桌面客户端</small></div></div>
       <nav aria-label="主导航">{[['drive','我的文件'],['share','分享链接'],['shares','我的分享'],['recycle','回收站'],['tasks','传输任务'],['settings','设置']].map(([key,label]) =>
         <button key={key} className={page === key ? 'nav active' : 'nav'} onClick={() => { cancelSearch(); setPage(key); if(key === 'drive' && share) void browse([['0','我的网盘']]); }}>{label}{key === 'tasks' && tasks.length > 0 && <span>{tasks.length}</span>}</button>)}</nav>
@@ -256,20 +308,16 @@ function App() {
         {share && <div className="file-actions"><button disabled={loading || searching || transferring || loggingIn || !selected.length} onClick={() => setSharingDialog('save')}>永久转存到网盘</button><span className="note">下载仍使用临时转存并清理</span></div>}
         <div className="file-header"><input aria-label="全选可见文件" type="checkbox" checked={all} onChange={() => setChecked(old => { const next = new Set(old); filtered.forEach(row => all ? next.delete(row.fid) : next.add(row.fid)); return next; })} />
           <button onClick={() => sortBy('name')}>名称{sort?.key === 'name' ? sort.descending ? ' ↓' : ' ↑' : ''}</button><button onClick={() => sortBy('size')}>大小</button><span>类型</span><button onClick={() => sortBy('path')}>路径</button></div>
-        <div className="file-scroll" ref={scroll}>{loading && <div className="empty">正在读取目录…</div>}
+        {cut && !share && <div className="cut-bar"><span>{cut.blocked ? '上次粘贴结果待核实' : `已剪切 ${cut.entries.length} 项，等待粘贴`}</span><button disabled={!canPaste} onClick={paste}>粘贴到当前目录</button><button onClick={() => void clearCut()}>取消剪切</button></div>}
+        <div className="file-scroll" ref={scroll} tabIndex={0} aria-label="文件列表" onContextMenu={event => contextAt(event,null)}>{loading && <div className="empty">正在读取目录…</div>}
           {!loading && !filtered.length && <div className="empty">{searching ? '正在搜索，结果将陆续显示…' : rows.length ? '没有符合筛选条件的项目' : '暂无文件'}</div>}
-          <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>{virtualizer.getVirtualItems().map(item => { const row = filtered[item.index]; return <div className={checked.has(row.fid) ? 'file-row selected' : 'file-row'} key={row.fid} style={{ transform: `translateY(${item.start}px)` }} onDoubleClick={() => void openRow(row)} onContextMenu={event => { event.preventDefault(); if(!checked.has(row.fid)) setChecked(new Set([row.fid])); setContext({row,x:Math.min(event.clientX,window.innerWidth-180),y:Math.min(event.clientY,window.innerHeight-210)}); }}>
+          <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>{virtualizer.getVirtualItems().map(item => { const row = filtered[item.index]; return <div className={'file-row' + (checked.has(row.fid) ? ' selected' : '') + (cutIds.has(row.fid) && !share ? ' cut' : '')} key={row.fid} style={{ transform: `translateY(${item.start}px)` }} onDoubleClick={() => void openRow(row)} onContextMenu={event => contextAt(event,row)}>
             <input type="checkbox" aria-label={`选择 ${row.name}`} checked={checked.has(row.fid)} onChange={() => toggle(row.fid)} />
             <button className="file-name" title={row.name} onClick={() => void openRow(row)}><FileIcon folder={row.directory} /><span>{row.name}</span></button>
             <span>{row.directory ? '—' : units(row.size)}</span><span>{row.directory ? '目录' : '文件'}</span><span title={row.path}>{row.path || (searchView ? '待定位' : '—')}</span></div>; })}</div></div>
         <footer><button disabled={transferring || loggingIn} onClick={() => void action(async () => { const folder = await window.quark.chooseFolder(); if (folder) await saveSettings(folder); })}>保存目录</button>
           <button className="folder-path" title={preferences.output_dir} onClick={() => void action(() => window.quark.openFolder(preferences.output_dir))}>{preferences.output_dir || '尚未选择保存目录'}</button>
-          <button className="primary" disabled={searching || loading || loggingIn || !selected.length || !preferences.output_dir} onClick={() => void action(async () => {
-            const alreadyRunning = transferring;
-            if (!alreadyRunning && !await saveSettings()) return; setTransferring(true);
-            try { const result = await call('download', { entries: selected, handle: share, path: sharePath }); acceptTasks(result); setPage('tasks'); notify(`已加入 ${selected.length} 个下载任务`,'success'); }
-            catch (error) { if(!alreadyRunning) setTransferring(false); throw error; }
-          })}>{transferring ? "加入队列" : "下载"}{selected.length ? `（${selected.length}）` : ''}</button></footer>
+          <button className="primary" disabled={!canDownload} onClick={() => void downloadSelected()}>{transferring ? "加入队列" : "下载"}{selected.length ? `（${selected.length}）` : ''}</button></footer>
       </>}
       {page === 'share' && <section className="form-section"><h2>打开分享</h2><p>支持纯链接、带 pwd 的链接及包含提取码的分享文案。</p>
         <label>分享链接或文案<textarea value={shareText} onChange={event => { shareRevision.current++; setShareText(event.target.value); }} onBlur={() => { const text = shareText, revision = shareRevision.current, code = codeRevision.current; void action(async () => { if (!text.trim()) return; const parsed = await call('share.parse', { text }); if (revision === shareRevision.current && code === codeRevision.current && parsed.passcode) setPasscode(parsed.passcode); }); }} /></label>
@@ -283,10 +331,32 @@ function App() {
         <button className="primary" disabled={transferring} onClick={() => void saveSettings()}>保存设置</button><p className="note">上传和下载队列逐项执行，线程数作用于单个下载文件。限速对上传和下载均生效，实际速度受账号与服务端限制。</p></section>}
       <div className="status" role="status">{status}</div>
     </main>
-    {context && <><div className="menu-dismiss" onClick={() => setContext(null)}/><div className="context-menu" role="menu" style={{left:context.x,top:context.y}}>
-      {!share && <><button disabled={transferring || searching || selected.length !== 1} onClick={() => fileAction('rename')}>重命名</button><button disabled={transferring || searching} onClick={() => fileAction('move')}>移动</button><button disabled={transferring || searching} onClick={() => fileAction('delete')}>移入回收站</button><button onClick={() => fileAction('info',[context.row])}>属性</button></>}
-      <button onClick={() => { const entries = selected; setContext(null); void copyPaths(entries); }}>复制路径</button></div></>}
-    {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} parent={trail} close={() => setFileDialog(null)} done={() => { void (searchView ? runSearch() : browse()); }} onStatus={notify}/ >}
+    {context && <><div className="menu-dismiss" onClick={() => setContext(null)} onContextMenu={event => {event.preventDefault();setContext(null);}}/><div ref={menu} className="context-menu" role="menu" aria-label="文件操作" style={{left:context.x,top:context.y}} onKeyDown={event => {
+      shortcut(event);
+      if(['ArrowDown','ArrowUp','Home','End'].includes(event.key)) {
+        event.preventDefault();const buttons=Array.from(menu.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') || []);
+        const index=buttons.indexOf(document.activeElement as HTMLButtonElement);
+        const next=event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length-1 : (index+(event.key === 'ArrowDown' ? 1 : -1)+buttons.length)%buttons.length;
+        buttons[next]?.focus();
+      }
+    }}>
+      {context.row && <>
+        {context.row.directory && <button role="menuitem" disabled={loading || searching || selected.length !== 1} onClick={() => {const row=context.row!;setContext(null);void openRow(row);}}>打开目录</button>}
+        <button role="menuitem" disabled={!canDownload} onClick={() => void downloadSelected()}>下载{selected.length > 1 ? `（${selected.length}）` : ''}</button>
+        {!share && <button role="menuitem" disabled={!canModify || selected.length !== 1} onClick={() => {setContext(null);setSharingDialog('create');}}>分享</button>}
+        <hr/>{!share && <>
+          <button role="menuitem" disabled={!canModify || !selected.length} onClick={() => void cutSelected()}>剪切<kbd>Ctrl+X</kbd></button>
+          <button role="menuitem" disabled={!canPaste} onClick={paste}>粘贴<kbd>Ctrl+V</kbd></button><hr/>
+          <button role="menuitem" disabled={!canModify || !selected.length} onClick={() => fileAction('delete')}>删除<kbd>Delete</kbd></button>
+          <button role="menuitem" disabled={!canModify || selected.length !== 1} onClick={() => fileAction('rename')}>重命名<kbd>F2</kbd></button>
+          <button role="menuitem" disabled={!canModify || !selected.length} onClick={() => fileAction('move')}>移动到…</button><hr/>
+          <button role="menuitem" disabled={selected.length !== 1 || loading || searching} onClick={() => fileAction('info',[context.row!])}>详细信息</button>
+        </>}
+        <button role="menuitem" disabled={loading || searching} onClick={() => {setContext(null);void copyPaths();}}>复制路径<kbd>Ctrl+Shift+C</kbd></button>
+      </>}
+      {!context.row && <><button role="menuitem" disabled={loading || searching} onClick={() => {setContext(null);void (share ? openShare() : browse());}}>刷新</button>{!share && <><button role="menuitem" disabled={!canModify} onClick={() => fileAction('mkdir',[])}>新建目录</button><button role="menuitem" disabled={!canPaste} onClick={paste}>粘贴<kbd>Ctrl+V</kbd></button></>}</>}
+    </div></>}
+    {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} cutId={fileDialog.cutId} onCut={setCut} parent={trail} close={() => setFileDialog(null)} done={() => { void (searchView ? runSearch() : browse()); }} onStatus={notify}/ >}
     {sharingDialog && <SharingDialog mode={sharingDialog} entries={selected} handle={share} path={sharePath} close={() => setSharingDialog(null)} onStatus={notify}/>}
     {loggingIn && <div className="modal-backdrop"><div className="modal"><h2>扫码登录</h2><p>使用手机夸克 App 扫描二维码</p>{qr ? <img src={qr} alt="夸克登录二维码" /> : <div className="qr-loading">正在获取二维码…</div>}
       <button onClick={() => { loginId.current = null; setLoggingIn(false); setQr(null); setNickname('未登录'); void action(() => call('login.cancel')); }}>取消登录</button></div></div>}

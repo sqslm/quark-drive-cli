@@ -15,9 +15,11 @@ class Drive:
     def __init__(self, records):
         self.records = {row["fid"]: dict(row) for row in records}
         self.writes = []
+        self.requests = []
 
     def transport(self):
         def handle(request):
+            self.requests.append(request)
             path = request.url.path
             if request.method == "GET" and path.endswith("file/info"):
                 data = self.records[request.url.params["fid"]]
@@ -35,7 +37,8 @@ class Drive:
                     self.records[body["fid"]]["file_name"] = body["file_name"]
                     data = {}
                 elif path.endswith("file/move"):
-                    self.records[body["filelist"][0]]["pdir_fid"] = body["to_pdir_fid"]
+                    for fid in body['filelist']:
+                        self.records[fid]["pdir_fid"] = body["to_pdir_fid"]
                     data = {"finish": True}
                 elif path.endswith("file/delete"):
                     self.records.pop(body["filelist"][0])

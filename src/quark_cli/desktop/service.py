@@ -59,6 +59,7 @@ class DesktopService:
         self.busy = False
         self.logging_in = False
         self.managing = False
+        self.cut = None
         self.closed = False
         self.preferences_warning = ""
         self.preferences_writable = True
@@ -108,6 +109,7 @@ class DesktopService:
                     self.send({"id": identifier, "error": "请先结束传输或当前登录"})
                     return
                 self.logging_in = True
+                self.cut = None
             self.login_cancel.set()
             self.login_cancel = threading.Event()
             cancel = self.login_cancel
@@ -131,6 +133,50 @@ class DesktopService:
                     self.logging_in = False
 
     def dispatch(self, identifier, method, p, cancel):
+        if method == 'file.cut':
+            if p.get('handle'):
+                raise UsageError('分享文件只读，不能剪切')
+            with self.lock:
+                if self.busy or self.logging_in or self.managing:
+                    raise UsageError('请先结束传输、登录或网盘操作')
+                entries = [asdict(self.entry(row)) for row in p.get('entries',[])]
+                ids = [valid_fid(row['fid']) for row in entries]
+                if not ids or '0' in ids or len(set(ids)) != len(ids):
+                    raise UsageError('请选择有效且不重复的文件或目录')
+                self.cut = {'id':uuid.uuid4().hex,'entries':entries,'context':self.context(),'blocked':False}
+                return self.cut_view()
+        if method == 'file.clearCut':
+            with self.lock:
+                if self.managing:
+                    raise UsageError('网盘操作正在执行，请等待结果后取消剪切')
+                if self.cut and self.cut['id'] == p.get('id'):
+                    self.cut = None
+                return self.cut_view()
+        if method == 'file.paste':
+            if p.get('handle'):
+                raise UsageError('分享文件只读，不能粘贴')
+            with self.mutation():
+                clipboard = self.cut
+                if clipboard is None or clipboard['id'] != p.get('id') or clipboard['context'] != self.context():
+                    raise UsageError('剪切记录已失效或登录已变化，请重新剪切')
+                if clipboard['blocked']:
+                    raise UsageError('上次粘贴结果未确认，请先刷新核实，未重复提交')
+                # Reserve this intent before opening any metadata or write request.
+                clipboard['blocked'] = True
+                with self.backend._client() as client:
+                    try:
+                        results = FileOperations(client).paste(clipboard['entries'],p['target'])
+                    except QuarkError:
+                        # paste reports write outcomes; an exception here is
+                        # target preflight, before any move was submitted.
+                        clipboard['blocked'] = False
+                        raise
+                done = {row['fid'] for row in results if row['state'] == 'done'}
+                clipboard['entries'] = [row for row in clipboard['entries'] if row['fid'] not in done]
+                clipboard['blocked'] = any(row['state'] == 'unknown' for row in results)
+                if not clipboard['entries']:
+                    self.cut = None
+                return {'results':results,'clipboard':self.cut_view()}
         if method in ('share.list','share.link','recycle.list'):
             with self.backend._client() as client:
                 if method == 'recycle.list':
@@ -374,6 +420,12 @@ class DesktopService:
                 with self.lock:
                     self.managing = False
 
+    def cut_view(self):
+        clipboard = self.cut
+        if clipboard is None:
+            return None
+        return {key:clipboard[key] for key in ('id','entries','blocked')}
+
     @staticmethod
     def entry(row):
         return Entry(str(row["fid"]), str(row["name"]), bool(row["directory"]), row.get("size"),
@@ -488,7 +540,8 @@ METHODS = frozenset({"hello", "account", "browse", "search", "search.cancel", "l
     "share.open", "share.browse", "preferences.save", "login", "login.cancel", "download", "download.stop", "tasks", "tasks.retry",
     "file.info", "file.mkdir", "file.rename", "file.move", "file.delete",
     "upload", "tasks.cancel", "tasks.clear", "tasks.authorize",
-    'share.list','share.link','share.create','share.revoke','share.save','recycle.list','recycle.restore','recycle.remove'})
+    'share.list','share.link','share.create','share.revoke','share.save','recycle.list','recycle.restore','recycle.remove',
+    'file.cut','file.paste','file.clearCut'})
 
 
 def main():
