@@ -163,7 +163,7 @@ class ShareImportTests(ShareWindowCase):
         window._search_var.set("报告")
         window._submit_search(ROOT_FID)
         self.assertIsInstance(self._submitted(window), Search)
-        window._handle(SearchResults(ROOT_FID, "报告", (Entry("r", "报告.bin", False, 4, path="/报告.bin"),)))
+        window._handle(SearchResults(ROOT_FID, "报告", (Entry("r", "报告.bin", False, 4, path="/报告.bin"),), request_id=window._search_generation))
         self._tick(window, "r")
 
         # A link the library refuses changes nothing: the search stays as it is.
@@ -196,7 +196,7 @@ class ShareImportTests(ShareWindowCase):
             self.assertNotIn(SHARE_LINK, text)
             self.assertNotIn(PASSCODE, text)
         # The answer to the search just left cannot fill the share table.
-        window._handle(SearchResults(ROOT_FID, "报告", (Entry("r", "报告.bin", False, 4),)))
+        window._handle(SearchResults(ROOT_FID, "报告", (Entry("r", "报告.bin", False, 4),), request_id=window._search_generation))
         self.assertEqual(window._tree.rows, [])
 
 
@@ -223,7 +223,7 @@ class ShareBrowsingTests(ShareWindowCase):
         # An account listing and a late search answer are dropped in a share
         # view, so no share row can ever sit under an account location line.
         window._handle(Listing(ROOT_FID, (Entry("a1", "账号文件.bin", False, 4),)))
-        window._handle(SearchResults(ROOT_FID, "文件", (Entry("a2", "搜索文件.bin", False, 4),)))
+        window._handle(SearchResults(ROOT_FID, "文件", (Entry("a2", "搜索文件.bin", False, 4),), request_id=window._search_generation))
         self.assertEqual(self._texts(window), ["分享文件.bin"])
 
         window.open_drive()

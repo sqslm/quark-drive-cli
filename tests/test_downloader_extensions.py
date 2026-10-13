@@ -121,7 +121,7 @@ class ExtensionWindowTests(WindowCase):
         self.assertEqual(self._requests(window), [])
 
     def test_busy_filters_do_not_rewrite_the_current_batch_view(self):
-        for flag in ("_downloading", "_searching", "_logging_in", "_reading_share"):
+        for flag in ("_downloading", "_logging_in", "_reading_share"):
             window = self._extension_window()
             window._adopt_rows((Entry("v", "clip.mp4", False), Entry("p", "clip.pdf", False)))
             setattr(window, flag, True)

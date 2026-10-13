@@ -27,6 +27,16 @@ class Files:
     def __init__(self, client: QuarkClient) -> None:
         self.client = client
 
+    def search_page(self, query: str, page: int = 1, size: int = 100) -> dict[str, Any]:
+        if not query.strip() or page < 1 or not 1 <= size <= 100:
+            raise UsageError("搜索关键词或分页参数无效")
+        payload = self.client.get("file/search", params={"q": query.strip(), "_page": page,
+            "_size": size, "_fetch_total": 1, "_sort": "file_name:asc", "_is_hl": 0})
+        data = _data(payload, "搜索")
+        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+            raise RemoteError("搜索响应缺少 data.list")
+        return payload
+
     def list_page(self, folder_id: str = "0", page: int = 1, size: int = 50) -> dict[str, Any]:
         if page < 1:
             raise UsageError("page 必须大于 0")

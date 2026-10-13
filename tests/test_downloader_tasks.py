@@ -404,6 +404,7 @@ class RealTaskControlsTests(unittest.TestCase):
                 window._output_dir = folder
                 window._adopt_rows([Entry("a", "a.bin", False), Entry("b", "b.bin", False)])
                 window._checked = {"a", "b"}
+                window._sync_controls()
                 window._download_button.invoke()
                 self.assertEqual(window._notebook.tab(window._notebook.select(), "text"), "下载任务")
                 window._handle(Finished(DOWNLOAD_ACTION, "已下载 a.bin"))

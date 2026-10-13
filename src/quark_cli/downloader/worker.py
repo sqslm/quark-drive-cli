@@ -52,6 +52,7 @@ from .core import (
     summary_text,
 )
 from .share import ShareDownloader, ShareSource
+from .search import SearchCancelled, stream
 
 SHARE_BROWSE_ACTION = "读取分享"
 
@@ -89,6 +90,8 @@ class Search:
 
     fid: str
     query: str
+    request_id: int = 0
+    recursive: bool = True
 
 
 @dataclass(frozen=True)
@@ -141,6 +144,29 @@ class SearchResults:
     fid: str
     query: str
     entries: tuple[Entry, ...]
+    request_id: int = 0
+    complete: bool = True
+    scanned: int = 0
+
+
+@dataclass(frozen=True)
+class SearchEnded:
+    request_id: int
+    message: str
+    cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class Locate:
+    entry: Entry
+    generation: int
+
+
+@dataclass(frozen=True)
+class Located:
+    entry: Entry
+    generation: int
+    error: str = ""
 
 
 @dataclass(frozen=True)
@@ -184,6 +210,10 @@ class Backend(Protocol):
 
     def search(self, fid: str, query: str) -> list[Entry]: ...
 
+    def search_stream(self, request: Search, report: Callable, stopped: Callable) -> None: ...
+
+    def locate(self, entry: Entry) -> Entry: ...
+
     def download(
         self,
         request: Download,
@@ -213,12 +243,40 @@ class DriveBackend:
         self._cookie = cookie
         self._transport = transport
         self._guard = default_guard(transport, None)
+        self._path_cache: dict[str, tuple] = {}
 
     def _client(self) -> QuarkClient:
         return QuarkClient(self._cookie(), transport=self._transport, guard=self._guard)
 
     def account_nickname(self) -> str:
         return get_account_nickname(self._cookie(), transport=self._transport, guard=self._guard)
+
+    def search_stream(self, request: Search, report: Callable, stopped: Callable) -> None:
+        self._path_cache.clear()
+        with QuarkClient(self._cookie(), transport=self._transport, guard=self._guard,
+                         timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+            stream(Files(client), request.fid, request.query, request.recursive, report, stopped)
+
+    def locate(self, entry: Entry) -> Entry:
+        with self._client() as client:
+            paths = RemotePaths(Files(client))
+            item = Files(client).info(entry.fid)
+            if item.get("file_name") != entry.name or is_directory(item) != entry.directory:
+                raise RemoteError("搜索结果名称已经变化，请重新搜索")
+            from ..paths import valid_fid
+            parent = valid_fid(item.get("pdir_fid"))
+            if parent not in self._path_cache:
+                ancestry = paths.ancestry(entry.fid)
+                chain = ((ROOT_FID, ROOT_NAME),) + tuple(
+                    (obj.fid, obj.item["file_name"]) for obj in reversed(ancestry[1:-1]))
+                self._path_cache[parent] = chain
+            else:
+                matches = [row for row in paths.children(parent) if str(row.get("fid")) == entry.fid]
+                if len(matches) != 1 or matches[0].get("file_name") != entry.name:
+                    raise RemoteError("搜索结果所在目录已经变化，请重新搜索")
+            chain = self._path_cache[parent] + ((entry.fid, entry.name),)
+            path = "/" + "/".join(name for _, name in chain[1:])
+            return replace(entry, path=path, location=chain if entry.directory else chain[:-1])
 
     def listing(self, fid: str) -> list[Entry]:
         with self._client() as client:
@@ -377,12 +435,17 @@ class Worker:
         # window when the next batch starts, so a stop can never leak into a
         # later click while it still ends the item it was aimed at.
         self._stop = threading.Event()
+        self._search_requests: queue.Queue = queue.Queue()
+        self._search_cancel = threading.Event()
+        self._search_thread: threading.Thread | None = None
 
     def start(self) -> None:
         if self._thread is not None:
             return
         self._thread = threading.Thread(target=self._serve, name="quark-downloader", daemon=True)
         self._thread.start()
+        self._search_thread = threading.Thread(target=self._serve_search, name="quark-search", daemon=True)
+        self._search_thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
         """Ask the worker to finish after the current request; bounded join.
@@ -395,14 +458,45 @@ class Worker:
         if thread is None:
             return
         self._requests.put(None)
+        self.cancel_search()
+        self._search_requests.put(None)
         thread.join(timeout)
 
     def submit(self, request: Browse | BrowseShare | Search | Download | LoadAccountProfile) -> None:
+        if isinstance(request, Search):
+            self.cancel_search()
+            self._search_cancel = threading.Event()
+            self._search_requests.put((request, self._search_cancel))
+            return
         if isinstance(request, LoadAccountProfile):
             # The read-only profile has a short timeout and never holds up files.
             threading.Thread(target=self._load_profile, args=(request,), name="quark-profile", daemon=True).start()
             return
         self._requests.put(request)
+
+    def cancel_search(self) -> None:
+        self._search_cancel.set()
+
+    def _serve_search(self) -> None:
+        while True:
+            job = self._search_requests.get()
+            if job is None:
+                return
+            request, cancel = job
+            if cancel.is_set():
+                continue
+            def report(rows, scanned):
+                if not cancel.is_set():
+                    self.events.put(SearchResults(request.fid, request.query, rows,
+                        request.request_id, complete=False, scanned=scanned))
+            try:
+                self._backend.search_stream(request, report, cancel.is_set)
+                if not cancel.is_set():
+                    self.events.put(SearchResults(request.fid, request.query, (), request.request_id))
+            except SearchCancelled:
+                self.events.put(SearchEnded(request.request_id, "搜索已取消", True))
+            except Exception as error:
+                self.events.put(SearchEnded(request.request_id, describe_error(error, SEARCH_ACTION)))
 
     def _load_profile(self, request: LoadAccountProfile) -> None:
         try:
@@ -436,6 +530,12 @@ class Worker:
                 self._browse_share(request)
             elif isinstance(request, Search):
                 self._search(request)
+            elif isinstance(request, Locate):
+                try:
+                    found = self._backend.locate(request.entry)
+                    self.events.put(Located(found, request.generation))
+                except Exception as error:
+                    self.events.put(Located(request.entry, request.generation, describe_error(error, "定位目录")))
             else:
                 self._download(request)
 

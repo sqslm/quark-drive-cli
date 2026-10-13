@@ -536,3 +536,9 @@ The share downloader's offline tests in `tests/test_downloader_share.py` exercis
 - Temporary share cleanup uses a targeted recycle-record removal. Quark documents that ordinary deletion moves files to the [recycle bin](https://www.quark.cn/documents/help/recycle-bin); the list/remove request shapes were cross-checked against this project's [Quark API notes](https://github.com/zhaocongqi/clouddrive-auto-save/blob/main/docs/quark_apis.md). No source code was copied.
 - [Alibaba Cloud OSS multipart upload constraints](https://help.aliyun.com/zh/oss/user-guide/multipart-upload) document the allowed part sizes used in the upload implementation.
 - Quark API endpoints, including QR login and share saving, are unofficial and can change without notice. Run `quark auth status` after future logins and use a disposable test folder for live checks.
+
+### 客户端扩展进度
+
+下载器的全盘搜索已改为服务端分页，子树搜索增量显示；新增取消搜索，导航和输入不再因搜索整体禁用。全盘结果路径按选中或打开时定位，暂停路径排序；部分失败明确标注结果不完整。下载引擎、续传及分享清理规则保持不变。
+
+后续按 Electron 基础客户端、文件管理、上传与持久传输中心、分享与回收站、发布完善五个阶段推进。详见 [客户端功能路线图](docs/网盘下载器待实现.md)。

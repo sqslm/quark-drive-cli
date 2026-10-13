@@ -21,7 +21,7 @@ from unittest.mock import patch
 import httpx
 
 from quark_cli.downloader import worker as worker_module
-from quark_cli.downloader.core import DOWNLOAD_ACTION, SEARCH_ACTION, Entry, Location, download_plan
+from quark_cli.downloader.core import DOWNLOAD_ACTION, Entry, Location, download_plan
 from quark_cli.downloader.worker import (
     Browse,
     Download,
@@ -32,6 +32,7 @@ from quark_cli.downloader.worker import (
     Progress,
     Search,
     SearchResults,
+    SearchEnded,
     Stopped,
     Worker,
 )
@@ -75,6 +76,10 @@ class FakeBackend:
             if self.listing_error is not None:
                 raise self.listing_error
         return list(self.listing_rows)
+
+    def search_stream(self, request, report, stopped):
+        if not stopped():
+            report(tuple(self.search(request.fid, request.query)), 0)
 
     def search(self, fid, query):
         with self._lock:
@@ -147,6 +152,7 @@ class WorkerTests(unittest.TestCase):
         event = worker.events.get(timeout=5)
         self.assertIsInstance(event, SearchResults)
         self.assertEqual((event.fid, event.query, event.entries), ("0", "报告", (hit,)))
+        self.assertTrue(worker.events.get(timeout=5).complete)
         with self.assertRaises(queue.Empty):
             worker.events.get_nowait()
         self.assertEqual(backend.searches, [("0", "报告")])
@@ -156,8 +162,7 @@ class WorkerTests(unittest.TestCase):
         worker = self._worker(backend)
         worker.submit(Search("0", "报告"))
         failed = worker.events.get(timeout=5)
-        self.assertIsInstance(failed, Failed)
-        self.assertEqual(failed.action, SEARCH_ACTION)
+        self.assertIsInstance(failed, SearchEnded)
         self.assertEqual(failed.message, "搜索失败：发生未预期的错误")
         self.assertNotIn("private", failed.message)
 

@@ -360,7 +360,10 @@ class WindowCase(unittest.TestCase):
 
     @staticmethod
     def _submitted(window: DownloaderWindow) -> Any:
-        return window._worker._requests.get_nowait()
+        try:
+            return window._worker._requests.get_nowait()
+        except queue.Empty:
+            return window._worker._search_requests.get_nowait()[0]
 
     def _listing(self, window: DownloaderWindow, *entries: Entry) -> None:
         """Deliver one folder listing of the root, as the worker would."""
@@ -368,7 +371,7 @@ class WindowCase(unittest.TestCase):
 
     @staticmethod
     def _results(window: DownloaderWindow, query: str, *entries: Entry, fid: str = ROOT_FID) -> None:
-        window._handle(SearchResults(fid=fid, query=query, entries=entries))
+        window._handle(SearchResults(request_id=window._search_generation, fid=fid, query=query, entries=entries))
 
     @staticmethod
     def _click(window: DownloaderWindow, *, x: int = 10, y: int = 0, time: int | None = None) -> Any:
@@ -788,9 +791,9 @@ class SearchTests(WindowCase):
         window._scope_var.set("当前目录及子目录")
         window._search_var.set("目标")
         window.search()
-        self.assertEqual(self._submitted(window), Search("d", "目标"))
+        self.assertEqual(self._submitted(window), Search("d", "目标", request_id=window._search_generation, recursive=(window._pending or window._search).recursive))
         self.assertTrue(window._return_button.visible)
-        window._handle(SearchResults("d", "目标", ()))
+        window._handle(SearchResults("d", "目标", (), request_id=window._search_generation))
         window.leave_search()
         self.assertFalse(window._return_button.visible)
 
@@ -802,7 +805,7 @@ class SearchTests(WindowCase):
         window._search_var.set("  报告  ")
 
         window.search_subdirectories()
-        self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告"))
+        self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告", request_id=window._search_generation, recursive=(window._pending or window._search).recursive))
         self.assertTrue(window._searching)
         self.assertEqual(window._status_var.value, SEARCHING_STATUS)
         # One request at a time: nothing else is submitted while it is in flight.
@@ -819,11 +822,11 @@ class SearchTests(WindowCase):
         window._search_var.set("报告")
 
         window.search()
-        self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告"))
+        self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告", request_id=window._search_generation, recursive=(window._pending or window._search).recursive))
 
         window._handle(Failed(SEARCH_ACTION, "搜索失败：上游连接失败"))
         window.search_subdirectories()
-        self.assertEqual(self._submitted(window), Search(fid="d", query="报告"))
+        self.assertEqual(self._submitted(window), Search(fid="d", query="报告", request_id=window._search_generation, recursive=(window._pending or window._search).recursive))
 
     def test_a_blank_keyword_only_hints_and_submits_nothing(self):
         window = self._window()
@@ -844,7 +847,7 @@ class SearchTests(WindowCase):
         self._submitted(window)
 
         window._handle(
-            SearchResults(
+            SearchResults(request_id=window._search_generation,
                 fid=ROOT_FID,
                 query="报告",
                 entries=(
@@ -864,7 +867,7 @@ class SearchTests(WindowCase):
         self.assertEqual(window._status_var.value, IDLE_STATUS)
         self.assertEqual(window._count_var.value, match_text(2, 2))
         self.assertFalse(window._searching)
-        self.assertEqual(window._search, Search(fid=ROOT_FID, query="报告"))
+        self.assertEqual(window._search, Search(fid=ROOT_FID, query="报告", request_id=window._search_generation, recursive=(window._pending or window._search).recursive))
         # A search session is running, so it can be left again; the buttons that
         # ask for a request are usable now that none is in flight.
         self.assertEqual(window._return_button.state, "normal")
@@ -882,7 +885,7 @@ class SearchTests(WindowCase):
         self._submitted(window)
 
         # ...while a search that matched nothing says so outright.
-        window._handle(SearchResults(fid=ROOT_FID, query="报告", entries=()))
+        window._handle(SearchResults(request_id=window._search_generation, fid=ROOT_FID, query="报告", entries=()))
         self.assertEqual(window._tree.rows, [])
         self.assertEqual(window._count_var.value, NO_MATCH_RESULT_TEXT)
         self.assertEqual(window._status_var.value, IDLE_STATUS)
@@ -920,13 +923,13 @@ class SearchTests(WindowCase):
 
         # Another keyword, another folder: neither answer belongs to the request
         # the window is waiting for.
-        window._handle(SearchResults(fid=ROOT_FID, query="别的词", entries=(Entry("x", "别的.bin", False, 4),)))
-        window._handle(SearchResults(fid="d", query="报告", entries=(Entry("y", "别处.bin", False, 4),)))
+        window._handle(SearchResults(request_id=window._search_generation, fid=ROOT_FID, query="别的词", entries=(Entry("x", "别的.bin", False, 4),)))
+        window._handle(SearchResults(request_id=window._search_generation, fid="d", query="报告", entries=(Entry("y", "别处.bin", False, 4),)))
         self.assertTrue(window._searching)
         self.assertEqual([row[1] for row in window._tree.rows], ["报告旧.bin"])
 
         window._handle(
-            SearchResults(
+            SearchResults(request_id=window._search_generation,
                 fid=ROOT_FID,
                 query="报告",
                 entries=(Entry("m", "报告.bin", False, 4, "/我的网盘/报告.bin", (("0", "我的网盘"),)),),
@@ -941,7 +944,7 @@ class SearchTests(WindowCase):
         window.search_subdirectories()
         self._submitted(window)
         window._handle(
-            SearchResults(
+            SearchResults(request_id=window._search_generation,
                 fid=ROOT_FID,
                 query="报告",
                 entries=(Entry("m", "报告.bin", False, 4, "/我的网盘/报告.bin", (("0", "我的网盘"),)),),
@@ -969,10 +972,10 @@ class SearchTests(WindowCase):
         self.assertTrue(window._searching)
         self.assertEqual(window._status_var.value, SEARCHING_STATUS)
         self.assertEqual([row[1] for row in window._tree.rows], ["报告旧.bin"])
-        self.assertEqual(window._search_button.state, "disabled")
+        self.assertEqual(window._search_button.state, "normal")
 
         window._handle(
-            SearchResults(
+            SearchResults(request_id=window._search_generation,
                 fid=ROOT_FID,
                 query="报告",
                 entries=(Entry("m", "报告.bin", False, 4, "/我的网盘/报告.bin", (("0", "我的网盘"),)),),
@@ -987,7 +990,7 @@ class SearchTests(WindowCase):
         window.search_subdirectories()
         self._submitted(window)
         window._handle(
-            SearchResults(
+            SearchResults(request_id=window._search_generation,
                 fid=ROOT_FID,
                 query="报告",
                 entries=(Entry("m", "报告.bin", False, 4, "/我的网盘/报告.bin", (("0", "我的网盘"),)),),
@@ -995,13 +998,13 @@ class SearchTests(WindowCase):
         )
 
         window.refresh()
-        self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告"))
+        self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告", request_id=window._search_generation, recursive=(window._pending or window._search).recursive))
         self.assertEqual(window._status_var.value, SEARCHING_STATUS)
         with self.assertRaises(queue.Empty):
             self._submitted(window)
 
         window._handle(
-            SearchResults(
+            SearchResults(request_id=window._search_generation,
                 fid=ROOT_FID,
                 query="报告",
                 entries=(Entry("m2", "报告2.bin", False, 4, "/我的网盘/报告2.bin", (("0", "我的网盘"),)),),
@@ -1009,41 +1012,27 @@ class SearchTests(WindowCase):
         )
         self.assertEqual([row[1] for row in window._tree.rows], ["报告2.bin"])
 
-    def test_a_search_in_flight_freezes_the_search_navigation_and_the_filters(self):
+    def test_search_keeps_controls_available_but_refuses_download(self):
         window = self._window()
         self._listing(window, Entry("d", "报告目录", True, None))
         with tempfile.TemporaryDirectory() as folder:
             window._output_dir = folder
-            self._tick(window, "d")
             window._search_var.set("报告")
             window.search_subdirectories()
-            self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="报告"))
-            self.assertEqual(window._search_button.state, "disabled")
-            self.assertEqual(window._scope_combo.state, "disabled")
-            self.assertEqual(window._return_button.state, "disabled")
-            self.assertEqual(window._up_button.state, "disabled")
-            self.assertEqual(window._refresh_button.state, "disabled")
+            first = self._submitted(window)
+            self.assertEqual(window._search_button.state, "normal")
+            self.assertEqual(window._scope_combo.state, "readonly")
+            self.assertEqual(window._return_button.state, "normal")
+            self.assertEqual(window._keyword_entry.state, "normal")
             self.assertEqual(window._download_button.state, "disabled")
-            self.assertEqual(window._keyword_entry.state, "disabled")
-            self.assertEqual(window._kind_combo.state, "disabled")
-            self.assertEqual(window._open_folder_button.state, "normal")
-
-            window.search()
-            window.search_subdirectories()
-            window.go_up()
-            window.refresh()
-            window.leave_search()
             window.start_download()
-            window._on_activate(None)
-            # Editing a filter while the search runs changes neither the table
-            # nor the queue.
-            window._search_var.set("别的词")
-            window._kind_var.set(KIND_DIRECTORIES)
-            window._on_filter_change()
             with self.assertRaises(queue.Empty):
                 self._submitted(window)
-            self.assertEqual([row[1] for row in window._tree.rows], ["报告目录"])
-            self.assertEqual(window._location.fid, ROOT_FID)
+            window.search_subdirectories()
+            second = self._submitted(window)
+            self.assertNotEqual(first.request_id, second.request_id)
+            window.cancel_search()
+            self.assertFalse(window._searching)
 
     def test_a_download_freezes_the_search_and_the_filters(self):
         window = self._window()
@@ -1053,7 +1042,7 @@ class SearchTests(WindowCase):
             window.search_subdirectories()
             self._submitted(window)
             window._handle(
-                SearchResults(
+                SearchResults(request_id=window._search_generation,
                     fid=ROOT_FID,
                     query="报告",
                     entries=(
@@ -1098,7 +1087,7 @@ class SearchTests(WindowCase):
         window.search_subdirectories()
         self._submitted(window)
         window._handle(
-            SearchResults(
+            SearchResults(request_id=window._search_generation,
                 fid=ROOT_FID,
                 query="报告",
                 entries=(
@@ -1146,7 +1135,7 @@ class SearchTests(WindowCase):
             window.search_subdirectories()
             self._submitted(window)
             window._handle(
-                SearchResults(
+                SearchResults(request_id=window._search_generation,
                     fid=ROOT_FID,
                     query="报告",
                     entries=(
@@ -1239,7 +1228,7 @@ class FilterTests(WindowCase):
         window.search_subdirectories()
         self._submitted(window)
         window._handle(
-            SearchResults(
+            SearchResults(request_id=window._search_generation,
                 fid=ROOT_FID,
                 query="报告",
                 entries=(
@@ -1301,7 +1290,7 @@ class FilterTests(WindowCase):
         window._kind_var.set(KIND_FILES)
         window._on_filter_change()
         window.search_subdirectories()
-        self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="f"))
+        self.assertEqual(self._submitted(window), Search(fid=ROOT_FID, query="f", request_id=window._search_generation, recursive=(window._pending or window._search).recursive))
         self._results(
             window,
             "f",

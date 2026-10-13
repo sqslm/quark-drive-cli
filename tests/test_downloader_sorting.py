@@ -116,7 +116,7 @@ class SortWindowTests(WindowCase):
             window._handle(Finished(DOWNLOAD_ACTION, "done"))
             self.assertEqual(self._requests(window)[0].fid, "a")
             window._handle(Failed(DOWNLOAD_ACTION, "failed"))
-            for flag in ("_searching", "_reading_share", "_logging_in"):
+            for flag in ("_reading_share", "_logging_in"):
                 setattr(window, flag, True)
                 window.sort_by("name")
                 self.assertEqual(window._sort_key, "size")
