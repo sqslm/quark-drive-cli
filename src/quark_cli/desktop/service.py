@@ -156,7 +156,8 @@ class DesktopService:
                     raise UsageError('分享浏览不能创建或取消账户分享')
                 if method == 'share.create':
                     try:
-                        return sharing.create(p['entry'], passcode=p.get('passcode') or None, expire_days=p.get('expire_days',7))
+                        return sharing.create(p['entry'], passcode=p.get('passcode') or None, expire_days=p.get('expire_days',7),
+                            progress=lambda text: self.event(identifier,'share.progress',text))
                     except QuarkError as error:
                         evidence = safe_operation_result(getattr(error,'share_evidence',{}))
                         if not evidence:

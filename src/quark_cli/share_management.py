@@ -6,7 +6,7 @@ import math
 import re
 import time
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Mapping, Callable
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -527,7 +527,14 @@ class ShareManager:
             raise RemoteError("分享创建期间来源子树发生变化")
 
     def create(self, ref: str, *, passcode: str | None = None,
-               expire_days: int = 7, dry_run: bool = False, scope: Scope | None = None) -> dict[str, Any]:
+               expire_days: int = 7, dry_run: bool = False, scope: Scope | None = None,
+               verify_tree: bool = True, progress: Callable[[str], None] | None = None) -> dict[str, Any]:
+        if scope is not None and not verify_tree:
+            raise UsageError('受限范围分享必须核验完整子树')
+        def report(text):
+            if progress is not None:
+                progress(text)
+        report('正在核对选中项目…')
         if not isinstance(expire_days, int) or isinstance(expire_days, bool) or expire_days not in _EXPIRED:
             raise UsageError("分享有效期必须是 0、1、7 或 30 天")
         if passcode is not None and (not isinstance(passcode, str) or not _CODE.fullmatch(passcode)):
@@ -542,7 +549,7 @@ class ShareManager:
             raise UsageError("账户根目录不能作为分享来源")
         if scope:
             scope.check(obj.fid)
-        snapshot = self._account_snapshot(obj.fid, scope)
+        snapshot = self._account_snapshot(obj.fid, scope) if verify_tree else {obj.fid:self._identity(obj.item)}
         title = snapshot[obj.fid]["file_name"]
         if not _text(title):
             raise UsageError("来源对象名称无法作为安全分享标题")
@@ -552,7 +559,7 @@ class ShareManager:
             return {"result": "preview", "dry_run": True, **plan}
         for identity in snapshot.values():
             self._check_account(identity, scope)
-        if self._account_snapshot(obj.fid, scope) != snapshot:
+        if verify_tree and self._account_snapshot(obj.fid, scope) != snapshot:
             raise RemoteError("分享来源在提交前发生变化")
         body = {"fid_list": [obj.fid], "title": title, "url_type": plan["url_type"],
                 "expired_type": plan["expired_type"], "support_error_code": ["41060"]}
@@ -561,6 +568,7 @@ class ShareManager:
         evidence = {"result": "unknown", **plan}
         incomplete = False
         try:
+            report('正在提交分享…')
             try:
                 submit = self._call("post", "share", body=body, accepted_business_codes=(41060,))
             except QuarkError as error:
@@ -576,10 +584,12 @@ class ShareManager:
                 # Still obtain the original task/link for cleanup; malformed
                 # snapshot evidence can never become complete success.
                 incomplete = True
+            report('正在等待服务器生成链接…')
             task, task_incomplete = self._poll_creation(task_id, submit.get("metadata"))
             incomplete = incomplete or task_incomplete
             share_id = task["share_id"]
             evidence["share_id"] = share_id
+            report('正在核验链接和分享参数…')
             record = self._own_record(share_id)
             password = self._password(share_id, record)
             # These fields are associated with the original task/internal ID
@@ -593,7 +603,14 @@ class ShareManager:
             if incomplete:
                 evidence["result"] = "partial"
                 raise _operation_error("分享未完整创建；已保留核验后的链接，请人工处理；未重新提交或自动取消", evidence)
-            self._prove_created(password, obj.fid, snapshot, scope)
+            if verify_tree:
+                self._prove_created(password, obj.fid, snapshot, scope)
+            else:
+                _token, roots = self._members(password)
+                if len(roots) != 1 or roots[0]['fid'] != obj.fid:
+                    raise RemoteError('本次分享根集合与选中项目不符')
+                self._match_share(roots[0], snapshot[obj.fid], root=True)
+                self._check_account(snapshot[obj.fid], None)
         except AuthenticationError:
             raise _operation_error("分享创建或读回未获授权，结果未确认；未重新提交", evidence, authentication=True) from None
         except (RateLimitError, AccessRestrictedError) as error:

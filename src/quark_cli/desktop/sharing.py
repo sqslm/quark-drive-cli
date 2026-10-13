@@ -19,10 +19,14 @@ class Sharing:
         record = self.manager._own_record(share_id)
         return safe_operation_result(self.manager._password(share_id, record))
 
-    def create(self, entry, *, passcode=None, expire_days=7):
+    def create(self, entry, *, passcode=None, expire_days=7, progress=None):
         actual, _ = self.files.checked(entry)
         return self.manager.create(
-            valid_fid(actual["fid"]), passcode=passcode, expire_days=expire_days
+            valid_fid(actual["fid"]),
+            passcode=passcode,
+            expire_days=expire_days,
+            verify_tree=False,
+            progress=progress,
         )
 
     def save(self, source, path, entries, target):

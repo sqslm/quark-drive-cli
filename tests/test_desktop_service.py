@@ -75,6 +75,17 @@ class DesktopTests(unittest.TestCase):
         self.assertFalse(result['saved'])
         self.assertEqual(result['result'],'unknown')
         self.assertFalse(self.service.managing)
+    def test_share_progress_uses_the_creation_request_id(self):
+        def create(*args,**kwargs):
+            kwargs['progress']('正在核验链接和分享参数…')
+            return {'result':'created'}
+        with patch.object(self.backend,'_client',create=True), patch('quark_cli.desktop.service.Sharing') as sharing:
+            sharing.return_value.create.side_effect = create
+            result=self.service.dispatch('create-progress','share.create',{'entry':{}},None)
+        self.assertEqual(result['result'],'created')
+        event = next(message for message in self.messages if message.get('event')=='share.progress')
+        self.assertEqual(event['id'],'create-progress')
+        self.assertFalse(self.service.managing)
     def test_handshake_preferences_and_browse_contain_no_credential(self):
         self.service.accept({"id": "init", "method": "hello"})
         data = self.wait_result("init")["result"]

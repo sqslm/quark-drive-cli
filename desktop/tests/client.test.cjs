@@ -17,10 +17,11 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   try {
-    const page = await browser.newPage({ viewport: { width: 1180, height: 780 } });
+    const page = await browser.newPage({ viewport: { width: 1180, height: 780 },reducedMotion:'no-preference' });
     const errors = []; page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(() => {
       const listeners = new Set(); let cancelled = false; let tasks = [];
+      window.testClockMs = Date.now();Date.now = () => window.testClockMs;
       let shares = [], recycle = [{record_id:'trash-a',fid:'gone-a',name:'测试删除.txt',directory:false,size:4,parent:'0'}, {record_id:'trash-b',fid:'gone-b',name:'测试恢复.txt',directory:false,size:4,parent:'0'}];
       const rows = Array.from({ length: 10000 }, (_, index) => ({ fid: String(index), name: `知否 ${String(index).padStart(5,'0')}.txt`, directory: false, size: index + 1, path: '', location: [] }));
       const preferences = { output_dir: 'C:\\Downloads', connections: 4, limit_rate: null, width: 1180, height: 780 };
@@ -47,14 +48,14 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
           }
           if(method === 'share.parse') return { url:'https://pan.quark.cn/s/abcdef', passcode:'1234' };
           if(method === 'share.open') return { handle:'share', entries:rows.slice(0,2) };
-          if(method === 'share.create') { const result={result:'created',share_id:'own-new',pwd_id:'new-public',title:params.entry.name,share_url:'https://pan.quark.cn/s/new-public',passcode:params.passcode,expired_type:4};shares.push(result);return result; }
+          if(method === 'share.create') { listeners.forEach(callback => callback({id,event:'share.progress',data:'正在等待服务器生成链接…'})); await new Promise(resolve => {window.releaseShareCreate = resolve;});const result={result:'created',share_id:'own-new',pwd_id:'new-public',title:params.entry.name,share_url:'https://pan.quark.cn/s/new-public',passcode:params.passcode,expired_type:4,expired_at:Date.now()+720*3600000};shares.push(result);return result; }
           if(method === 'share.list') return {items:shares.map(row => ({...row})),catalog_complete:true};
           if(method === 'share.link') return shares.find(row => row.share_id === params.share_id);
           if(method === 'share.revoke') {shares=shares.filter(row => !params.entries.some(entry => entry.share_id === row.share_id));return params.entries.map(row => ({name:row.title,state:'done',detail:'已取消分享'}));}
           if(method === 'recycle.list') return recycle.map(row => ({...row}));
           if(method === 'recycle.remove' || method === 'recycle.restore') {recycle=recycle.filter(row => !params.entries.some(entry => entry.record_id === row.record_id));return params.entries.map(row => ({name:row.name,state:'done',detail:method === 'recycle.remove' ? '已永久删除' : '已恢复到原目录'}));}
           if(method === 'share.save') return window.testSaveUnknown ? {saved:false,result:'unknown',detail:'结果未确认，请核实目标目录'} : {saved:true,item_count:params.entries.length,destination_path:'/'};
-          if(method === 'preferences.save') return { preferences:params, persisted:true, warning:'' };
+          if(method === 'preferences.save') return { preferences:params, persisted:!window.testSaveWarning, warning:window.testSaveWarning ? '设置仅在窗口内有效' : '' };
           if(method === 'download') { tasks.push({ id:'task', name: params.entries[0].name, state:'waiting', detail:'', target:'C:\\Downloads\\test.txt', valid:true,direction:'download',revision:1 }); return tasks.map(task => ({...task})); }
           if(method === 'upload') { tasks.push({ id:'upload-task',name:'测试.txt',state:'waiting',detail:'',target:'/测试.txt',valid:true,direction:'upload',revision:1 }); return tasks.map(task => ({...task})); }
           if(method === 'tasks.cancel') { tasks = tasks.map(task => params.ids.includes(task.id) ? {...task,state:'cancelled',revision:task.revision+1} : task); return tasks.map(task => ({...task})); }
@@ -84,12 +85,28 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByLabel('分享有效期').selectOption('30');
     await page.getByLabel('新分享提取码').fill('a123');
     await page.getByRole('button',{name:'确认创建',exact:true}).click();
+    await page.locator('.share-progress').getByText('正在等待服务器生成链接…',{exact:true}).waitFor();
+    await page.evaluate(() => window.releaseShareCreate());
     await page.getByRole('button',{name:'复制分享文案',exact:true}).click();
+    await page.locator('.toast.success').getByText('已复制分享文案',{exact:true}).waitFor();
+    assert.equal(await page.locator('.toast').evaluate(element => getComputedStyle(element).animationName),'toast-enter');
+    await page.getByRole('button',{name:'复制分享文案',exact:true}).click();
+    await page.locator('.toast.success').getByText('已复制分享文案',{exact:true}).waitFor();
+    await mkdir(path.resolve(__dirname, '../test-results'), {recursive:true});
+    await page.waitForFunction(() => {const element=document.querySelector('.toast');return element && getComputedStyle(element).opacity === '1';});
+    assert.ok(await page.locator('.toast').evaluate(element => {const box=element.getBoundingClientRect();return !!document.elementFromPoint(box.x+box.width/2,box.y+box.height/2)?.closest('.toast');}));
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/feedback.png')});
+    await page.getByRole('button',{name:'关闭提示',exact:true}).click();
+    assert.equal(await page.locator('.toast').count(),0);
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     const shareCreated = await page.evaluate(() => window.testCalls.find(call => call.method === 'share.create'));
     assert.equal(shareCreated.params.entry.fid,'1');assert.equal(shareCreated.params.expire_days,30);assert.equal(shareCreated.params.passcode,'a123');
     assert.ok(await page.evaluate(() => window.testCalls.some(call => call.method === 'clipboard' && call.params.text.includes('提取码：a123'))));
     await page.getByRole('button',{name:'我的分享',exact:true}).click();
+    await page.getByText('剩余 720 小时',{exact:true}).waitFor();
+    await page.evaluate(() => {window.testClockMs+=10*3600000;});
+    await page.getByText('剩余 710 小时',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'share.list').length),1);
     await page.getByLabel('选择记录 知否 00001.txt',{exact:true}).check();
     await page.getByRole('button',{name:'取消选中分享',exact:true}).click();
     await page.getByRole('button',{name:'确认',exact:true}).click();
@@ -110,6 +127,14 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button',{name:'确认',exact:true}).click();
     await page.getByText('测试恢复.txt：已恢复到原目录',{exact:true}).waitFor();
     await page.getByRole('button',{name:'关闭',exact:true}).click();
+    await page.getByRole('button',{name:'我的文件',exact:true}).click();
+    await page.getByRole('button',{name:'设置',exact:true}).click();
+    await page.getByRole('button',{name:'保存设置',exact:true}).click();
+    await page.locator('.toast.success').getByText('设置已保存',{exact:true}).waitFor();
+    await page.evaluate(() => {window.testSaveWarning=true;});
+    await page.getByRole('button',{name:'保存设置',exact:true}).click();
+    await page.locator('.toast.warning').getByText('设置仅在窗口内有效',{exact:true}).waitFor();
+    await page.evaluate(() => {window.testSaveWarning=false;});
     await page.getByRole('button',{name:'我的文件',exact:true}).click();
     await page.getByLabel('搜索关键词').fill('知否');
     await page.getByRole('button', { name:'搜索', exact:true }).click();

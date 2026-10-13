@@ -1,0 +1,24 @@
+const {test} = require('node:test');
+const assert = require('node:assert/strict');
+const {readFile} = require('node:fs/promises');
+const path = require('node:path');
+const vm = require('node:vm');
+const ts = require('typescript');
+
+test('remaining lifetime uses the server deadline and rolls over at hour and expiry boundaries',async () => {
+  const source = await readFile(path.resolve(__dirname,'../src/shareExpiry.ts'),'utf8');
+  const code = ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+  const exported = {};vm.runInNewContext(code,{exports:exported,Date,Number,Math});
+  const now = Date.UTC(2026,9,13,12),hour = 3600000;
+  const expiry = now+48*hour;
+  const row = {expired_type:3,expired_at:expiry};
+  assert.equal(exported.shareExpiry(row,now).text,'剩余 48 小时');
+  assert.equal(exported.shareExpiry(row,now+1).text,'剩余 47 小时');
+  assert.equal(exported.shareExpiry(row,expiry-hour+1).text,'不足 1 小时');
+  assert.equal(exported.shareExpiry(row,expiry).text,'已过期');
+  assert.equal(exported.shareExpiry({...row,expired_at:expiry/1000},now).text,'剩余 48 小时');
+  assert.equal(exported.shareExpiry({expired_type:1},expiry).text,'永久');
+  assert.equal(exported.shareExpiry({expired_type:3},now).text,'到期时间未知');
+  for(const value of [0,-1,Infinity,NaN,'invalid',10**20]) assert.equal(exported.shareExpiry({expired_type:3,expired_at:value},now).text,'到期时间未知');
+  assert.match(exported.shareExpiry(row,now).title,/^到期：/);
+});

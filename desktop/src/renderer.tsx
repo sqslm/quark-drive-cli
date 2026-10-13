@@ -7,6 +7,7 @@ import { FileDialog, FileAction } from './FileDialog';
 import { TasksPanel } from './TasksPanel';
 import { CatalogPanel } from './CatalogPanel';
 import { SharingDialog } from './SharingDialog';
+import { FeedbackProvider, useFeedback, Tone } from './Feedback';
 
 const units = (bytes: number | null) => bytes === null ? '—' : bytes < 1024 ? `${bytes} B` :
   bytes < 1048576 ? `${(bytes / 1024).toFixed(1)} KiB` : bytes < 1073741824 ? `${(bytes / 1048576).toFixed(1)} MiB` : `${(bytes / 1073741824).toFixed(2)} GiB`;
@@ -17,6 +18,7 @@ function FileIcon({ folder }: { folder: boolean }) {
   </svg>;
 }
 function App() {
+  const toast = useFeedback();
   const [page, setPage] = useState('drive');
   const [nickname, setNickname] = useState('未登录');
   const [rows, setRows] = useState<Entry[]>([]);
@@ -38,6 +40,7 @@ function App() {
   const [format,setFormat] = useState('');
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState('正在启动网盘后端…');
+  function notify(text:string,tone:Tone='info') {setStatus(text);toast(text,tone);}
   const [preferences, setPreferences] = useState<Preferences>({ output_dir: '', connections: 4, limit_rate: null, width: 1180, height: 780 });
   const [threads, setThreads] = useState('4');
   const [rate, setRate] = useState('0');
@@ -64,7 +67,7 @@ function App() {
     }));
   }
   async function action<T>(work: () => Promise<T>): Promise<T | undefined> {
-    try { return await work(); } catch (error) { setStatus(error instanceof Error ? error.message : '操作失败'); }
+    try { return await work(); } catch (error) { notify(error instanceof Error ? error.message : '操作失败','error'); }
   }
   function cancelSearch() {
     searchId.current = null; setSearching(false);
@@ -103,7 +106,7 @@ function App() {
     if (generation === view.current) { setLoading(false); if (result) { setRows(result); setSharePath(parent); setQuery(''); setChecked(new Set()); } }
   }
   async function runSearch() {
-    if (!query.trim()) { setStatus('请输入搜索关键词'); return; }
+    if (!query.trim()) { notify('请输入搜索关键词','warning'); return; }
     const id = crypto.randomUUID(); searchId.current = id; ++view.current;
     setResultsRecursive(scope !== 'global');
     if(scope === 'global' && sort?.key === 'path') setSort(null);
@@ -122,7 +125,7 @@ function App() {
       await call('search', { query: query.trim(), fid: scope === 'global' ? '0' : trail.at(-1)![0], recursive: scope !== 'global' }, id);
       if (searchId.current === id) { if (!received) setRows([]); setStatus('搜索完成'); }
     } catch (error) {
-      if (searchId.current === id) setStatus(`${error instanceof Error ? error.message : '搜索失败'}${received ? '；结果不完整' : ''}`);
+      if (searchId.current === id) notify(`${error instanceof Error ? error.message : '搜索失败'}${received ? '；结果不完整' : ''}`,'error');
     } finally { off(); if (searchId.current === id) { searchId.current = null; setSearching(false); } }
   }
   async function openShare() {
@@ -130,26 +133,26 @@ function App() {
     const result = await action<{ handle: string; entries: Entry[] }>(() => call('share.open', { text: shareText, passcode }));
     if (generation !== view.current) return;
     setLoading(false);
-    if (result) { setShare(result.handle); setSharePath('/'); setRows(result.entries); setChecked(new Set()); setQuery(''); setKind('all'); setFormat(''); setExtensions(''); setSearchView(false); setPage('drive'); setStatus('分享只读浏览；下载后清理临时转存'); }
+    if (result) { setShare(result.handle); setSharePath('/'); setRows(result.entries); setChecked(new Set()); setQuery(''); setKind('all'); setFormat(''); setExtensions(''); setSearchView(false); setPage('drive'); notify('已打开分享，下载后清理临时转存','success'); }
   }
   async function saveSettings(folder = preferences.output_dir) {
     const n = Number(threads), limit = Number(rate);
     if (!threads.trim() || !Number.isInteger(n) || n < 1 || n > 16 || !rate.trim() || !Number.isFinite(limit) || (limit !== 0 && (limit < .01 || limit > 10240))) {
-      setStatus('线程数为 1–16；限速为 0 或 0.01–10240 MiB/s'); return false;
+      notify('线程数为 1–16；限速为 0 或 0.01–10240 MiB/s','warning'); return false;
     }
     const next = { ...preferences, output_dir: folder, connections: n, limit_rate: limit ? Math.floor(limit * 1048576) : null };
     const saved = await action<{ preferences: Preferences; warning: string }>(() => call('preferences.save', next));
-    if (saved) { setPreferences(saved.preferences); setStatus(saved.warning || '设置已保存'); return true; } return false;
+    if (saved) { setPreferences(saved.preferences); notify(saved.warning || '设置已保存',saved.warning ? 'warning' : 'success'); return true; } return false;
   }
   useEffect(() => {
     const off = window.quark.onEvent((event: Event) => {
       if (event.event === 'task') {
         const task = event.data as Task;
         setTasks(old => old.some(row => row.id === task.id) ? old.map(row => row.id === task.id ? task : row) : [...old, task]);
-      } else if (event.event === 'batch.finished') { setTransferring(false); setStatus('本批次已结束，请查看逐项结果'); }
+      } else if (event.event === 'batch.finished') { setTransferring(false); notify('本批次已结束，请查看逐项结果'); }
       else if (event.event === 'login.qr' && event.id === loginId.current) setQr(event.data as string);
-      else if (event.event === 'warning') setStatus(event.data as string);
-      else if (event.event === 'backend.error') { setStatus(event.data as string); setTransferring(false); setSearching(false); }
+      else if (event.event === 'warning') notify(event.data as string,'warning');
+      else if (event.event === 'backend.error') { notify(event.data as string,'error'); setTransferring(false); setSearching(false); }
     });
     void action(async () => {
       const hello = await call('hello');
@@ -197,7 +200,7 @@ function App() {
       for(const row of entries) located.push(row.path ? row : await call('locate',{ entry:row }));
       if(generation !== view.current) return;
       await window.quark.copyText(located.map(row => row.path).join('\n'));
-      setStatus(`已复制 ${located.length} 项路径`);
+      notify(`已复制 ${located.length} 项路径`,'success');
     });
   }
   const all = filtered.length > 0 && selected.length === filtered.length;
@@ -213,14 +216,14 @@ function App() {
       if(!sources.length) return;
       if(!alreadyRunning && !await saveSettings()) return;
       setTransferring(true);
-      try { acceptTasks(await call('upload',{sources,parent:trail.at(-1)![0]})); setPage('tasks'); }
+      try { acceptTasks(await call('upload',{sources,parent:trail.at(-1)![0]})); setPage('tasks'); notify(`已加入 ${sources.length} 个上传任务`,'success'); }
       catch(error) { if(!alreadyRunning) setTransferring(false); throw error; }
     });
   }
   async function login() {
     cancelSearch(); ++view.current; ++profileGeneration.current; setLoading(false); const id = crypto.randomUUID(); loginId.current = id; setLoggingIn(true); setNickname('正在登录');
     const result = await action<{ nickname: string; cancelled?: boolean }>(() => call('login', {}, id));
-    if (loginId.current === id) { setLoggingIn(false); setQr(null); if (result && !result.cancelled) { setNickname(result.nickname); setAccountRevision(old => old+1); acceptTasks(await call('tasks')); await browse([['0','我的网盘']]); } else setNickname('昵称暂不可用'); }
+    if (loginId.current === id) { setLoggingIn(false); setQr(null); if (result && !result.cancelled) { setNickname(result.nickname); setAccountRevision(old => old+1); acceptTasks(await call('tasks')); await browse([['0','我的网盘']]); notify('登录成功','success'); } else setNickname('昵称暂不可用'); }
   }
   return <><div className="titlebar"><span>夸克网盘客户端</span></div><div className="app">
     <aside><div className="brand"><span className="brand-mark">Q</span><div>夸克网盘<small>桌面客户端</small></div></div>
@@ -239,7 +242,7 @@ function App() {
           <div className="search-input"><input aria-label="搜索关键词" placeholder="搜索文件名称" value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !share) void runSearch(); }} /></div>
           <select aria-label="搜索范围" disabled={!!share} value={scope} onChange={event => setScope(event.target.value)}><option value="global">全盘</option><option value="subtree">当前目录及子目录</option></select>
           <button className="primary" disabled={!!share} onClick={() => void runSearch()}>搜索</button>
-          {searching && <button onClick={() => { cancelSearch(); setStatus('搜索已取消；已读结果可能不完整'); }}>取消搜索</button>}</div>
+          {searching && <button onClick={() => { cancelSearch(); notify('搜索已取消；已读结果可能不完整'); }}>取消搜索</button>}</div>
         <div className="filters"><select aria-label="类型筛选" value={kind} onChange={event => setKind(event.target.value)}><option value="all">全部类型</option><option value="files">仅文件</option><option value="directories">仅目录</option></select>
           <select aria-label="格式筛选" value={format} onChange={event => setFormat(event.target.value)}><option value="">全部格式</option>{[...Object.keys(extensionGroups),'无扩展名'].map(value => <option key={value} value={value}>{value}</option>)}<option value="custom">自定义格式</option></select>
           {format === 'custom' && <input aria-label="自定义扩展名" placeholder="mp4, mkv, tar.gz" value={extensions} onChange={event => setExtensions(event.target.value)}/>}
@@ -264,7 +267,7 @@ function App() {
           <button className="primary" disabled={searching || loading || loggingIn || !selected.length || !preferences.output_dir} onClick={() => void action(async () => {
             const alreadyRunning = transferring;
             if (!alreadyRunning && !await saveSettings()) return; setTransferring(true);
-            try { const result = await call('download', { entries: selected, handle: share, path: sharePath }); acceptTasks(result); setPage('tasks'); }
+            try { const result = await call('download', { entries: selected, handle: share, path: sharePath }); acceptTasks(result); setPage('tasks'); notify(`已加入 ${selected.length} 个下载任务`,'success'); }
             catch (error) { if(!alreadyRunning) setTransferring(false); throw error; }
           })}>{transferring ? "加入队列" : "下载"}{selected.length ? `（${selected.length}）` : ''}</button></footer>
       </>}
@@ -272,8 +275,8 @@ function App() {
         <label>分享链接或文案<textarea value={shareText} onChange={event => { shareRevision.current++; setShareText(event.target.value); }} onBlur={() => { const text = shareText, revision = shareRevision.current, code = codeRevision.current; void action(async () => { if (!text.trim()) return; const parsed = await call('share.parse', { text }); if (revision === shareRevision.current && code === codeRevision.current && parsed.passcode) setPasscode(parsed.passcode); }); }} /></label>
         <label>提取码 <small>可手工修改</small><input aria-label="提取码" value={passcode} onChange={event => { codeRevision.current++; setPasscode(event.target.value); }} /></label><button className="primary" disabled={loading} onClick={() => void openShare()}>打开分享</button>
         <p className="note">浏览不会转存。分享下载使用临时目录，下载结束、失败或停止后清理。</p></section>}
-      {page === 'tasks' && <TasksPanel tasks={tasks} busy={transferring} onTasks={acceptTasks} onStart={() => setTransferring(true)} onEnd={() => setTransferring(false)} onStatus={setStatus}/>}
-      {(page === 'shares' || page === 'recycle') && <CatalogPanel key={`${page}-${accountRevision}`} mode={page === 'shares' ? 'shares' : 'recycle'} busy={transferring || loggingIn} onStatus={setStatus}/>}
+      {page === 'tasks' && <TasksPanel tasks={tasks} busy={transferring} onTasks={acceptTasks} onStart={() => setTransferring(true)} onEnd={() => setTransferring(false)} onStatus={notify}/>}
+      {(page === 'shares' || page === 'recycle') && <CatalogPanel key={`${page}-${accountRevision}`} mode={page === 'shares' ? 'shares' : 'recycle'} busy={transferring || loggingIn} onStatus={notify}/>}
       {page === 'settings' && <section className="form-section"><h2>下载设置</h2><label>线程数 <small>1–16，默认 4</small><input type="number" min="1" max="16" disabled={transferring} value={threads} onChange={event => setThreads(event.target.value)} /></label>
         <label>总限速 <small>MiB/s，0 表示不限速</small><input type="number" min="0" step="0.1" disabled={transferring} value={rate} onChange={event => setRate(event.target.value)} /></label>
         <label>保存目录<input value={preferences.output_dir} readOnly /></label><button disabled={transferring} onClick={() => void action(async () => { const folder = await window.quark.chooseFolder(); if (folder) await saveSettings(folder); })}>选择目录</button>
@@ -283,10 +286,10 @@ function App() {
     {context && <><div className="menu-dismiss" onClick={() => setContext(null)}/><div className="context-menu" role="menu" style={{left:context.x,top:context.y}}>
       {!share && <><button disabled={transferring || searching || selected.length !== 1} onClick={() => fileAction('rename')}>重命名</button><button disabled={transferring || searching} onClick={() => fileAction('move')}>移动</button><button disabled={transferring || searching} onClick={() => fileAction('delete')}>移入回收站</button><button onClick={() => fileAction('info',[context.row])}>属性</button></>}
       <button onClick={() => { const entries = selected; setContext(null); void copyPaths(entries); }}>复制路径</button></div></>}
-    {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} parent={trail} close={() => setFileDialog(null)} done={() => { void (searchView ? runSearch() : browse()); }}/ >}
-    {sharingDialog && <SharingDialog mode={sharingDialog} entries={selected} handle={share} path={sharePath} close={() => setSharingDialog(null)} onStatus={setStatus}/>}
+    {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} parent={trail} close={() => setFileDialog(null)} done={() => { void (searchView ? runSearch() : browse()); }} onStatus={notify}/ >}
+    {sharingDialog && <SharingDialog mode={sharingDialog} entries={selected} handle={share} path={sharePath} close={() => setSharingDialog(null)} onStatus={notify}/>}
     {loggingIn && <div className="modal-backdrop"><div className="modal"><h2>扫码登录</h2><p>使用手机夸克 App 扫描二维码</p>{qr ? <img src={qr} alt="夸克登录二维码" /> : <div className="qr-loading">正在获取二维码…</div>}
       <button onClick={() => { loginId.current = null; setLoggingIn(false); setQr(null); setNickname('未登录'); void action(() => call('login.cancel')); }}>取消登录</button></div></div>}
   </div></>;
 }
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById('root')!).render(<FeedbackProvider><App /></FeedbackProvider>);

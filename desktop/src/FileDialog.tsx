@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import { Entry } from './types';
+import { Feedback } from './Feedback';
 
 export type FileAction = 'mkdir' | 'rename' | 'move' | 'delete' | 'info';
-export function FileDialog({ action, entries, parent, done, close }: {
-  action: FileAction; entries: Entry[]; parent: [string,string][]; done: () => void; close: () => void;
+export function FileDialog({ action, entries, parent, done, close, onStatus }: {
+  action: FileAction; entries: Entry[]; parent: [string,string][]; done: () => void; close: () => void; onStatus:Feedback;
 }) {
   const [name,setName] = useState(action === 'rename' ? entries[0].name : '');
   const [trail,setTrail] = useState<[string,string][]>([['0','我的网盘']]);
@@ -30,12 +31,12 @@ export function FileDialog({ action, entries, parent, done, close }: {
     setBusy(true); setError('');
     try {
       if(action === 'mkdir') {
-        await window.quark.call('file.mkdir',{ parent:parent.at(-1)![0], name }); done(); close();
+        await window.quark.call('file.mkdir',{ parent:parent.at(-1)![0], name }); done(); close();onStatus('目录已创建','success');
       } else if(action !== 'info') {
         const result = await window.quark.call(`file.${action}`,{ entries,name,target:trail.at(-1)![0] });
-        setResults(result); done();
+        setResults(result); done();onStatus(result.some((row:{state:string}) => row.state !== 'done') ? '部分项目操作失败，请查看逐项结果' : '文件操作已完成', result.some((row:{state:string}) => row.state !== 'done') ? 'warning' : 'success');
       }
-    } catch(error) { setError(error instanceof Error ? error.message : '操作失败'); }
+    } catch(error) { const text = error instanceof Error ? error.message : '操作失败';setError(text);onStatus(text,'error'); }
     finally { setBusy(false); }
   }
   return <div className="modal-backdrop"><section className="modal file-modal" role="dialog" aria-modal="true" aria-label={title}>
@@ -50,6 +51,6 @@ export function FileDialog({ action, entries, parent, done, close }: {
     {error && <p className="error" role="alert">{error}</p>}
     <div className="dialog-actions"><button disabled={busy} onClick={close}>{results || action === 'info' ? '关闭' : '取消'}</button>
       {!results && action !== 'info' && <button className="primary" disabled={busy || ((action === 'mkdir' || action === 'rename') && !name.trim())} onClick={() => void submit()}>{busy ? '处理中…' : action === 'move' ? '移到当前目录' : '确认'}</button>}
-      {info && <button onClick={() => void window.quark.copyText(String(info.path || ''))}>复制路径</button>}</div>
+      {info && <button onClick={() => void window.quark.copyText(String(info.path || '')).then(() => onStatus('已复制路径','success')).catch(error => onStatus(error.message,'error'))}>复制路径</button>}</div>
   </section></div>;
 }

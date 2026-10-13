@@ -1,9 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { shareText } from './SharingDialog';
+import { Feedback } from './Feedback';
+import { shareExpiry } from './shareExpiry';
 
-type Row = {share_id?:string;record_id?:string;title?:string;name?:string;share_url?:string;expired_type?:number;directory?:boolean;size?:number;parent?:string;deleted_at?:number};
-export function CatalogPanel({mode,busy,onStatus}: {mode:'shares'|'recycle';busy:boolean;onStatus:(text:string)=>void}) {
+type Row = {share_id?:string;record_id?:string;title?:string;name?:string;share_url?:string;expired_type?:number;expired_at?:number;directory?:boolean;size?:number;parent?:string;deleted_at?:number};
+export function CatalogPanel({mode,busy,onStatus}: {mode:'shares'|'recycle';busy:boolean;onStatus:Feedback}) {
   const [rows,setRows] = useState<Row[]>([]);
   const [selected,setSelected] = useState<Set<string>>(new Set());
   const [loading,setLoading] = useState(false);
@@ -12,6 +14,7 @@ export function CatalogPanel({mode,busy,onStatus}: {mode:'shares'|'recycle';busy
   const [confirm,setConfirm] = useState<'revoke'|'restore'|'remove'|null>(null);
   const [confirmed,setConfirmed] = useState(false);
   const [results,setResults] = useState<{name:string;detail:string;state:string}[]|null>(null);
+  const [now,setNow] = useState(Date.now);
   const scroll = useRef<HTMLDivElement>(null);
   const generation = useRef(0);
   const key = (row:Row) => String(mode === 'shares' ? row.share_id : row.record_id);
@@ -26,18 +29,25 @@ export function CatalogPanel({mode,busy,onStatus}: {mode:'shares'|'recycle';busy
     finally {if(id === generation.current) setLoading(false);}
   }
   useEffect(() => {void refresh();return () => {++generation.current;};},[mode]);
+  useEffect(() => {
+    if(mode !== 'shares') return;
+    const tick = () => setNow(Date.now());
+    const interval = window.setInterval(tick,1000);
+    window.addEventListener('focus',tick);document.addEventListener('visibilitychange',tick);
+    return () => {window.clearInterval(interval);window.removeEventListener('focus',tick);document.removeEventListener('visibilitychange',tick);};
+  },[mode]);
   async function submit() {
     setLoading(true);setError('');
     try {
       const response = await window.quark.call(confirm === 'revoke' ? 'share.revoke' : confirm === 'restore' ? 'recycle.restore' : 'recycle.remove',{entries:picked});
-      setResults(response);await refresh();onStatus('操作已结束，请查看逐项结果');
-    } catch(error) {setError(error instanceof Error ? error.message : '操作失败');}
+      setResults(response);await refresh();const failed = response.some((row:{state:string}) => row.state !== 'done');onStatus(failed ? '部分项目未完成，请查看逐项结果' : '操作已完成，请查看逐项结果', failed ? 'warning' : 'success');
+    } catch(error) {const text=error instanceof Error ? error.message : '操作失败';setError(text);onStatus(text,'error');}
     finally {setLoading(false);}
   }
   async function copy(row:Row) {
     setLoading(true);setError('');
-    try {const result = await window.quark.call('share.link',{share_id:row.share_id});await window.quark.copyText(shareText(result));onStatus('已复制分享文案');}
-    catch(error) {setError(error instanceof Error ? error.message : '复制分享失败');}
+    try {const result = await window.quark.call('share.link',{share_id:row.share_id});await window.quark.copyText(shareText(result));onStatus('已复制分享文案','success');}
+    catch(error) {const text=error instanceof Error ? error.message : '复制分享失败';setError(text);onStatus(text,'error');}
     finally {setLoading(false);}
   }
   const disabled = busy || loading || !ready || !picked.length;
@@ -47,11 +57,11 @@ export function CatalogPanel({mode,busy,onStatus}: {mode:'shares'|'recycle';busy
     {mode === 'shares' ? <button disabled={disabled} onClick={() => open('revoke')}>取消选中分享</button> : <><button disabled={disabled} onClick={() => open('restore')}>恢复选中记录</button><button disabled={disabled} onClick={() => open('remove')}>永久删除选中记录</button></>}
     <span className="catalog-count">{rows.length} 项 · 已选 {picked.length} 项</span></div>
     {error && <p className="error catalog-error" role="alert">{error}</p>}
-    <div className="catalog-header"><input type="checkbox" aria-label="全选当前记录" disabled={!ready || loading} checked={rows.length > 0 && picked.length === rows.length} onChange={() => setSelected(picked.length === rows.length ? new Set() : new Set(rows.map(key)))}/><span>{mode === 'shares' ? '分享名称 / 链接' : '名称 / 原目录'}</span><span>{mode === 'shares' ? '有效期' : '类型 / 大小'}</span><span>操作</span></div>
+    <div className="catalog-header"><input type="checkbox" aria-label="全选当前记录" disabled={!ready || loading} checked={rows.length > 0 && picked.length === rows.length} onChange={() => setSelected(picked.length === rows.length ? new Set() : new Set(rows.map(key)))}/><span>{mode === 'shares' ? '分享名称 / 链接' : '名称 / 原目录'}</span><span>{mode === 'shares' ? '剩余有效期' : '类型 / 大小'}</span><span>操作</span></div>
     <div className="catalog-list" ref={scroll}>{!rows.length && <div className="empty">{loading ? '正在读取…' : error ? '读取失败，请刷新重试' : mode === 'shares' ? '暂无本人分享' : '回收站为空'}</div>}<div style={{height:virtual.getTotalSize(),position:'relative'}}>{virtual.getVirtualItems().map(item => {const row = rows[item.index];return <div className="catalog-row" key={key(row)} style={{transform:`translateY(${item.start}px)`}}>
       <input type="checkbox" disabled={loading || !ready} aria-label={`选择记录 ${row.title || row.name}`} checked={selected.has(key(row))} onChange={() => setSelected(old => {const next = new Set(old);next.has(key(row)) ? next.delete(key(row)) : next.add(key(row));return next;})}/>
       <div><strong>{row.title || row.name || row.share_id}</strong><p title={row.share_url || row.parent}>{mode === 'shares' ? row.share_url || '复制时读取链接' : row.parent ? `原目录 FID：${row.parent}` : '原目录信息不可用'}</p></div>
-      <span>{mode === 'shares' ? ({1:'永久',2:'1 天',3:'7 天',4:'30 天'} as Record<number,string>)[row.expired_type || 0] || '期限待核验' : row.directory ? '目录' : `${row.size ?? '—'} B`}</span>
+      <span title={mode === 'shares' ? shareExpiry(row,now).title : undefined}>{mode === 'shares' ? shareExpiry(row,now).text : row.directory ? '目录' : `${row.size ?? '—'} B`}</span>
       {mode === 'shares' ? <button disabled={loading} onClick={() => void copy(row)}>复制分享文案</button> : <span>已删除</span>}</div>;})}</div></div>
     {confirm && <div className="modal-backdrop"><section className="modal file-modal" role="dialog" aria-modal="true" aria-label={title}><h2>{title}</h2>
       {!results && <><p>已选择 {picked.length} 项：{picked.map(row => row.title || row.name).join('、')}</p><p>{confirm === 'remove' ? '这些记录将永久删除，无法从回收站恢复。' : confirm === 'restore' ? '恢复到原目录，同名冲突不覆盖。' : '选中链接将失效，网盘文件保留。'}</p>
