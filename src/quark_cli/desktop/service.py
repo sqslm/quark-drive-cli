@@ -31,6 +31,7 @@ from .file_operations import FileOperations
 from .tasks import TaskStore, Upload
 from .sharing import Sharing
 from .recycle import Recycle
+from .favorites import Favorites
 from ..share_management import safe_operation_result
 
 
@@ -60,6 +61,7 @@ class DesktopService:
         self.logging_in = False
         self.managing = False
         self.cut = None
+        self.favorites = Favorites(self.directory / "favorites.json")
         self.closed = False
         self.preferences_warning = ""
         self.preferences_writable = True
@@ -133,6 +135,37 @@ class DesktopService:
                     self.logging_in = False
 
     def dispatch(self, identifier, method, p, cancel):
+        if method.startswith('favorites.'):
+            if p.get('handle'):
+                raise UsageError('分享目录不能设为账号常用文件夹')
+            with self.lock:
+                if self.logging_in:
+                    raise UsageError('请等待登录结束')
+                context = self.context()
+                if method == 'favorites.list':
+                    return self.favorites.list(context)
+                if method == 'favorites.add':
+                    return self.favorites.add(context, p['trail'])
+                if method == 'favorites.remove':
+                    return self.favorites.remove(context, valid_fid(p['fid']))
+            if method == 'favorites.open':
+                fid = valid_fid(p['fid'])
+                if not any(row['fid'] == fid for row in self.favorites.list(context)):
+                    raise UsageError('常用文件夹已移除或登录已变化')
+                with self.backend._client(interactive=True) as client:
+                    paths = FileOperations(client).paths
+                    chain = paths.ancestry(fid)
+                    from ..paths import is_directory
+                    if not is_directory(chain[0].item):
+                        raise UsageError('常用位置已不是目录，请移除该记录')
+                    trail = [['0','我的网盘']] + [[obj.fid,obj.item['file_name']] for obj in reversed(chain[:-1])]
+                with self.lock:
+                    if context != self.context() or self.logging_in:
+                        raise UsageError('登录已变化，请重新打开常用文件夹')
+                    if not any(row['fid'] == fid for row in self.favorites.list(context)):
+                        raise UsageError('常用文件夹已移除')
+                    self.favorites.add(context, trail)
+                return trail
         if method == 'file.cut':
             if p.get('handle'):
                 raise UsageError('分享文件只读，不能剪切')
@@ -163,7 +196,7 @@ class DesktopService:
                     raise UsageError('上次粘贴结果未确认，请先刷新核实，未重复提交')
                 # Reserve this intent before opening any metadata or write request.
                 clipboard['blocked'] = True
-                with self.backend._client() as client:
+                with self.backend._client(interactive=True) as client:
                     try:
                         results = FileOperations(client).paste(clipboard['entries'],p['target'])
                     except QuarkError:
@@ -235,7 +268,7 @@ class DesktopService:
                 with self.lock:
                     if (self.busy or self.logging_in) and method != "file.info":
                         raise UsageError("请先停止传输再修改网盘文件")
-                with self.backend._client() as client:
+                with self.backend._client(interactive=True) as client:
                     operations = FileOperations(client)
                     if method == "file.info":
                         return operations.info(p["entry"])
@@ -541,7 +574,8 @@ METHODS = frozenset({"hello", "account", "browse", "search", "search.cancel", "l
     "file.info", "file.mkdir", "file.rename", "file.move", "file.delete",
     "upload", "tasks.cancel", "tasks.clear", "tasks.authorize",
     'share.list','share.link','share.create','share.revoke','share.save','recycle.list','recycle.restore','recycle.remove',
-    'file.cut','file.paste','file.clearCut'})
+    'file.cut','file.paste','file.clearCut',
+    'favorites.list','favorites.add','favorites.remove','favorites.open'})
 
 
 def main():

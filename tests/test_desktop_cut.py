@@ -6,12 +6,43 @@ import httpx
 
 from quark_cli.desktop.service import DesktopService
 from quark_cli.downloader.worker import DriveBackend
-from quark_cli.errors import UsageError
+from quark_cli.errors import UsageError, RateLimitError
+from quark_cli.request_guard import RequestGuard
 from tests.test_desktop_files import Drive, entry
 from tests.test_downloader_worker import item, COOKIE
 
 
 class CutTests(unittest.TestCase):
+    def test_fast_operations_and_normal_reads_share_durable_cooldown(self):
+        drive = Drive([item("a","A.txt",size=3)])
+        def reject(request):
+            drive.requests.append(request)
+            return httpx.Response(429)
+        drive.transport = lambda:httpx.MockTransport(reject)
+        service=self.service(drive)
+        directory=service.directory/'guard'
+        service.backend._operation_guard=RequestGuard.durable(directory=directory,pacing=.1)
+        service.backend._guard=RequestGuard.durable(directory=directory,pacing=.5)
+        with self.assertRaises(RateLimitError):
+            self.call(service,'file.info',{'entry':entry('a','A.txt',size=3)})
+        with self.assertRaises(RateLimitError):
+            service.backend.listing('0')
+        self.assertEqual(len(drive.requests),1)
+
+    def test_interactive_paste_reuses_info_and_shortens_pacing(self):
+        drive = Drive([item("a", "A.txt", size=3), item("target", "目标", directory=True)])
+        service = self.service(drive)
+        clock = [0.0]
+        def sleep(delay):
+            clock[0] += delay
+        service.backend._guard = RequestGuard.memory(pacing=.5, clock=lambda:clock[0], sleep=sleep)
+        service.backend._operation_guard = RequestGuard.memory(pacing=.1, clock=lambda:clock[0], sleep=sleep)
+        cut = self.call(service, "file.cut", {"entries":[entry("a", "A.txt", size=3)]})
+        result = self.call(service, "file.paste", {"id":cut["id"], "target":"target"})
+        self.assertEqual(result["results"][0]["state"], "done")
+        self.assertLessEqual(len(drive.requests), 6)
+        self.assertLessEqual(clock[0], .6)
+
     def service(self, drive):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

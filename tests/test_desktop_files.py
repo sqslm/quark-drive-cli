@@ -41,7 +41,8 @@ class Drive:
                         self.records[fid]["pdir_fid"] = body["to_pdir_fid"]
                     data = {"finish": True}
                 elif path.endswith("file/delete"):
-                    self.records.pop(body["filelist"][0])
+                    for fid in body["filelist"]:
+                        self.records.pop(fid)
                     data = {}
                 elif path.endswith("/file"):
                     self.records["new"] = item(
@@ -60,6 +61,25 @@ def entry(fid, name, directory=False, size=None):
 
 
 class FileTests(unittest.TestCase):
+    def test_batch_delete_reuses_preflight_and_submits_once(self):
+        drive = Drive([item("a","A.txt",size=3),item("b","B.txt",size=4),item("keep","Keep.txt")])
+        result = self.operations(drive).apply("delete",[entry("a","A.txt",size=3),entry("b","B.txt",size=4)])
+        self.assertEqual([row['state'] for row in result],['done','done'])
+        self.assertEqual(len(drive.writes),1)
+        self.assertEqual(drive.writes[0][1]['filelist'],['a','b'])
+        self.assertLessEqual(len(drive.requests),5)
+        self.assertIn('keep',drive.records)
+
+    def test_rename_reads_back_fresh_metadata_and_later_info_is_fresh(self):
+        drive = Drive([item("a","A.txt",size=3)])
+        operations=self.operations(drive)
+        result=operations.apply('rename',[entry('a','A.txt',size=3)],name='New.txt')
+        self.assertEqual(result[0]['state'],'done')
+        self.assertEqual(len(drive.requests),4)
+        drive.records['a']['file_name']='Changed.txt'
+        with self.assertRaises(UsageError):
+            operations.info(entry('a','New.txt',size=3))
+
     def operations(self, drive):
         client = QuarkClient(COOKIE, transport=drive.transport())
         self.addCleanup(client.close)

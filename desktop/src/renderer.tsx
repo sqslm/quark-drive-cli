@@ -1,16 +1,15 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Entry, Event, Preferences, Task, Cut } from './types';
+import { Entry, Event, Preferences, Task, Cut, Favorite } from './types';
 import './style.css';
 import { FileDialog, FileAction } from './FileDialog';
 import { TasksPanel } from './TasksPanel';
 import { CatalogPanel } from './CatalogPanel';
 import { SharingDialog } from './SharingDialog';
 import { FeedbackProvider, useFeedback, Tone } from './Feedback';
+import { formatSize as units } from './size';
 
-const units = (bytes: number | null) => bytes === null ? '—' : bytes < 1024 ? `${bytes} B` :
-  bytes < 1048576 ? `${(bytes / 1024).toFixed(1)} KiB` : bytes < 1073741824 ? `${(bytes / 1048576).toFixed(1)} MiB` : `${(bytes / 1073741824).toFixed(2)} GiB`;
 function FileIcon({ folder }: { folder: boolean }) {
   return <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
     {folder ? <path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3V7Z" fill="#fff0c6" stroke="#c49b37" strokeWidth="1.5" /> :
@@ -50,6 +49,8 @@ function App() {
   const [loggingIn, setLoggingIn] = useState(false);
   const [fileDialog,setFileDialog] = useState<{ action:FileAction; entries:Entry[]; cutId?:string } | null>(null);
   const [cut,setCut] = useState<Cut|null>(null);
+  const [favorites,setFavorites] = useState<Favorite[]>([]);
+  const [favoriteBusy,setFavoriteBusy] = useState(false);
   const [sharingDialog,setSharingDialog] = useState<'create'|'save'|null>(null);
   const [accountRevision,setAccountRevision] = useState(0);
   const [context,setContext] = useState<{ row:Entry|null; x:number; y:number } | null>(null);
@@ -63,6 +64,45 @@ function App() {
   const menu = useRef<HTMLDivElement>(null);
   useEffect(() => {if(context) menu.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();},[context]);
   const call = window.quark.call;
+  async function loadFavorites() {
+    const generation = profileGeneration.current;
+    const next = await action<Favorite[]>(() => call('favorites.list'));
+    if(next && generation === profileGeneration.current) setFavorites(next);
+  }
+  async function toggleFavorite(row:Entry) {
+    setContext(null);setFavoriteBusy(true);
+    const generation = profileGeneration.current;
+    try {
+      const exists = favorites.some(item => item.fid === row.fid);
+      let chain = row.location.length ? row.location : [...trail,[row.fid,row.name]];
+      if(!exists && searchView && !row.location.length) {
+        const found:Entry = await call('locate',{entry:row});chain=found.location;
+      }
+      if(generation !== profileGeneration.current) return;
+      const next:Favorite[] = await call(exists ? 'favorites.remove' : 'favorites.add',exists ? {fid:row.fid} : {trail:chain});
+      if(generation === profileGeneration.current) {setFavorites(next);notify(exists ? '已移除常用文件夹' : '已添加常用文件夹','success');}
+    } catch(error) {notify(error instanceof Error ? error.message : '无法保存常用文件夹','error');}
+    finally {setFavoriteBusy(false);}
+  }
+  async function removeFavorite(fid:string) {
+    setFavoriteBusy(true);const generation=profileGeneration.current;
+    const next=await action<Favorite[]>(() => call('favorites.remove',{fid}));
+    if(next && generation === profileGeneration.current) {setFavorites(next);notify('已移除常用文件夹','success');}
+    setFavoriteBusy(false);
+  }
+  async function openFavorite(fid:string) {
+    cancelSearch();const generation=++view.current;setLoading(true);setPage('drive');
+    const chain=await action<[string,string][]>(() => call('favorites.open',{fid}));
+    if(generation !== view.current) return;
+    setLoading(false);
+    if(chain) {await browse(chain);void loadFavorites();}
+  }
+  async function shareBrowse(path:string) {
+    if(!share) return;
+    cancelSearch();const generation=++view.current;setLoading(true);
+    const result=await action<Entry[]>(() => call('share.browse',{handle:share,path}));
+    if(generation === view.current) {setLoading(false);if(result) {setRows(result);setSharePath(path);setQuery('');setChecked(new Set());}}
+  }
   function acceptTasks(next: Task[]) {
     setTasks(old => next.map(task => {
       const previous = old.find(row => row.id === task.id);
@@ -164,6 +204,7 @@ function App() {
       setExtensionGroups(hello.extension_groups || {});
       acceptTasks(await call("tasks"));
       await browse([['0', '我的网盘']]);
+      void loadFavorites();
       if (hello.warning) setStatus(hello.warning);
       const generation = profileGeneration.current;
       void action(async () => { const account = await call('account'); if(generation === profileGeneration.current) setNickname(account.nickname); });
@@ -273,21 +314,23 @@ function App() {
     });
   }
   async function login() {
-    cancelSearch(); ++view.current; ++profileGeneration.current; setCut(null);setContext(null);setLoading(false); const id = crypto.randomUUID(); loginId.current = id; setLoggingIn(true); setNickname('正在登录');
+    cancelSearch(); ++view.current; ++profileGeneration.current; setFavorites([]);setCut(null);setContext(null);setLoading(false); const id = crypto.randomUUID(); loginId.current = id; setLoggingIn(true); setNickname('正在登录');
     const result = await action<{ nickname: string; cancelled?: boolean }>(() => call('login', {}, id));
-    if (loginId.current === id) { setLoggingIn(false); setQr(null); if (result && !result.cancelled) { setNickname(result.nickname); setAccountRevision(old => old+1); acceptTasks(await call('tasks')); await browse([['0','我的网盘']]); notify('登录成功','success'); } else setNickname('昵称暂不可用'); }
+    if (loginId.current === id) { setLoggingIn(false); setQr(null); if (result && !result.cancelled) { setNickname(result.nickname); setAccountRevision(old => old+1); acceptTasks(await call('tasks')); await browse([['0','我的网盘']]); notify('登录成功','success'); } else setNickname('昵称暂不可用');void loadFavorites(); }
   }
   return <><div className="titlebar"><span>夸克网盘客户端</span></div><div className="app" onKeyDown={shortcut}>
     <aside><div className="brand"><span className="brand-mark">Q</span><div>夸克网盘<small>桌面客户端</small></div></div>
       <nav aria-label="主导航">{[['drive','我的文件'],['share','分享链接'],['shares','我的分享'],['recycle','回收站'],['tasks','传输任务'],['settings','设置']].map(([key,label]) =>
         <button key={key} className={page === key ? 'nav active' : 'nav'} onClick={() => { cancelSearch(); setPage(key); if(key === 'drive' && share) void browse([['0','我的网盘']]); }}>{label}{key === 'tasks' && tasks.length > 0 && <span>{tasks.length}</span>}</button>)}</nav>
+      <section className="favorites" aria-label="常用文件夹"><h2>常用文件夹</h2>{!favorites.length && <p>右键目录可添加</p>}{favorites.map(row => <div key={row.fid}><button title={row.name} disabled={loading || loggingIn} onClick={() => void openFavorite(row.fid)}>{row.name}</button><button aria-label={`移除常用 ${row.name}`} disabled={favoriteBusy || loggingIn} onClick={() => void removeFavorite(row.fid)}>×</button></div>)}</section>
       <div className="account"><span className="avatar">{nickname.slice(0,1)}</span><div className="account-name" title={nickname}>{nickname}<small>夸克网盘账号</small></div></div>
       <button className="login-button" disabled={transferring || loggingIn} onClick={() => void login()}>扫码登录</button>
     </aside>
     <main><header><div><h1>{({drive: share ? '分享文件' : '我的文件', share:'分享链接',shares:'我的分享',recycle:'回收站',tasks:'传输任务',settings:'设置'} as Record<string,string>)[page]}</h1>
-      <p>{page === 'drive' ? `${rows.length} 项 · ${share ? sharePath : trail.map(item => item[1]).join(' / ')}` : page === 'tasks' ? '下载进度与逐项结果' : page === 'share' ? '粘贴链接或完整分享文案' : '下载与本地保存偏好'}</p></div>
+      <p>{page === 'drive' ? `${rows.length} 项${searchView ? ' · 搜索结果' : ''}` : page === 'tasks' ? '下载进度与逐项结果' : page === 'share' ? '粘贴链接或完整分享文案' : '下载与本地保存偏好'}</p></div>
       <span className="connection">{transferring ? '正在传输' : '就绪'}</span></header>
       {page === 'drive' && <>
+        <nav className="breadcrumbs" aria-label="文件路径">{(share ? [['/','分享文件'],...sharePath.split('/').filter(Boolean).map((name,index,parts) => ['/'+parts.slice(0,index+1).join('/'),name])] : trail).map(([fid,name],index,chain) => <React.Fragment key={fid}>{index > 0 && <span aria-hidden="true">/</span>}<button aria-current={index === chain.length-1 ? 'location' : undefined} disabled={loggingIn} onClick={() => void (share ? shareBrowse(fid) : browse(trail.slice(0,index+1)))}>{name}</button></React.Fragment>)}</nav>
         <div className="toolbar"><button disabled={loading || (!!share && sharePath === '/')} onClick={() => void (share ? shareUp() : browse(trail.slice(0, -1).length ? trail.slice(0,-1) : trail))}>返回上级</button>
           <button disabled={loading} onClick={() => void (share ? openShare() : searchView ? runSearch() : browse())}>刷新</button>
           {searchView && <button onClick={() => void browse()}>返回目录</button>}
@@ -350,6 +393,7 @@ function App() {
           <button role="menuitem" disabled={!canModify || !selected.length} onClick={() => fileAction('delete')}>删除<kbd>Delete</kbd></button>
           <button role="menuitem" disabled={!canModify || selected.length !== 1} onClick={() => fileAction('rename')}>重命名<kbd>F2</kbd></button>
           <button role="menuitem" disabled={!canModify || !selected.length} onClick={() => fileAction('move')}>移动到…</button><hr/>
+          {context.row.directory && <button role="menuitem" disabled={favoriteBusy || loggingIn || selected.length !== 1 || loading || searching} onClick={() => void toggleFavorite(context.row!)}>{favorites.some(row => row.fid === context.row!.fid) ? '取消常用文件夹' : '设为常用文件夹'}</button>}
           <button role="menuitem" disabled={selected.length !== 1 || loading || searching} onClick={() => fileAction('info',[context.row!])}>详细信息</button>
         </>}
         <button role="menuitem" disabled={loading || searching} onClick={() => {setContext(null);void copyPaths();}}>复制路径<kbd>Ctrl+Shift+C</kbd></button>

@@ -243,10 +243,15 @@ class DriveBackend:
         self._cookie = cookie
         self._transport = transport
         self._guard = default_guard(transport, None)
+        # Interactive desktop writes retain the shared durable cooldown, with
+        # shorter spacing than unattended scans/transfers.
+        from ..request_guard import RequestGuard
+        self._operation_guard = RequestGuard.memory() if isinstance(transport, httpx.MockTransport) else RequestGuard.durable(pacing=0.1)
         self._path_cache: dict[str, tuple] = {}
 
-    def _client(self) -> QuarkClient:
-        return QuarkClient(self._cookie(), transport=self._transport, guard=self._guard)
+    def _client(self, *, interactive=False) -> QuarkClient:
+        return QuarkClient(self._cookie(), transport=self._transport,
+                           guard=self._operation_guard if interactive else self._guard)
 
     def account_nickname(self) -> str:
         return get_account_nickname(self._cookie(), transport=self._transport, guard=self._guard)

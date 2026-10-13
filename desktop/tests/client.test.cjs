@@ -20,7 +20,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     const page = await browser.newPage({ viewport: { width: 1180, height: 780 },reducedMotion:'no-preference' });
     const errors = []; page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(() => {
-      const listeners = new Set(); let cancelled = false; let tasks = [];let cut=null;
+      const listeners = new Set(); let cancelled = false; let tasks = [];let cut=null;let favorites=[];
       window.testClockMs = Date.now();Date.now = () => window.testClockMs;
       let shares = [], recycle = [{record_id:'trash-a',fid:'gone-a',name:'测试删除.txt',directory:false,size:4,parent:'0'}, {record_id:'trash-b',fid:'gone-b',name:'测试恢复.txt',directory:false,size:4,parent:'0'}];
       const rows = Array.from({ length: 10000 }, (_, index) => ({ fid: String(index), name: `知否 ${String(index).padStart(5,'0')}.txt`, directory: false, size: index + 1, path: '', location: [] }));
@@ -33,6 +33,11 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
           window.testCalls.push({ method, params });
           if(method === 'hello') return { protocol: 1, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: '测试账号' };
+          if(method === 'favorites.list') return favorites.map(row => ({...row}));
+          if(method === 'favorites.add') {const [fid,name]=params.trail.at(-1);favorites=[...favorites.filter(row => row.fid !== fid),{fid,name}];return favorites;}
+          if(method === 'favorites.remove') {favorites=favorites.filter(row => row.fid !== params.fid);return favorites;}
+          if(method === 'favorites.open') return [['0','我的网盘'],[params.fid,favorites.find(row => row.fid === params.fid).name]];
+          if(method === 'file.info') return {file_name:params.entry.name,size:3489662954,path:'/'+params.entry.name,directory:false};
           if(method === 'tasks') return tasks.map(task => ({...task}));
           if(method === 'browse') return rows.filter(row => (row.parent || '0') === (params.fid || '0')).map(row => ({...row}));
           if(method === 'file.mkdir') { rows.push({fid:'new',name:params.name,directory:true,size:null,path:'',location:[]}); return {fid:'new'}; }
@@ -96,8 +101,16 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     const cutCall=await page.evaluate(() => window.testCalls.find(call => call.method==='file.cut'));
     assert.deepEqual(cutCall.params.entries.map(row => row.fid),['2']);
     await page.locator('.file-header').getByRole('button',{name:/^名称/}).click();
-    await page.getByRole('button',{name:'新建测试',exact:true}).click();
+    const beforeFavorite=await page.evaluate(() => window.testCalls.filter(call => ['browse','locate'].includes(call.method)).length);
+    await page.locator('.file-row').filter({hasText:'新建测试'}).click({button:'right'});
+    await page.getByRole('menuitem',{name:'设为常用文件夹',exact:true}).click();
+    await page.locator('.favorites').getByRole('button',{name:'新建测试',exact:true}).waitFor();
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => ['browse','locate'].includes(call.method)).length),beforeFavorite);
+    await page.locator('.file-row').getByRole('button',{name:'新建测试',exact:true}).click();
     await page.getByText('暂无文件',{exact:true}).waitFor();
+    await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'新建测试',exact:true}).waitFor();
+    assert.ok(await page.locator('.breadcrumbs').evaluate(element => element.getBoundingClientRect().bottom < document.querySelector('.file-header').getBoundingClientRect().top));
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/favorites-breadcrumb.png')});
     await page.getByLabel('文件列表',{exact:true}).click({button:'right',position:{x:30,y:40}});
     await page.getByRole('menuitem',{name:/^粘贴/}).click();
     await page.getByRole('dialog',{name:'粘贴（移动）'}).getByText('目标：我的网盘 / 新建测试',{exact:true}).waitFor();
@@ -107,7 +120,18 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     const pasteCall=await page.evaluate(() => window.testCalls.find(call => call.method==='file.paste'));
     assert.equal(pasteCall.params.id,'cut-current');assert.equal(pasteCall.params.target,'new');
     assert.equal(await page.locator('.cut-bar').count(),0);
-    await page.getByRole('button',{name:'返回上级',exact:true}).click();
+    await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'我的网盘',exact:true}).click();
+    await page.locator('.file-row').filter({hasText:'知否 00003.txt'}).waitFor();
+    await page.locator('.favorites').getByRole('button',{name:'新建测试',exact:true}).click();
+    await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'新建测试',exact:true}).waitFor();
+    await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'我的网盘',exact:true}).click();
+    await page.getByRole('button',{name:'移除常用 新建测试',exact:true}).click();
+    await page.locator('.favorites').getByText('右键目录可添加',{exact:true}).waitFor();
+    await page.locator('.file-row').filter({hasText:'知否 00003.txt'}).click({button:'right'});
+    await page.getByRole('menuitem',{name:'详细信息',exact:true}).click();
+    await page.getByRole('dialog',{name:'文件属性'}).getByText('3.25 GB',{exact:true}).waitFor();
+    assert.equal(await page.getByText('大小（字节）',{exact:true}).count(),0);
+    await page.getByRole('button',{name:'关闭',exact:true}).click();
     await page.locator('.file-row').filter({hasText:'知否 00003.txt'}).click({button:'right'});
     await page.keyboard.press('Escape');
     assert.equal(await page.getByRole('menu').count(),0);

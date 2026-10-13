@@ -200,8 +200,13 @@ class Files:
     def delete(self, fid: str) -> Any:
         if not fid or fid == "0":
             raise UsageError("FID 无效")
+        return self.delete_many([fid])
+
+    def delete_many(self, fids: list[str]) -> Any:
+        if not fids or any(not fid or fid == "0" for fid in fids) or len(set(fids)) != len(fids):
+            raise UsageError("FID 列表无效")
         payload = self.client.post(
             "file/delete",
-            body={"action_type": 2, "filelist": [fid], "exclude_fids": []},
+            body={"action_type": 2, "filelist": fids, "exclude_fids": []},
         )
         return _data(payload, "删除")

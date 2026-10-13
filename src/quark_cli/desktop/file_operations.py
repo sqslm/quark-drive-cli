@@ -7,6 +7,19 @@ from ..shares import _optional_created_fid, ShareSaver
 from ..downloader.core import describe_error
 
 
+class _SelectionFiles(Files):
+    """Reuse metadata only within a preflight; discard it before readback."""
+
+    def __init__(self, client):
+        super().__init__(client)
+        self.infos = {}
+
+    def info(self, fid):
+        if fid not in self.infos:
+            self.infos[fid] = super().info(fid)
+        return self.infos[fid]
+
+
 class _SelectionPaths(RemotePaths):
     """Read each parent listing once during a batch's preflight only."""
 
@@ -16,14 +29,19 @@ class _SelectionPaths(RemotePaths):
 
     def children(self, fid):
         if fid not in self.listings:
-            self.listings[fid] = super().children(fid)
+            self.listings[fid] = self.files.list_all(fid, size=100)["data"]["list"]
+            for row in self.listings[fid]:
+                if valid_fid(row.get("fid")) == "0" or (
+                    "pdir_fid" in row and valid_fid(row["pdir_fid"]) != fid
+                ):
+                    raise RemoteError("目录列表的父 FID 与请求不符")
         return self.listings[fid]
 
 
 class FileOperations:
     def __init__(self, client):
-        self.files = Files(client)
-        self.paths = RemotePaths(self.files)
+        self.files = _SelectionFiles(client)
+        self.paths = _SelectionPaths(self.files)
         self.client = client
 
     def checked(self, entry, paths=None):
@@ -56,6 +74,7 @@ class FileOperations:
             raise UsageError("目标目录存在同名文件或目录，未覆盖")
 
     def info(self, entry):
+        self.reset()
         actual, chain = self.checked(entry)
         safe = {
             key: actual[key]
@@ -76,6 +95,7 @@ class FileOperations:
         return safe
 
     def mkdir(self, parent, name):
+        self.reset()
         parent = self.paths.resolve(parent, directory=True).fid
         self.available(parent, name)
         result = self.files.mkdir(name, parent)
@@ -88,7 +108,8 @@ class FileOperations:
         return {"fid": fid, "name": name, "state": "done"}
 
     def paste(self, entries, target):
-        paths = _SelectionPaths(self.files)
+        self.reset()
+        paths = self.paths
         target = paths.resolve(str(target), directory=True).fid
         target_chain = paths.ancestry(target)
         existing = {
@@ -141,9 +162,23 @@ class FileOperations:
                     ),
                 )
             return results
+        self.reset()
+        # One fresh destination snapshot verifies the whole batch, rather than
+        # one info request per successful member. Missing members need info to
+        # distinguish an unchanged source from an unknown outcome.
+        try:
+            moved = {valid_fid(row['fid']):row for row in self.paths.children(target)}
+        except Exception as error:
+            for index, _ in candidates:
+                results[index].update(state="unknown", detail=describe_error(error,"移动结果核验") + "；未重发")
+            return results
         for index, actual in candidates:
             try:
-                after = self.files.info(valid_fid(actual["fid"]))
+                fid = valid_fid(actual['fid'])
+                after = moved.get(fid)
+                in_target = after is not None
+                if after is None:
+                    after = self.files.info(fid)
                 if (
                     after.get("file_name") != actual["file_name"]
                     or is_directory(after) != is_directory(actual)
@@ -153,7 +188,7 @@ class FileOperations:
                     )
                 ):
                     raise RemoteError("移动后的对象身份不符，请刷新核实")
-                if str(after.get("pdir_fid")) == target:
+                if in_target or str(after.get("pdir_fid")) == target:
                     results[index].update(state="done", detail="已移动到目标目录")
                 elif str(after.get("pdir_fid")) == str(actual["pdir_fid"]):
                     results[index].update(
@@ -168,13 +203,53 @@ class FileOperations:
                 )
         return results
 
+    def reset(self):
+        self.files.infos.clear()
+        self.paths.listings.clear()
+
+    def delete(self, entries):
+        results, candidates, seen = [], [], set()
+        for entry in entries:
+            index = len(results)
+            results.append({"fid":entry.get("fid"), "name":entry.get("name", ""), "state":"failed", "detail":""})
+            try:
+                actual, _ = self.checked(entry)
+                fid = valid_fid(actual["fid"])
+                if fid in seen:
+                    raise UsageError("重复选择同一对象")
+                seen.add(fid)
+                candidates.append((index, actual))
+            except Exception as error:
+                results[index]["detail"] = describe_error(error, "删除预检")
+        if not candidates:
+            return results
+        try:
+            self.files.delete_many([valid_fid(actual["fid"]) for _, actual in candidates])
+        except Exception as error:
+            for index, _ in candidates:
+                results[index].update(state="failed" if getattr(error,"api_rejected",False) else "unknown",
+                                      detail=describe_error(error,"删除") + "；未重发，请刷新核实")
+            return results
+        self.reset()
+        for index, actual in candidates:
+            try:
+                if any(str(row.get("fid")) == str(actual["fid"]) for row in self.paths.children(str(actual["pdir_fid"]))):
+                    raise RemoteError("删除已提交，此项仍在原目录；请刷新核实，未重发")
+                results[index].update(state="done",detail="已移入回收站")
+            except Exception as error:
+                results[index].update(state="unknown",detail=describe_error(error,"删除结果核验"))
+        return results
+
     def apply(self, operation, entries, *, name=None, target=None):
+        self.reset()
         if operation not in ("rename", "move", "delete"):
             raise UsageError("不支持的文件操作")
         if operation == "rename" and len(entries) != 1:
             raise UsageError("重命名只允许选择一项")
         if operation == "move":
             return self.paste(entries, target)
+        if operation == "delete":
+            return self.delete(entries)
         results, seen = [], set()
         for entry in entries:
             try:
@@ -183,31 +258,21 @@ class FileOperations:
                 if fid in seen:
                     raise UsageError("重复选择同一对象")
                 seen.add(fid)
-                if operation == "rename":
-                    self.available(valid_fid(actual["pdir_fid"]), name, excluding=fid)
-                    self.files.rename(fid, name)
-                    after = self.files.info(fid)
-                    if after.get("file_name") != name or after.get(
-                        "pdir_fid"
-                    ) != actual.get("pdir_fid"):
-                        raise RemoteError("重命名已提交，但结果未确认，请刷新查看")
-                else:
-                    self.files.delete(fid)
-                    if any(
-                        str(row.get("fid")) == fid
-                        for row in self.paths.children(str(actual["pdir_fid"]))
-                    ):
-                        raise RemoteError("删除已提交，但结果未确认，请刷新查看")
+                self.available(valid_fid(actual["pdir_fid"]), name, excluding=fid)
+                self.files.rename(fid, name)
+                self.files.infos.clear()
+                after = self.files.info(fid)
+                if after.get("file_name") != name or after.get("pdir_fid") != actual.get("pdir_fid"):
+                    raise RemoteError("重命名已提交，但结果未确认，请刷新查看")
                 results.append(
                     {
                         "fid": fid,
                         "name": entry["name"],
                         "state": "done",
-                        "detail": "已移入回收站"
-                        if operation == "delete"
-                        else "操作完成",
+                        "detail": "操作完成",
                     }
                 )
+                self.paths.listings.clear()
             except Exception as error:
                 results.append(
                     {

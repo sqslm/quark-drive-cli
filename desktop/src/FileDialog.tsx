@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Entry, Cut } from './types';
 import { Feedback } from './Feedback';
+import { formatSize } from './size';
 
 export type FileAction = 'mkdir' | 'rename' | 'move' | 'delete' | 'info' | 'paste';
 export function FileDialog({ action, entries, parent, done, close, onStatus,cutId,onCut }: {
@@ -53,7 +54,7 @@ export function FileDialog({ action, entries, parent, done, close, onStatus,cutI
       <div className="directory-list">{folders.map(row => <button key={row.fid} disabled={busy} onClick={() => void loadFolders([...trail,[row.fid,row.name]])}>{row.name}</button>)}{!folders.length && <p>没有子目录，可以选择当前目录</p>}</div><p>目标：{trail.map(item => item[1]).join(' / ')}</p></div>}
     {action === 'delete' && !results && <p>选中项目将移入回收站，可在回收站中恢复。</p>}
     {action === 'paste' && !results && <><p>源项目：{entries.map(row => row.path || row.name).join('、')}</p><p>目标：{parent.map(item => item[1]).join(' / ')}</p><p>确认后移动这些项目，同名冲突不覆盖。</p></>}
-    {info && <dl className="properties">{Object.entries(info).map(([key,value]) => <React.Fragment key={key}><dt>{({file_name:'名称',path:'路径',size:'大小（字节）',directory:'目录',fid:'FID',pdir_fid:'父目录 FID',updated_at:'修改时间',created_at:'创建时间'} as Record<string,string>)[key] || key}</dt><dd>{String(value)}</dd></React.Fragment>)}</dl>}
+    {info && <dl className="properties">{Object.entries(info).map(([key,value]) => <React.Fragment key={key}><dt>{({file_name:'名称',path:'路径',size:'大小',directory:'目录',fid:'FID',pdir_fid:'父目录 FID',updated_at:'修改时间',created_at:'创建时间'} as Record<string,string>)[key] || key}</dt><dd>{key === 'size' ? formatSize(typeof value === 'number' ? value : null) : String(value)}</dd></React.Fragment>)}</dl>}
     {results && <div className="operation-results">{results.map((row,index) => <p key={index} className={row.state !== 'done' ? 'error' : ''}>{row.name}：{row.detail}</p>)}</div>}
     {error && <p className="error" role="alert">{error}</p>}
     <div className="dialog-actions"><button disabled={busy} onClick={close}>{results || action === 'info' ? '关闭' : '取消'}</button>
