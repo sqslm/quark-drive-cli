@@ -67,6 +67,8 @@ class DesktopService:
             task["valid"] = False
             task["_cancel"] = threading.Event()
         self.pending_count = 0
+        self.batch_id = None
+        self.batch_tasks = []
         self.active_id = None
         self.sources: dict[str, ShareSource] = {}
         self.busy = False
@@ -111,6 +113,9 @@ class DesktopService:
         if method not in METHODS or not isinstance(params, dict):
             self.send({"id": identifier, "error": "不支持的请求"})
             return
+        if self.closed:
+            self.send({"id": identifier, "error": "客户端正在退出，不再接收新任务"})
+            return
         if method == "search.cancel":
             self.search_cancel.set()
         elif method == "login.cancel":
@@ -154,6 +159,8 @@ class DesktopService:
                     self.logging_in = False
 
     def dispatch(self, identifier, method, p, cancel):
+        if self.closed:
+            raise UsageError('客户端正在退出，不再接收新操作')
         if method == 'logout':
             with self.lock:
                 if self.busy or self.logging_in or self.managing:
@@ -600,17 +607,25 @@ class DesktopService:
             self.event(None, "warning", self.task_store.warning)
 
     def start_tasks(self, tasks):
+        if self.closed:
+            raise UsageError('客户端正在退出，不再启动传输')
         if not tasks:
             raise UsageError("没有可继续的任务；分享任务需重新授权，登录不同请重新选择")
-        if not self.busy:
+        new_batch = not self.busy
+        if new_batch:
             self.stop.clear()
+            self.batch_id = uuid.uuid4().hex
+            self.batch_tasks = []
         self.busy = True
+        self.batch_tasks.extend(tasks)
         for task in tasks:
             task["state"] = "waiting"
             task["_cancel"].clear()
             task["revision"] += 1
             self.pending_count += 1
         self.persist_tasks()
+        if new_batch:
+            self.event(None, "batch.started", {"batch_id": self.batch_id})
         for task in tasks:
             self.transfers.submit(self.run_task, task)
 
@@ -664,15 +679,20 @@ class DesktopService:
                 self.pending_count -= 1
                 self.busy = self.pending_count > 0
                 if not self.busy:
-                    self.event(None, "batch.finished", {"stopped": self.stop.is_set()})
+                    counts = {state: sum(task['state'] == state for task in self.batch_tasks)
+                              for state in ('done', 'failed', 'stopped', 'cancelled')}
+                    self.event(None, "batch.finished", {"batch_id": self.batch_id,
+                               "stopped": self.stop.is_set(), "counts": counts})
 
     def shutdown(self):
-        self.closed = True
-        self.stop.set()
-        self.search_cancel.set()
-        self.login_cancel.set()
+        with self.lock:
+            self.closed = True
+            self.stop.set()
+            self.search_cancel.set()
+            self.login_cancel.set()
         self.reads.shutdown(wait=True, cancel_futures=True)
-        self.transfers.shutdown(wait=True, cancel_futures=True)
+        # Let queued jobs record their stopped state without opening a transfer.
+        self.transfers.shutdown(wait=True)
 
 
 METHODS = frozenset({"hello", "account", "browse", "search", "search.cancel", "locate", "share.parse",

@@ -1,7 +1,8 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Entry, Event, Preferences, Task, Cut, Favorite, Appearance, AppearanceSource } from './types';
+import { Entry, Event, Preferences, Task, Cut, Favorite, Appearance, AppearanceSource, ClientSettings } from './types';
+import logo from '../assets/app-icon.png';
 import './style.css';
 import './theme.css';
 import { FileDialog, FileAction } from './FileDialog';
@@ -35,6 +36,19 @@ function App() {
   const [page, setPage] = useState('drive');
   const [appearanceSource,setAppearanceSource] = useState<AppearanceSource>('system');
   const [appearanceSaving,setAppearanceSaving] = useState(false);
+  const [clientSettings,setClientSettings] = useState<ClientSettings>({closeBehavior:'tray',notifications:true});
+  const [clientSettingsSaving,setClientSettingsSaving] = useState(false);
+  const [quitting,setQuitting] = useState(false);
+  async function changeClientSettings(next:ClientSettings) {
+    const previous=clientSettings;
+    setClientSettings(next);
+    setClientSettingsSaving(true);
+    try {
+      const result=await window.quark.setClientSettings(next);setClientSettings(result.settings);
+      notify(result.warning || '后台运行设置已保存',result.warning ? 'warning' : 'success');
+    } catch(error) {setClientSettings(previous);notify(error instanceof Error ? error.message : '无法保存后台运行设置','error');}
+    finally {setClientSettingsSaving(false);}
+  }
   function acceptAppearance(next:Appearance) {
     document.documentElement.dataset.theme=next.source;
     document.documentElement.dataset.colorScheme=next.dark ? 'dark' : 'light';
@@ -227,8 +241,14 @@ function App() {
   }
   useEffect(() => {
     void action(async () => {const next=await window.quark.getAppearance();acceptAppearance(next);if(next.warning) notify(next.warning,'warning');});
+    void action(async () => {const next=await window.quark.getClientSettings();setClientSettings(next.settings);if(next.warning) notify(next.warning,'warning');});
     const off = window.quark.onEvent((event: Event) => {
       if(event.event === 'appearance') acceptAppearance(event.data as Appearance);
+      else if(event.event === 'desktop.quitting') setQuitting(true);
+      else if(event.event === 'navigate' && event.data === 'tasks') {cancelSearch();setPage('tasks');}
+      else if(event.event === 'tasks.changed') acceptTasks(event.data as Task[]);
+      else if(event.event === 'batch.started') setTransferring(true);
+      else if(event.event === 'feedback') notify(event.data as string);
       else if (event.event === 'task') {
         const task = event.data as Task;
         setTasks(old => old.some(row => row.id === task.id) ? old.map(row => row.id === task.id ? task : row) : [...old, task]);
@@ -381,8 +401,8 @@ function App() {
       notify(result.warning || '登录成功',result.warning ? 'warning' : 'success');
     } else {if(signedIn) void loadFavorites();if(result?.cancelled) notify(signedIn ? '登录已取消，原账号保持不变' : '登录已取消');}
   }
-  return <><div className="titlebar"><span>夸克网盘客户端</span></div><div className="app" onKeyDown={shortcut}>
-    <aside><div className="brand"><span className="brand-mark">Q</span><div>夸克网盘<small>桌面客户端</small></div></div>
+  return <><div className="titlebar"><img src={logo} alt=""/><span>夸克网盘客户端</span></div><div className="app" inert={quitting} onKeyDown={shortcut}>
+    <aside><div className="brand"><img className="brand-logo" src={logo} alt=""/><div>夸克网盘<small>桌面客户端</small></div></div>
       <nav aria-label="主导航">{[['drive','我的文件'],['share','分享链接'],['shares','我的分享'],['recycle','回收站'],['tasks','传输任务'],['settings','设置']].map(([key,label]) =>
         <button key={key} className={page === key ? 'nav active' : 'nav'} aria-current={page === key ? 'page' : undefined} onClick={() => { cancelSearch(); setPage(key); if(key === 'drive' && share) void browse([['0','我的网盘']]); }}><NavigationIcon name={key}/>{label}{key === 'tasks' && tasks.length > 0 && <span>{tasks.length}</span>}</button>)}</nav>
       <section className="favorites" aria-label="常用文件夹"><h2>常用文件夹</h2>{!favorites.length && <p>右键目录可添加</p>}{favorites.map(row => <div key={row.fid}><button title={row.name} disabled={loading || loggingIn} onClick={() => void openFavorite(row.fid)}>{row.name}</button><button aria-label={`移除常用 ${row.name}`} disabled={favoriteBusy || loggingIn} onClick={() => void removeFavorite(row.fid)}>×</button></div>)}</section>
@@ -434,10 +454,12 @@ function App() {
         <p className="note">浏览不会转存。分享下载使用临时目录，下载结束、失败或停止后清理。</p></section>}
       {page === 'tasks' && <TasksPanel tasks={tasks} busy={transferring} onTasks={acceptTasks} onStart={() => setTransferring(true)} onEnd={() => setTransferring(false)} onStatus={notify}/>}
       {(page === 'shares' || page === 'recycle') && (signedIn ? <CatalogPanel key={`${page}-${accountRevision}`} mode={page === 'shares' ? 'shares' : 'recycle'} busy={transferring || loggingIn} onStatus={notify}/> : <div className="empty">请先登录账号</div>)}
-      {page === 'settings' && <section className="form-section settings-section"><h2>外观</h2><p className="section-description">选择适合你的主题，让浏览更舒服。</p><div className="theme-options" role="group" aria-label="外观主题">{([['system','跟随系统'],['light','浅色'],['dark','暗色']] as [AppearanceSource,string][]).map(([source,label]) => <label className={'theme-option'+(appearanceSource === source ? ' chosen' : '')} key={source}><span className={'theme-preview '+source} aria-hidden="true"><i/><span><b/><b/><b/></span></span><span className="theme-option-label"><input type="radio" name="appearance" value={source} checked={appearanceSource === source} disabled={appearanceSaving} onChange={() => void changeAppearance(source)}/>{label}</span></label>)}</div><p className="note">立即生效并自动保存。跟随系统会自动响应 Windows 主题变化。</p><div className="settings-divider"/><h2>下载设置</h2><div className="settings-grid"><label>线程数 <small>1–16，默认 4</small><input type="number" min="1" max="16" disabled={transferring} value={threads} onChange={event => setThreads(event.target.value)} /></label>
-        <label>总限速 <small>MiB/s，0 表示不限速</small><input type="number" min="0" step="0.1" disabled={transferring} value={rate} onChange={event => setRate(event.target.value)} /></label></div>
+      {page === 'settings' && <section className="form-section settings-section"><h2>外观</h2><p className="section-description">选择适合你的主题，让浏览更舒服。</p><div className="theme-options" role="group" aria-label="外观主题">{([['system','跟随系统'],['light','浅色'],['dark','暗色']] as [AppearanceSource,string][]).map(([source,label]) => <label className={'theme-option'+(appearanceSource === source ? ' chosen' : '')} key={source}><span className={'theme-preview '+source} aria-hidden="true"><i/><span><b/><b/><b/></span></span><span className="theme-option-label"><input type="radio" name="appearance" value={source} checked={appearanceSource === source} disabled={appearanceSaving} onChange={() => void changeAppearance(source)}/>{label}</span></label>)}</div><p className="note">立即生效并自动保存。跟随系统会自动响应 Windows 主题变化。</p><div className="settings-divider"/><h2>下载设置</h2>
+        <div className="transfer-settings"><div className="transfer-setting"><div><label htmlFor="thread-value">线程数</label><p>单文件并发连接，默认 4</p></div><input id="thread-value" aria-label="线程数" type="number" min="1" max="16" step="1" disabled={transferring} value={threads} onChange={event => setThreads(event.target.value)}/><div className="setting-slider"><span>1</span><input aria-label="拖动调整线程数" type="range" min="1" max="16" step="1" disabled={transferring} value={Math.min(16,Math.max(1,Number(threads) || 1))} style={{'--range-fill':`${(Math.min(16,Math.max(1,Number(threads) || 1))-1)/15*100}%`} as React.CSSProperties} onChange={event => setThreads(event.target.value)}/><span>16</span></div></div>
+        <div className="transfer-setting"><div><label htmlFor="rate-value">总限速</label><p>MiB/s，0 表示不限速</p></div><input id="rate-value" aria-label="总限速" type="number" min="0" max="10240" step="0.01" disabled={transferring} value={rate} onChange={event => setRate(event.target.value)} title="滑块范围 0–100，输入框支持 0.01–10240 MiB/s"/><div className="setting-slider"><span>0</span><input aria-label="拖动调整总限速" type="range" min="0" max="100" step="0.01" disabled={transferring} value={Math.min(100,Math.max(0,Number(rate) || 0))} style={{'--range-fill':`${Math.min(100,Math.max(0,Number(rate) || 0))}%`} as React.CSSProperties} onChange={event => setRate(event.target.value)}/><span>100</span></div></div></div>
         <label>保存目录<input value={preferences.output_dir} readOnly /></label><button disabled={transferring} onClick={() => void action(async () => { const folder = await window.quark.chooseFolder(); if (folder) await saveSettings(folder); })}>选择目录</button>
-        <button className="primary" disabled={transferring} onClick={() => void saveSettings()}>保存设置</button><p className="note">上传和下载队列逐项执行，线程数作用于单个下载文件。限速对上传和下载均生效，实际速度受账号与服务端限制。</p></section>}
+        <button className="primary" disabled={transferring} onClick={() => void saveSettings()}>保存设置</button><p className="note">上传和下载队列逐项执行，线程数作用于单个下载文件。限速对上传和下载均生效，实际速度受账号与服务端限制。限速滑块为 0–100，输入框可填写更高值。</p>
+        <div className="settings-divider"/><h2>后台运行</h2><div className="desktop-options"><label>关闭窗口时<select aria-label="关闭窗口行为" value={clientSettings.closeBehavior} disabled={clientSettingsSaving} onChange={event => void changeClientSettings({...clientSettings,closeBehavior:event.target.value as ClientSettings['closeBehavior']})}><option value="tray">最小化到托盘，继续传输</option><option value="quit">安全退出客户端</option></select></label><label className="notification-option"><input aria-label="传输完成通知" type="checkbox" checked={clientSettings.notifications} disabled={clientSettingsSaving} onChange={event => void changeClientSettings({...clientSettings,notifications:event.target.checked})}/>传输完成时显示系统通知</label></div><p className="note">即时生效并自动保存。托盘可打开窗口、暂停或继续任务；退出会等待当前操作结束并保存进度。</p><button onClick={() => void action(() => window.quark.quit())}>退出客户端</button></section>}
       <div className="status" role="status">{status}</div>
     </main>
     {accountMenu && <div className="menu-dismiss" onClick={() => setAccountMenu(false)}/>}
@@ -471,6 +493,6 @@ function App() {
     {sharingDialog && <SharingDialog mode={sharingDialog} entries={selected} handle={share} path={sharePath} close={() => setSharingDialog(null)} onStatus={notify}/>}
     {loginPicker && <div className="modal-backdrop"><section className="modal login-picker" role="dialog" aria-modal="true" aria-label={signedIn ? '切换账号' : '登录账号'}><h2>{signedIn ? '切换账号' : '登录夸克账号'}</h2><p>选择官方支持的登录方式</p><button disabled={transferring} onClick={() => void login('qr')}>扫码登录</button><button disabled={transferring} onClick={() => void login('mobile')}>手机验证码登录</button><button disabled={transferring} onClick={() => void login('wechat')}>微信登录</button><p className="note">手机和微信登录在独立的夸克官方页面完成。{signedIn && '取消登录会保留原账号。'}</p><button onClick={() => setLoginPicker(false)}>取消</button></section></div>}
     {loggingIn && <div className="modal-backdrop"><div className="modal" role="dialog" aria-modal="true" aria-label={loginMode === 'qr' ? '扫码登录' : '官方网页登录'}><h2>{loginMode === 'qr' ? '扫码登录' : '官方网页登录'}</h2>{loginMode === 'qr' ? <><p>使用手机夸克 App 扫描二维码</p>{qr ? <img src={qr} alt="夸克登录二维码" /> : <div className="qr-loading">{loginCancelling ? '正在取消，等待当前请求结束…' : '正在获取二维码…'}</div>}<button disabled={loginCancelling} onClick={() => {setLoginCancelling(true);setQr(null);void action(() => call('login.cancel'));}}>{loginCancelling ? '正在取消…' : '取消登录'}</button></> : <p>请在官方窗口完成{loginMode === 'mobile' ? '手机验证码' : '微信'}登录，关闭该窗口可取消。</p>}</div></div>}
-  </div></>;
+  </div>{quitting && <div className="modal-backdrop exit-backdrop"><section className="modal" role="alertdialog" aria-modal="true" aria-label="正在安全退出"><h2>正在安全退出…</h2><p>正在停止任务并保存进度，请稍候。</p><p className="note">当前网络请求或文件操作结束后，客户端会自动退出。</p></section></div>}</>;
 }
 createRoot(document.getElementById('root')!).render(<FeedbackProvider><App /></FeedbackProvider>);

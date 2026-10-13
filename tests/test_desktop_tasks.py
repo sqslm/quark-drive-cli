@@ -87,6 +87,65 @@ class QueueTests(unittest.TestCase):
         document = json.loads(self.service.task_store.path.read_text("utf-8"))
         self.assertEqual([row["state"] for row in document["tasks"]], ["done", "done"])
         self.assertNotIn("sid=queue-credential", str(document))
+        started = [message for message in self.messages if message.get('event') == 'batch.started']
+        finished = [message for message in self.messages if message.get('event') == 'batch.finished']
+        self.assertEqual(len(started), 1)
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(started[0]['data']['batch_id'], finished[0]['data']['batch_id'])
+        self.assertEqual(finished[0]['data']['counts'], {'done':2,'failed':0,'stopped':0,'cancelled':0})
+        self.queue('c')
+        self.wait_idle()
+        later = [message for message in self.messages if message.get('event') == 'batch.finished'][-1]['data']
+        self.assertNotEqual(later['batch_id'], finished[0]['data']['batch_id'])
+        self.assertEqual(later['counts']['done'], 1)
+
+    def test_shutdown_waits_for_active_cleanup_and_persists_queued_pause(self):
+        self.queue('active')
+        self.assertTrue(self.backend.entered.wait(1))
+        self.queue('queued')
+        finished = threading.Event()
+        def shutdown():
+            self.service.shutdown()
+            finished.set()
+        closing = threading.Thread(target=shutdown)
+        closing.start()
+        try:
+            self.assertTrue(self.service.stop.wait(1))
+            self.assertFalse(finished.is_set())
+            self.service.accept({'id':'closing-request','method':'download','params':{'entries':[]}})
+            self.assertIn('正在退出', self.messages[-1]['error'])
+            with self.assertRaises(Exception):
+                self.service.start_tasks([])
+            self.assertTrue(self.service.stop.is_set())
+        finally:
+            self.backend.release.set()
+            closing.join(2)
+        self.assertTrue(finished.is_set())
+        self.assertEqual([request.fid for request in self.backend.requests], ['active'])
+        self.assertEqual([task['state'] for task in self.service.tasks], ['stopped','stopped'])
+        self.assertFalse(self.service.busy)
+        document=json.loads(self.service.task_store.path.read_text('utf8'))
+        self.assertEqual([task['state'] for task in document['tasks']], ['stopped','stopped'])
+        summary=[message for message in self.messages if message.get('event') == 'batch.finished'][-1]['data']
+        self.assertTrue(summary['stopped'])
+        self.assertEqual(summary['counts']['stopped'], 2)
+
+    def test_batch_summary_counts_failed_and_cancelled_without_old_results(self):
+        original=self.backend.download
+        def download(request, progress, stopped):
+            if request.fid == 'fail':
+                raise RuntimeError('controlled failure')
+            return original(request, progress, stopped)
+        self.backend.download=download
+        self.queue('done')
+        self.assertTrue(self.backend.entered.wait(1))
+        self.queue('fail')
+        queued=self.queue('cancelled')[-1]
+        self.service.dispatch('cancel','tasks.cancel',{'ids':[queued['id']]},None)
+        self.backend.release.set()
+        self.wait_idle()
+        summary=[message for message in self.messages if message.get('event') == 'batch.finished'][-1]['data']
+        self.assertEqual(summary['counts'], {'done':1,'failed':1,'stopped':0,'cancelled':1})
 
     def test_cancel_waiting_item_never_calls_backend(self):
         self.queue("a")

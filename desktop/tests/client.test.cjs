@@ -11,7 +11,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
   const server = http.createServer(async (request, response) => {
     const filename = path.resolve(root, '.' + (request.url === '/' ? '/index.html' : request.url.split('?')[0]));
     if (!filename.startsWith(root + path.sep)) { response.writeHead(403).end(); return; }
-    try { response.setHeader('Content-Type', filename.endsWith('.js') ? 'application/javascript' : 'text/html'); response.end(await readFile(filename)); }
+    try { response.setHeader('Content-Type', filename.endsWith('.js') ? 'application/javascript' : filename.endsWith('.png') ? 'image/png' : 'text/html'); response.end(await readFile(filename)); }
     catch { response.writeHead(404).end(); }
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -28,8 +28,12 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
       const preferences = { output_dir: 'C:\\Downloads', connections: 4, limit_rate: null, width: 1180, height: 780 };
       window.testCalls = [];
       let appearanceSource='system';
+      let clientSettings={closeBehavior:'tray',notifications:true};
       matchMedia('(prefers-color-scheme: dark)').addEventListener('change',event => {if(appearanceSource === 'system') listeners.forEach(listener => listener({id:null,event:'appearance',data:{source:'system',dark:event.matches,warning:''}}));});
       window.quark = {
+        getClientSettings:async () => ({settings:clientSettings,warning:''}),
+        setClientSettings:async settings => {clientSettings=settings;window.testCalls.push({method:'desktop.set',params:settings});return {settings,warning:window.testClientSettingsWarning ? '后台运行设置已生效，但未能保存；本次窗口内有效' : ''};},
+        quit:async () => {listeners.forEach(listener => listener({id:null,event:'desktop.quitting',data:true}));},
         getAppearance:async () => ({source:appearanceSource,dark:matchMedia('(prefers-color-scheme: dark)').matches,warning:''}),
         setAppearance:async source => {appearanceSource=source;const result={source,dark:source === 'dark' || source === 'system' && matchMedia('(prefers-color-scheme: dark)').matches,warning:window.testAppearanceWarning ? '外观已切换，但未能保存；本次窗口内有效' : ''};listeners.forEach(listener => listener({id:null,event:'appearance',data:result}));return result;},
         onEvent: callback => { listeners.add(callback); return () => listeners.delete(callback); },
@@ -248,6 +252,49 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     await page.getByRole('button',{name:'我的文件',exact:true}).click();
     await page.getByRole('button',{name:'设置',exact:true}).click();
+    assert.equal(await page.locator('.brand-logo').evaluate(image => image.complete && image.naturalWidth > 0),true);
+    const threadSlider=page.getByRole('slider',{name:'拖动调整线程数',exact:true});
+    await threadSlider.focus();await threadSlider.press('End');
+    assert.equal(await page.getByRole('spinbutton',{name:'线程数',exact:true}).inputValue(),'16');
+    await threadSlider.press('Home');
+    assert.equal(await page.getByRole('spinbutton',{name:'线程数',exact:true}).inputValue(),'1');
+    await page.getByRole('spinbutton',{name:'线程数',exact:true}).fill('8');
+    assert.equal(await threadSlider.inputValue(),'8');
+    const sliderBounds=await threadSlider.boundingBox();
+    await page.mouse.move(sliderBounds.x+7.5+(sliderBounds.width-15)*7/15,sliderBounds.y+sliderBounds.height/2);
+    await page.mouse.down();
+    await page.mouse.move(sliderBounds.x+sliderBounds.width*.85,sliderBounds.y+sliderBounds.height/2,{steps:5});
+    await page.mouse.up();
+    const dragged=await threadSlider.inputValue();
+    assert.ok(Number(dragged) > 8 && Number(dragged) <= 16);
+    assert.equal(await page.getByRole('spinbutton',{name:'线程数',exact:true}).inputValue(),dragged);
+    await page.getByRole('spinbutton',{name:'线程数',exact:true}).fill('8');
+    const rateSlider=page.getByRole('slider',{name:'拖动调整总限速',exact:true});
+    await rateSlider.focus();await rateSlider.press('End');
+    assert.equal(await page.getByRole('spinbutton',{name:'总限速',exact:true}).inputValue(),'100');
+    await rateSlider.press('Home');
+    assert.equal(await page.getByRole('spinbutton',{name:'总限速',exact:true}).inputValue(),'0');
+    await page.getByRole('spinbutton',{name:'总限速',exact:true}).fill('10.5');
+    assert.equal(await rateSlider.inputValue(),'10.5');
+    await page.getByRole('spinbutton',{name:'总限速',exact:true}).fill('0.01');
+    assert.equal(await rateSlider.inputValue(),'0.01');
+    await page.getByRole('spinbutton',{name:'总限速',exact:true}).fill('150');
+    assert.equal(await rateSlider.inputValue(),'100');
+    assert.equal(await page.getByRole('spinbutton',{name:'总限速',exact:true}).inputValue(),'150');
+    await page.getByRole('spinbutton',{name:'总限速',exact:true}).fill('0');
+    await page.getByRole('button',{name:'保存设置',exact:true}).click();
+    const sliderSaved=await page.evaluate(() => window.testCalls.filter(call => call.method === 'preferences.save').at(-1).params);
+    assert.equal(sliderSaved.connections,8);assert.equal(sliderSaved.limit_rate,null);
+    await page.getByLabel('关闭窗口行为',{exact:true}).selectOption('quit');
+    await page.locator('.toast.success').getByText('后台运行设置已保存',{exact:true}).waitFor();
+    await page.getByLabel('传输完成通知',{exact:true}).uncheck();
+    await page.waitForFunction(() => window.testCalls.filter(call => call.method === 'desktop.set').at(-1).params.notifications === false);
+    await page.evaluate(() => {window.testClientSettingsWarning=true;});
+    await page.getByLabel('关闭窗口行为',{exact:true}).selectOption('tray');
+    await page.locator('.toast.warning').getByText('后台运行设置已生效，但未能保存；本次窗口内有效',{exact:true}).waitFor();
+    await page.evaluate(() => {window.testClientSettingsWarning=false;});
+    await page.getByLabel('传输完成通知',{exact:true}).check();
+    await page.getByRole('spinbutton',{name:'线程数',exact:true}).scrollIntoViewIfNeeded();
     await page.screenshot({path:path.resolve(__dirname,'../test-results/light-settings.png')});
     await page.getByRole('radio',{name:'暗色',exact:true}).check();
     await page.locator('.toast.success').getByText('外观已保存',{exact:true}).waitFor();
@@ -307,6 +354,8 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(downloaded.length, 1); assert.equal(downloaded[0].fid, '0');
     await page.getByRole('button',{name:'设置',exact:true}).click();
     assert.ok(await page.getByRole('button',{name:'保存设置',exact:true}).isDisabled());
+    assert.ok(await page.getByRole('slider',{name:'拖动调整线程数',exact:true}).isDisabled());
+    assert.ok(await page.getByRole('slider',{name:'拖动调整总限速',exact:true}).isDisabled());
     assert.ok(await page.getByRole('radio',{name:'暗色',exact:true}).isEnabled());
     await page.getByRole('radio',{name:'暗色',exact:true}).check();
     await page.getByRole('button',{name:/^传输任务/}).click();
@@ -374,6 +423,10 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.locator('.toast.error').getByText('登录服务暂时不可用',{exact:true}).waitFor();
     await page.locator('.account-name[title="未登录"]').waitFor();
     assert.deepEqual(errors, []);
+    await page.getByRole('button',{name:'设置',exact:true}).click();
+    await page.getByRole('button',{name:'退出客户端',exact:true}).click();
+    await page.getByRole('alertdialog',{name:'正在安全退出',exact:true}).waitFor();
+    assert.equal(await page.locator('.app').evaluate(element => element.inert),true);
   } finally { await browser.close(); await new Promise(resolve => server.close(resolve)); }
 });
 
@@ -387,6 +440,34 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     const page = await app.firstWindow();
     await page.getByRole('heading', { name:'我的文件' }).waitFor();
     const hello = await page.evaluate(() => window.quark.call('hello'));
+    assert.deepEqual((await page.evaluate(() => window.quark.getClientSettings())).settings,{closeBehavior:'tray',notifications:true});
+    await assert.rejects(page.evaluate(() => window.quark.setClientSettings({closeBehavior:'unknown',notifications:true})),/设置无效/);
+    await app.evaluate(({Tray}) => {
+      const original=Tray.prototype.setContextMenu;
+      Tray.prototype.setContextMenu=function(menu) {global.testTray=this;global.testTrayMenu=menu;return original.call(this,menu);};
+    });
+    await page.evaluate(() => window.quark.setClientSettings({closeBehavior:'tray',notifications:true}));
+    assert.ok(await app.evaluate(() => global.testTray && !global.testTray.isDestroyed()));
+    const packagedIcon=path.join(path.dirname(executable),'resources/app-icon.ico');
+    const iconHeader=await readFile(packagedIcon);
+    assert.equal(iconHeader.readUInt16LE(2),1);assert.ok(iconHeader.readUInt16LE(4) >= 6);
+    await page.locator('.brand-logo').waitFor();
+    await page.waitForFunction(() => document.querySelector('.brand-logo').naturalWidth > 0);
+    await app.evaluate(({BrowserWindow}) => BrowserWindow.getAllWindows()[0].close());
+    assert.equal(await app.evaluate(({BrowserWindow}) => BrowserWindow.getAllWindows()[0].isVisible()),false);
+    assert.equal((await page.evaluate(() => window.quark.call('hello'))).protocol,1);
+    await app.evaluate(() => global.testTray.emit('click'));
+    assert.equal(await app.evaluate(({BrowserWindow}) => BrowserWindow.getAllWindows()[0].isVisible()),true);
+    await app.evaluate(() => global.testTrayMenu.getMenuItemById('transfers').click());
+    await page.getByRole('heading',{name:'传输任务',exact:true}).waitFor();
+    await page.getByRole('button',{name:'设置',exact:true}).click();
+    await page.getByLabel('关闭窗口行为',{exact:true}).selectOption('quit');
+    await page.getByLabel('传输完成通知',{exact:true}).uncheck();
+    await page.locator('.toast.success').getByText('后台运行设置已保存',{exact:true}).waitFor();
+    await page.waitForFunction(() => !document.querySelector('[aria-label="传输完成通知"]').disabled);
+    const savedDesktop=JSON.parse(await readFile(path.join(await app.evaluate(({app}) => app.getPath('userData')),'desktop.json'),'utf8'));
+    assert.deepEqual(savedDesktop,{closeBehavior:'quit',notifications:false});
+    await page.getByRole('button',{name:'我的文件',exact:true}).click();
     const initialAppearance=await page.evaluate(() => window.quark.getAppearance());
     assert.equal(initialAppearance.source,'system');
     assert.equal(initialAppearance.dark,await app.evaluate(({nativeTheme}) => nativeTheme.shouldUseDarkColors));
@@ -437,6 +518,7 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     const restarted=await app.firstWindow();
     await restarted.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
     assert.equal((await restarted.evaluate(() => window.quark.getAppearance())).source,'dark');
+    assert.deepEqual((await restarted.evaluate(() => window.quark.getClientSettings())).settings,{closeBehavior:'quit',notifications:false});
     assert.equal(await app.evaluate(({nativeTheme}) => nativeTheme.themeSource),'dark');
     await restarted.waitForFunction(() => document.documentElement.dataset.colorScheme === 'dark');
     assert.equal(await restarted.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(32, 37, 48)');
@@ -457,5 +539,19 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     assert.equal((await unavailable.evaluate(() => window.quark.getAppearance())).source,'system');
     const unsaved=await unavailable.evaluate(() => window.quark.setAppearance('dark'));
     assert.equal(unsaved.source,'dark');assert.match(unsaved.warning,/未能保存/);
+    await app.close();
+    await writeFile(path.join(userData,'desktop.json'),'{broken','utf8');
+    app=await _electron.launch(launchOptions);
+    const brokenSettings=await app.firstWindow();
+    await brokenSettings.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
+    const defaults=await brokenSettings.evaluate(() => window.quark.getClientSettings());
+    assert.deepEqual(defaults.settings,{closeBehavior:'tray',notifications:true});assert.match(defaults.warning,/无法读取/);
+    assert.equal(await readFile(path.join(userData,'desktop.json'),'utf8'),'{broken');
+    await app.close();await rm(path.join(userData,'desktop.json'));await mkdir(path.join(userData,'desktop.json'));
+    app=await _electron.launch(launchOptions);
+    const readonly=await app.firstWindow();
+    await readonly.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
+    const unsavedDesktop=await readonly.evaluate(() => window.quark.setClientSettings({closeBehavior:'quit',notifications:false}));
+    assert.deepEqual(unsavedDesktop.settings,{closeBehavior:'quit',notifications:false});assert.match(unsavedDesktop.warning,/未能保存/);
   } finally { await app.close(); await rm(directory, { recursive:true, force:true }); }
 });

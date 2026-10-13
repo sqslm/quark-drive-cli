@@ -4,7 +4,8 @@ module.exports = {
   packagerConfig: {
     asar: true,
     executableName: 'QuarkDriveClient',
-    extraResource: [path.resolve(__dirname, '../dist/QuarkBackend')],
+    icon:path.resolve(__dirname,'assets/app-icon.ico'),
+    extraResource: [path.resolve(__dirname, '../dist/QuarkBackend'),path.resolve(__dirname,'assets/app-icon.ico')],
   },
   makers: [{ name: '@electron-forge/maker-zip', platforms: ['win32'] }],
   plugins: [{ name: '@electron-forge/plugin-webpack', config: {

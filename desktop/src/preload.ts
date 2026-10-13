@@ -16,6 +16,9 @@ const bridge: Bridge = {
   copyText: (text) => ipcRenderer.invoke('quark:copy-text', text),
   getAppearance: () => ipcRenderer.invoke('quark:appearance.get'),
   setAppearance: source => ipcRenderer.invoke('quark:appearance.set',source),
+  getClientSettings: () => ipcRenderer.invoke('quark:desktop.get'),
+  setClientSettings: settings => ipcRenderer.invoke('quark:desktop.set',settings),
+  quit: () => ipcRenderer.invoke('quark:quit'),
   officialLogin: mode => ipcRenderer.invoke('quark:official-login',mode),
 };
 contextBridge.exposeInMainWorld('quark', bridge);

@@ -94,6 +94,16 @@ aside{padding-top:28px}.brand{padding-bottom:30px;letter-spacing:.2px}.brand sma
 .theme-option-label{display:flex;align-items:center;gap:8px;padding:12px 4px 4px;font-weight:500}
 .settings-section .theme-option input{display:inline-block;margin:0;width:14px;height:14px;accent-color:var(--blue)}
 .settings-section .note{margin:14px 0 20px}.settings-divider{height:1px;background:var(--line);margin:24px 0}
-.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.settings-grid label{margin-bottom:0}
+.brand-logo{width:36px;height:36px;border-radius:9px;flex-shrink:0}.titlebar img{width:17px;height:17px;border-radius:4px;margin-right:8px}
+.transfer-settings{margin-top:18px;border:1px solid var(--line);border-radius:10px;padding:0 18px;background:var(--subtle)}
+.transfer-setting{display:grid;grid-template-columns:minmax(145px,1fr) 88px minmax(180px,1.5fr);align-items:center;gap:18px;padding:18px 0}
+.transfer-setting+.transfer-setting{border-top:1px solid var(--line)}.transfer-setting label{margin:0;font-weight:500}.transfer-setting p{font-size:11px;margin:6px 0 0}
+.transfer-setting>input{min-width:0;width:100%;padding:9px}.setting-slider{display:flex;align-items:center;gap:12px;min-width:0;font-variant-numeric:tabular-nums;color:var(--secondary);font-size:12px}
+.setting-slider input[type=range]{appearance:none;min-width:0;width:100%;height:4px;padding:0;border:0;border-radius:4px;background:linear-gradient(to right,var(--blue) var(--range-fill),var(--control-border) var(--range-fill));cursor:pointer}
+.setting-slider input[type=range]::-webkit-slider-thumb{appearance:none;width:15px;height:15px;background:var(--blue);border:2px solid var(--surface);border-radius:50%;box-shadow:0 0 0 1px var(--blue)}
+.setting-slider input:disabled{opacity:.45;cursor:default}.setting-slider span:last-child{min-width:22px;text-align:right}
+.notification-option{display:flex!important;align-items:center;gap:10px}.desktop-options .notification-option input{margin:0;width:15px;height:15px;accent-color:var(--blue)}
+.exit-backdrop{z-index:110}.exit-backdrop .modal{width:420px}
+@media(max-width:950px){.transfer-setting{grid-template-columns:1fr 88px}.setting-slider{grid-column:1/-1}.transfer-setting{gap:12px}}
 .settings-section .settings-divider+h2{margin-top:0}
 @media(prefers-reduced-motion:reduce){button{transition:none}}
