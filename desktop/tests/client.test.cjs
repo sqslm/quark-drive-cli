@@ -42,7 +42,11 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
           if(method === 'favorites.open') return [['0','我的网盘'],[params.fid,favorites.find(row => row.fid === params.fid).name]];
           if(method === 'file.info') return {file_name:params.entry.name,size:3489662954,path:'/'+params.entry.name,directory:false};
           if(method === 'tasks') return tasks.map(task => ({...task}));
-          if(method === 'browse') return rows.filter(row => (row.parent || '0') === (params.fid || '0')).map(row => ({...row}));
+          if(method === 'browse') {
+            if(window.testHoldBrowse) await new Promise(resolve => {window.releaseBrowse=resolve;});
+            if(window.testBrowseFailure) throw new Error('测试目录读取失败');
+            return rows.filter(row => (row.parent || '0') === (params.fid || '0')).map(row => ({...row}));
+          }
           if(method === 'file.mkdir') { rows.push({fid:'new',name:params.name,directory:true,size:null,path:'',location:[]}); return {fid:'new'}; }
           if(method === 'file.rename') { const row = rows.find(row => row.fid === params.entries[0].fid); row.name = params.name; return [{ name:row.name,state:'done',detail:'操作完成'}]; }
           if(method === 'file.cut') {cut={id:'cut-current',entries:params.entries,blocked:false};return cut;}
@@ -79,6 +83,30 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.goto(`http://127.0.0.1:${server.address().port}/main_window/index.html`);
     await page.getByText('显示 10000 项', { exact: true }).waitFor();
     assert.ok(await page.locator('.file-row').count() < 60);
+    const listBefore=await page.locator('.file-scroll').evaluate(element => ({height:element.scrollHeight,rowY:element.querySelector('.file-row').getBoundingClientRect().y}));
+    await page.evaluate(() => {window.testHoldBrowse=true;});
+    await page.getByRole('button',{name:'刷新',exact:true}).click();
+    await page.getByText('正在读取目录…',{exact:true}).waitFor();
+    const listDuring=await page.locator('.file-scroll').evaluate(element => ({height:element.scrollHeight,rowY:element.querySelector('.file-row').getBoundingClientRect().y}));
+    assert.ok(Math.abs(listBefore.rowY-listDuring.rowY) < 1,'loading must not push existing rows down');
+    assert.equal(listDuring.height,listBefore.height,'loading must not change the scrollable list height');
+    await page.evaluate(() => {window.testHoldBrowse=false;window.releaseBrowse();});
+    await page.getByText('正在读取目录…',{exact:true}).waitFor({state:'hidden'});
+    await page.locator('.file-scroll').evaluate(element => {element.scrollTop=920;});
+    await page.waitForFunction(() => document.querySelector('.file-row').getBoundingClientRect().y < document.querySelector('.file-scroll').getBoundingClientRect().y);
+    const scrolledBefore=await page.locator('.file-scroll').evaluate(element => ({height:element.scrollHeight,top:element.scrollTop,rowY:element.querySelector('.file-row').getBoundingClientRect().y}));
+    await page.evaluate(() => {window.testHoldBrowse=true;window.testBrowseFailure=true;});
+    await page.getByRole('button',{name:'刷新',exact:true}).click();
+    await page.getByText('正在读取目录…',{exact:true}).waitFor();
+    const scrolledDuring=await page.locator('.file-scroll').evaluate(element => ({height:element.scrollHeight,top:element.scrollTop,rowY:element.querySelector('.file-row').getBoundingClientRect().y}));
+    assert.deepEqual(scrolledDuring,scrolledBefore);
+    assert.equal(await page.locator('.file-scroll').evaluate(element => element.inert),true);
+    await page.evaluate(() => {window.testHoldBrowse=false;window.releaseBrowse();});
+    await page.getByText('正在读取目录…',{exact:true}).waitFor({state:'hidden'});
+    await page.locator('.toast.error').getByText('测试目录读取失败',{exact:true}).waitFor();
+    assert.equal(await page.locator('.file-scroll').evaluate(element => element.scrollTop),scrolledBefore.top);
+    assert.equal(await page.locator('.file-scroll').evaluate(element => element.inert),false);
+    await page.evaluate(() => {window.testBrowseFailure=false;document.querySelector('.file-scroll').scrollTop=0;});
     assert.equal(await page.getByRole('button',{name:'重命名',exact:true}).count(),0);
     assert.equal(await page.getByLabel('格式筛选',{exact:true}).count(),0);
     await page.getByRole('button',{name:'筛选',exact:true}).click();
@@ -112,7 +140,13 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('menuitem',{name:'设为常用文件夹',exact:true}).click();
     await page.locator('.favorites').getByRole('button',{name:'新建测试',exact:true}).waitFor();
     assert.equal(await page.evaluate(() => window.testCalls.filter(call => ['browse','locate'].includes(call.method)).length),beforeFavorite);
+    const folderBefore=await page.locator('.file-scroll').evaluate(element => ({height:element.scrollHeight,rowY:element.querySelector('.file-row').getBoundingClientRect().y}));
+    await page.evaluate(() => {window.testHoldBrowse=true;});
     await page.locator('.file-row').getByRole('button',{name:'新建测试',exact:true}).click();
+    await page.getByText('正在读取目录…',{exact:true}).waitFor();
+    const folderDuring=await page.locator('.file-scroll').evaluate(element => ({height:element.scrollHeight,rowY:element.querySelector('.file-row').getBoundingClientRect().y}));
+    assert.deepEqual(folderDuring,folderBefore);
+    await page.evaluate(() => {window.testHoldBrowse=false;window.releaseBrowse();});
     await page.getByText('暂无文件',{exact:true}).waitFor();
     await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'新建测试',exact:true}).waitFor();
     assert.ok(await page.locator('.breadcrumbs').evaluate(element => element.getBoundingClientRect().bottom < document.querySelector('.file-header').getBoundingClientRect().top));

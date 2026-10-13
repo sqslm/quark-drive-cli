@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Entry, Event, Preferences, Task, Cut, Favorite } from './types';
@@ -67,6 +67,8 @@ function App() {
   const shareRevision = useRef(0);
   const codeRevision = useRef(0);
   const scroll = useRef<HTMLDivElement>(null);
+  const directoryKey = share ? `${share}:${sharePath}` : trail.at(-1)![0];
+  useLayoutEffect(() => {scroll.current?.scrollTo({top:0});},[directoryKey]);
   const menu = useRef<HTMLDivElement>(null);
   useEffect(() => {if(context) menu.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();},[context]);
   const call = window.quark.call;
@@ -131,6 +133,7 @@ function App() {
     }
   }
   async function openRow(row: Entry) {
+    if(loading) return;
     if (share) {
       if (!row.directory) return;
       const generation = ++view.current; cancelSearch(); setLoading(true);
@@ -383,12 +386,13 @@ function App() {
         <div className="file-header"><input aria-label="全选可见文件" type="checkbox" checked={all} onChange={() => setChecked(old => { const next = new Set(old); filtered.forEach(row => all ? next.delete(row.fid) : next.add(row.fid)); return next; })} />
           <button onClick={() => sortBy('name')}>名称{sort?.key === 'name' ? sort.descending ? ' ↓' : ' ↑' : ''}</button><button onClick={() => sortBy('size')}>大小</button><span>类型</span><button onClick={() => sortBy('path')}>路径</button></div>
         {cut && !share && <div className="cut-bar"><span>{cut.blocked ? '上次粘贴结果待核实' : `已剪切 ${cut.entries.length} 项，等待粘贴`}</span><button disabled={!canPaste} onClick={paste}>粘贴到当前目录</button><button onClick={() => void clearCut()}>取消剪切</button></div>}
-        <div className="file-scroll" ref={scroll} tabIndex={0} aria-label="文件列表" onContextMenu={event => contextAt(event,null)}>{loading && <div className="empty">正在读取目录…</div>}
+        <div className="file-list" aria-busy={loading}><div className="file-scroll" ref={scroll} tabIndex={0} inert={loading} aria-label="文件列表" onContextMenu={event => contextAt(event,null)}>
           {!loading && !filtered.length && <div className="empty">{!signedIn ? <><p>登录后浏览和管理网盘文件</p><button className="primary" onClick={() => setLoginPicker(true)}>登录账号</button></> : searching ? '正在搜索，结果将陆续显示…' : rows.length ? '没有符合筛选条件的项目' : '暂无文件'}</div>}
           <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>{virtualizer.getVirtualItems().map(item => { const row = filtered[item.index]; return <div className={'file-row' + (checked.has(row.fid) ? ' selected' : '') + (cutIds.has(row.fid) && !share ? ' cut' : '')} key={row.fid} style={{ transform: `translateY(${item.start}px)` }} onDoubleClick={() => void openRow(row)} onContextMenu={event => contextAt(event,row)}>
             <input type="checkbox" aria-label={`选择 ${row.name}`} checked={checked.has(row.fid)} onChange={() => toggle(row.fid)} />
             <div className="file-title"><button className="file-name" title={row.name} onClick={() => void openRow(row)}><FileIcon folder={row.directory} /><span>{row.name}</span></button><div className="row-actions"><button title="更多操作" aria-label={`更多操作 ${row.name}`} onClick={event => contextAt(event,row)}>⋯</button></div></div>
             <span>{row.directory ? '—' : units(row.size)}</span><span>{row.directory ? '目录' : '文件'}</span><span title={row.path}>{row.path || (searchView ? '待定位' : '—')}</span></div>; })}</div></div>
+          {loading && <div className="list-loading" role="status">正在读取目录…</div>}</div>
         <footer><button disabled={transferring || loggingIn} onClick={() => void action(async () => { const folder = await window.quark.chooseFolder(); if (folder) await saveSettings(folder); })}>保存目录</button>
           <button className="folder-path" title={preferences.output_dir} onClick={() => void action(() => window.quark.openFolder(preferences.output_dir))}>{preferences.output_dir || '尚未选择保存目录'}</button>
           <button className="primary" disabled={!canDownload} onClick={() => void downloadSelected()}>{transferring ? "加入队列" : "下载"}{selected.length ? `（${selected.length}）` : ''}</button></footer>
