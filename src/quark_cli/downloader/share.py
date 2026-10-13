@@ -139,6 +139,7 @@ class ShareDownloader:
         progress: Callable[[ProgressEvent], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
         connections: int = DEFAULT_DOWNLOAD_CONNECTIONS,
+        limit_rate: int | None = None,
     ) -> dict[str, Any]:
         """Download the one selected share item to ``target``, then clean up.
 
@@ -149,6 +150,8 @@ class ShareDownloader:
         """
         if type(connections) is not int or not 1 <= connections <= MAX_DOWNLOAD_CONNECTIONS:
             raise UsageError("下载并发连接数必须是 1 到 16 之间的整数")
+        if limit_rate is not None and (type(limit_rate) is not int or limit_rate <= 0):
+            raise UsageError("下载限速必须是正整数字节/秒")
         original = safe_transfer_name(name)
         destination = safe_local_path(target)
         if destination.name != original:
@@ -177,7 +180,7 @@ class ShareDownloader:
             # here still skips the save and the cleanup below removes the folder.
             self._stop_requested(should_stop, "下载已停止：未提交转存")
             account_fid = self._save_selection(selected, temp_fid, original, recursive)
-            result = self._transfer(account_fid, destination, original, recursive, progress, should_stop, connections)
+            result = self._transfer(account_fid, destination, original, recursive, progress, should_stop, connections, limit_rate)
         except BaseException as error:
             primary = error
 
@@ -337,6 +340,7 @@ class ShareDownloader:
         progress: Callable[[ProgressEvent], None] | None,
         should_stop: Callable[[], bool] | None,
         connections: int,
+        limit_rate: int | None,
     ) -> dict[str, Any]:
         """Download the account copy inside a temporary staging area, then publish.
 
@@ -354,6 +358,8 @@ class ShareDownloader:
             payload_dir.mkdir()
             staged = payload_dir / name
             options: dict[str, Any] = {"resume": True, "overwrite": False, "connections": connections}
+            if limit_rate is not None:
+                options["limit_rate"] = limit_rate
             if progress is not None:
                 options["progress"] = progress
             if should_stop is not None:

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 import re
+import math
 from typing import Any
 
 from ..errors import LocalIOError, QuarkError, RemoteError, UsageError
@@ -45,6 +46,17 @@ EXTENSION_GROUPS = {
     "压缩包": ("zip", "rar", "7z", "tar", "gz", "bz2", "xz", "tgz", "zst"),
 }
 EXTENSION_CHOICES = ("所有格式", *EXTENSION_GROUPS, "无扩展名")
+
+
+def download_limit_rate(value: str) -> int | None:
+    """The window's MiB/s field as the library's shared byte budget."""
+    try:
+        rate = float(value.strip())
+    except ValueError:
+        raise UsageError("限速请输入 0 或 0.01–10240 之间的数字（MiB/s）") from None
+    if not math.isfinite(rate) or not (rate == 0 or 0.01 <= rate <= 10240):
+        raise UsageError("限速请输入 0 或 0.01–10240 之间的数字（MiB/s）")
+    return int(rate * 1048576) if rate else None
 
 
 def display_text(value: Any) -> str:

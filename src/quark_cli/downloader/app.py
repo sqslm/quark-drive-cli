@@ -102,6 +102,7 @@ from .core import (
     describe_error,
     display_text,
     download_plan,
+    download_limit_rate,
     filter_entries,
     sort_entries,
     item_status,
@@ -326,6 +327,7 @@ class DownloaderWindow:
         self._output_dir = ""
         self._batch: Batch | None = None
         self._batch_connections = DEFAULT_DOWNLOAD_CONNECTIONS
+        self._batch_limit_rate: int | None = None
         self._batch_resume_available = True
         self._tasks: list[DownloadTask] = []
         self._active_task_ids: list[int] = []
@@ -342,6 +344,8 @@ class DownloaderWindow:
         self._continue_button: Any = None
         self._connections_var: Any = None
         self._connections_input: Any = None
+        self._limit_rate_var: Any = None
+        self._limit_rate_input: Any = None
         self._downloading = False
         self._stop_requested = False
         self._logging_in = False
@@ -448,7 +452,11 @@ class DownloaderWindow:
         width, height = self._preferences.width, self._preferences.height
         if self._root is not None and self._root.winfo_width() > 1:
             width, height = self._root.winfo_width(), self._root.winfo_height()
-        preferences = Preferences(self._output_dir, connections, width, height)
+        try:
+            rate = self._download_limit_rate()
+        except UsageError:
+            rate = self._preferences.limit_rate
+        preferences = Preferences(self._output_dir, connections, width, height, rate)
         try:
             save_preferences(self._preferences_path, preferences)
         except (QuarkError, OSError) as error:
@@ -464,6 +472,7 @@ class DownloaderWindow:
             return
         try:
             connections = self._download_connections()
+            self._download_limit_rate()
         except UsageError as error:
             self._set_status(str(error))
             return
@@ -622,6 +631,16 @@ class DownloaderWindow:
         self._connections_input.pack(side="left")
         self._connections_input.bind("<FocusOut>", self._remember_connections)
         self._connections_input.bind("<Return>", self._remember_connections)
+        ttk.Label(actions, text="总限速 MiB/s").pack(side="left", padx=(12, 4))
+        rate = self._preferences.limit_rate
+        self._limit_rate_var = tk.StringVar(value=(f"{max(0.01, rate / 1048576):.6f}".rstrip("0").rstrip(".")
+                                                 if rate is not None else "0"))
+        self._limit_rate_input = ttk.Spinbox(actions, from_=0, to=10240, increment=0.1, width=7,
+                                            textvariable=self._limit_rate_var, command=self._remember_connections)
+        self._limit_rate_input.pack(side="left")
+        self._limit_rate_input.bind("<FocusOut>", self._remember_connections)
+        self._limit_rate_input.bind("<Return>", self._remember_connections)
+        ttk.Label(actions, text="0 不限速").pack(side="left", padx=6)
         self._download_button = ttk.Button(actions, text=DOWNLOAD_BUTTON_TEXT, width=12, command=self.start_download)
         self._download_button.pack(side="right")
         self._stop_button = ttk.Button(actions, text="停止", width=8, command=self.stop_download, state="disabled")
@@ -672,6 +691,8 @@ class DownloaderWindow:
         self._continue_button = None
         self._connections_var = None
         self._connections_input = None
+        self._limit_rate_var = None
+        self._limit_rate_input = None
         self._nickname_var = None
         self._scope_var = None
         self._scope_combo = None
@@ -1053,6 +1074,7 @@ class DownloaderWindow:
         try:
             folder = output_folder(self._output_dir)
             connections = self._download_connections()
+            limit_rate = self._download_limit_rate()
         except (QuarkError, OSError) as error:
             self._set_status(describe_error(error, DOWNLOAD_ACTION))
             return
@@ -1061,7 +1083,7 @@ class DownloaderWindow:
         self._task_output_dir = str(folder)
         self._task_share = None if source is None else (source, self._share_trail[-1])
         self._tasks_valid = True
-        self._begin_batch(list(range(len(self._tasks))), connections)
+        self._begin_batch(list(range(len(self._tasks))), connections, limit_rate)
 
     def _download_connections(self) -> int:
         value = self._connections_var.get() if self._connections_var is not None else DEFAULT_DOWNLOAD_CONNECTIONS
@@ -1075,6 +1097,11 @@ class DownloaderWindow:
 
     def retry_failed(self) -> None:
         self._retry_tasks(failed_only=True)
+
+    def _download_limit_rate(self) -> int | None:
+        if self._limit_rate_var is None:
+            return self._preferences.limit_rate
+        return download_limit_rate(self._limit_rate_var.get())
 
     def continue_unfinished(self) -> None:
         self._retry_tasks(failed_only=False)
@@ -1099,13 +1126,14 @@ class DownloaderWindow:
         try:
             output_folder(self._task_output_dir)
             connections = self._download_connections()
+            limit_rate = self._download_limit_rate()
         except (QuarkError, OSError) as error:
             self._set_status(describe_error(error, DOWNLOAD_ACTION))
             return
         for index in task_ids:
             self._tasks[index].state = "waiting"
             self._tasks[index].detail = ""
-        self._begin_batch(task_ids, connections)
+        self._begin_batch(task_ids, connections, limit_rate)
 
     def open_task_folder(self) -> None:
         if self._busy() or self._task_tree is None:
@@ -1142,11 +1170,12 @@ class DownloaderWindow:
             self._task_menu.grab_release()
         return "break"
 
-    def _begin_batch(self, task_ids: list[int], connections: int) -> None:
+    def _begin_batch(self, task_ids: list[int], connections: int, limit_rate: int | None = None) -> None:
         self._save_preferences(connections=connections)
         self._active_task_ids = task_ids
         self._batch = Batch(self._task_output_dir, (self._tasks[index].entry for index in task_ids))
         self._batch_connections = connections
+        self._batch_limit_rate = limit_rate
         self._batch_resume_available = True
         self._batch_share = self._task_share
         self._stop_requested = False
@@ -1224,6 +1253,7 @@ class DownloaderWindow:
                     share_source=None if shared is None else shared[0],
                     share_path=SHARE_ROOT_PATH if shared is None else shared[1],
                     connections=self._batch_connections,
+                    limit_rate=self._batch_limit_rate,
                 )
             )
             return
@@ -1633,6 +1663,7 @@ class DownloaderWindow:
             selected_all = bool(self._entries) and all(entry.fid in self._checked for entry in self._entries.values())
             self._select_all_button.configure(text="取消全选" if selected_all else SELECT_ALL_TEXT)
         _set_state(self._connections_input, "disabled" if busy else "normal")
+        _set_state(self._limit_rate_input, "disabled" if busy else "normal")
         retry_ready = not busy and self._tasks_valid
         _set_state(self._retry_button, "normal" if retry_ready and any(
             task.state == "failed" for task in self._tasks) else "disabled")

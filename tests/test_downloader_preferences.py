@@ -27,7 +27,7 @@ class PreferencesFileTests(unittest.TestCase):
             save_preferences(path, preferences)
             self.assertEqual(load_preferences(path), preferences)
             data = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(set(data), {"version", "output_dir", "connections", "width", "height"})
+            self.assertEqual(set(data), {"version", "output_dir", "connections", "width", "height", "limit_rate"})
             private_path(path, read_only=True)
             self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["preferences.json"])
 
@@ -36,14 +36,26 @@ class PreferencesFileTests(unittest.TestCase):
             path = Path(folder) / "preferences.json"
             save_preferences(path, Preferences())
             base = json.loads(path.read_text(encoding="utf-8"))
-            for changes in ({"version": True}, {"version": 2}, {"connections": True}, {"connections": 17},
+            for changes in ({"version": True}, {"version": 3}, {"connections": True}, {"connections": 17},
                             {"connections": "8"}, {"width": 0}, {"height": True},
+                            {"limit_rate": True}, {"limit_rate": -1}, {"limit_rate": "2"},
                             {"output_dir": "relative"}, {"output_dir": "bad\0path"},
                             {"cookie": "private-cookie"}):
                 path.write_text(json.dumps({**base, **changes}), encoding="utf-8")
                 with self.subTest(changes=changes), self.assertRaises(LocalIOError) as caught:
                     load_preferences(path)
                 self.assertNotIn("private-cookie", str(caught.exception))
+
+    def test_legacy_preferences_restore_existing_values_with_unlimited_default(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "preferences.json"
+            save_preferences(path, Preferences(folder, 8, 920, 680, 1048576))
+            self.assertEqual(load_preferences(path).limit_rate, 1048576)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data.pop("limit_rate")
+            data["version"] = 1
+            path.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(load_preferences(path), Preferences(folder, 8, 920, 680))
 
 
 class PreferencesWindowTests(WindowCase):
@@ -123,10 +135,12 @@ class PreferencesControlsTests(unittest.TestCase):
                     with patch("tkinter.filedialog.askdirectory", return_value=folder):
                         window.choose_output()
                     window._connections_var.set("12")
+                    window._limit_rate_var.set("0.5")
                     root.tk.call(window._connections_input["command"])
                     window._share_var.set("https://pan.quark.cn/s/private?pwd=secret-code")
                     window._passcode_var.set("another-secret")
                     window._connections_var.set("-")
+                    window._limit_rate_var.set("")
                     observed.append((root.winfo_width(), root.winfo_height()))
                 finally:
                     window.close()
@@ -136,6 +150,7 @@ class PreferencesControlsTests(unittest.TestCase):
             self.assertEqual(len(observed), 1)
             restored = load_preferences(path)
             self.assertEqual((restored.output_dir, restored.connections), (folder, 12))
+            self.assertEqual(restored.limit_rate, 524288)
             self.assertEqual((restored.width, restored.height), observed[0])
             self.assertNotIn("secret", path.read_text(encoding="utf-8"))
             root = _tk_root()
@@ -145,6 +160,11 @@ class PreferencesControlsTests(unittest.TestCase):
                 try:
                     observed.append((window._output_var.get(), window._connections_var.get(),
                                      root.winfo_width(), root.winfo_height()))
+                    self.assertEqual(window._limit_rate_var.get(), "0.5")
+                    window._downloading = True
+                    window._sync_controls()
+                    self.assertEqual(str(window._limit_rate_input["state"]), "disabled")
+                    window._downloading = False
                 finally:
                     window.close()
 

@@ -111,6 +111,7 @@ class Download:
     share_source: ShareSource | None = None
     share_path: str = "/"
     connections: int = DEFAULT_DOWNLOAD_CONNECTIONS
+    limit_rate: int | None = None
 
 
 @dataclass(frozen=True)
@@ -304,6 +305,8 @@ class DriveBackend:
     ) -> dict[str, Any]:
         options: dict[str, Any] = {"overwrite": request.overwrite, "resume": True,
                                   "connections": request.connections}
+        if request.limit_rate is not None:
+            options["limit_rate"] = request.limit_rate
         if progress is not None:
             options["progress"] = progress
         if should_stop is not None:
@@ -326,6 +329,7 @@ class DriveBackend:
                     progress=progress,
                     should_stop=should_stop,
                     connections=request.connections,
+                    limit_rate=request.limit_rate,
                 )
             transfer = Transfer(client)
             if request.recursive:
