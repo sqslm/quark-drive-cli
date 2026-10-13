@@ -92,6 +92,7 @@ from .core import (
     ROOT_FID,
     SEARCH_ACTION,
     Batch,
+    DownloadTask,
     Entry,
     Location,
     Outcome,
@@ -315,6 +316,18 @@ class DownloaderWindow:
         self._batch: Batch | None = None
         self._batch_connections = DEFAULT_DOWNLOAD_CONNECTIONS
         self._batch_resume_available = True
+        self._tasks: list[DownloadTask] = []
+        self._active_task_ids: list[int] = []
+        self._task_output_dir = ""
+        self._task_share: tuple[ShareSource, str] | None = None
+        self._tasks_valid = True
+        self._notebook: Any = None
+        self._task_tab: Any = None
+        self._task_tree: Any = None
+        self._task_summary_var: Any = None
+        self._task_detail_var: Any = None
+        self._retry_button: Any = None
+        self._continue_button: Any = None
         self._connections_var: Any = None
         self._connections_input: Any = None
         self._downloading = False
@@ -447,8 +460,10 @@ class DownloaderWindow:
         self._count_var = tk.StringVar(value=match_text(0, 0))
         ttk.Label(find, textvariable=self._count_var, anchor="e").pack(side="right")
 
-        listing = ttk.Frame(root)
-        listing.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        self._notebook = ttk.Notebook(root)
+        self._notebook.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        listing = ttk.Frame(self._notebook)
+        self._notebook.add(listing, text="文件")
         tree = ttk.Treeview(listing, columns=("check", "path", "type", "size"), show="tree headings", selectmode="extended")
         tree.heading("#0", text="名称")
         tree.column("#0", width=260, minwidth=160)
@@ -466,6 +481,34 @@ class DownloaderWindow:
         tree.bind("<space>", self._on_space)
         tree.bind("<<TreeviewSelect>>", self._on_selection)
         self._tree = tree
+        self._task_tab = ttk.Frame(self._notebook)
+        self._notebook.add(self._task_tab, text="下载任务")
+        task_actions = ttk.Frame(self._task_tab)
+        task_actions.pack(fill="x", padx=6, pady=6)
+        self._retry_button = ttk.Button(task_actions, text="重试失败", command=self.retry_failed)
+        self._retry_button.pack(side="left", padx=(0, 4))
+        self._continue_button = ttk.Button(task_actions, text="继续未完成", command=self.continue_unfinished)
+        self._continue_button.pack(side="left", padx=(0, 8))
+        self._task_summary_var = tk.StringVar(value="暂无下载任务")
+        ttk.Label(task_actions, textvariable=self._task_summary_var).pack(side="left")
+        task_listing = ttk.Frame(self._task_tab)
+        task_listing.pack(fill="both", expand=True, padx=6)
+        self._task_tree = ttk.Treeview(task_listing, columns=("status", "detail"), show="tree headings",
+                                      selectmode="browse")
+        self._task_tree.heading("#0", text="名称")
+        self._task_tree.column("#0", width=230, minwidth=140)
+        self._task_tree.heading("status", text="状态")
+        self._task_tree.column("status", width=80, minwidth=80, stretch=False, anchor="center")
+        self._task_tree.heading("detail", text="结果 / 进度")
+        self._task_tree.column("detail", width=430, minwidth=180)
+        task_scroll = ttk.Scrollbar(task_listing, orient="vertical", command=self._task_tree.yview)
+        self._task_tree.configure(yscrollcommand=task_scroll.set)
+        task_scroll.pack(side="right", fill="y")
+        self._task_tree.pack(side="left", fill="both", expand=True)
+        self._task_tree.bind("<<TreeviewSelect>>", self._show_task_detail)
+        self._task_detail_var = tk.StringVar(value="选择任务可查看完整结果；记录保留至关闭窗口或开始新批次")
+        ttk.Label(self._task_tab, textvariable=self._task_detail_var, wraplength=790,
+                  justify="left", anchor="w").pack(fill="x", padx=6, pady=6)
         self._progress = ttk.Progressbar(root, mode="determinate", maximum=100.0)
         self._progress.pack(fill="x", padx=12, pady=(0, 4))
         self._log = tk.Text(root, height=4, wrap="word", state="disabled")
@@ -525,6 +568,13 @@ class DownloaderWindow:
             with contextlib.suppress(Exception):
                 root.destroy()
         self._tree = None
+        self._notebook = None
+        self._task_tab = None
+        self._task_tree = None
+        self._task_summary_var = None
+        self._task_detail_var = None
+        self._retry_button = None
+        self._continue_button = None
         self._connections_var = None
         self._connections_input = None
         self._nickname_var = None
@@ -641,6 +691,7 @@ class DownloaderWindow:
         elif isinstance(event, Progress):
             self._set_status(self._item_line(event.text))
             self._show_progress(event.fraction)
+            self._update_task("running", event.text)
         elif isinstance(event, Finished):
             self._settle(Outcome.DONE, event.summary)
             self._stop_progress(100.0)
@@ -902,21 +953,61 @@ class DownloaderWindow:
             return
         try:
             folder = output_folder(self._output_dir)
-            value = self._connections_var.get() if self._connections_var is not None else DEFAULT_DOWNLOAD_CONNECTIONS
-            try:
-                connections = int(value)
-            except (TypeError, ValueError):
-                raise UsageError("线程数必须是 1–16 的整数") from None
-            if not 1 <= connections <= MAX_DOWNLOAD_CONNECTIONS:
-                raise UsageError("线程数必须是 1–16 的整数")
+            connections = self._download_connections()
         except (QuarkError, OSError) as error:
             self._set_status(describe_error(error, DOWNLOAD_ACTION))
             return
         source = self._share_source
-        self._batch = Batch(str(folder), entries)
+        self._tasks = [DownloadTask(entry) for entry in entries]
+        self._task_output_dir = str(folder)
+        self._task_share = None if source is None else (source, self._share_trail[-1])
+        self._tasks_valid = True
+        self._begin_batch(list(range(len(self._tasks))), connections)
+
+    def _download_connections(self) -> int:
+        value = self._connections_var.get() if self._connections_var is not None else DEFAULT_DOWNLOAD_CONNECTIONS
+        try:
+            connections = int(value)
+        except (TypeError, ValueError):
+            raise UsageError("线程数必须是 1–16 的整数") from None
+        if not 1 <= connections <= MAX_DOWNLOAD_CONNECTIONS:
+            raise UsageError("线程数必须是 1–16 的整数")
+        return connections
+
+    def retry_failed(self) -> None:
+        self._retry_tasks(failed_only=True)
+
+    def continue_unfinished(self) -> None:
+        self._retry_tasks(failed_only=False)
+
+    def _retry_tasks(self, *, failed_only: bool) -> None:
+        if self._busy():
+            return
+        if not self._tasks_valid:
+            self._set_status("登录已变化，请重新勾选要下载的项目")
+            return
+        states = ("failed",) if failed_only else ("failed", "stopped", "skipped")
+        task_ids = [index for index, task in enumerate(self._tasks) if task.state in states]
+        if not task_ids:
+            self._set_status("没有需要重试的失败任务" if failed_only else "没有未完成的任务")
+            return
+        try:
+            output_folder(self._task_output_dir)
+            connections = self._download_connections()
+        except (QuarkError, OSError) as error:
+            self._set_status(describe_error(error, DOWNLOAD_ACTION))
+            return
+        for index in task_ids:
+            self._tasks[index].state = "waiting"
+            self._tasks[index].detail = ""
+        self._begin_batch(task_ids, connections)
+
+    def _begin_batch(self, task_ids: list[int], connections: int) -> None:
+        self._active_task_ids = task_ids
+        self._batch = Batch(self._task_output_dir, (self._tasks[index].entry for index in task_ids))
         self._batch_connections = connections
         self._batch_resume_available = True
-        self._batch_share = None if source is None else (source, self._share_trail[-1])
+        self._batch_share = self._task_share
         self._stop_requested = False
         self._downloading = True
         self._indeterminate = False
@@ -927,6 +1018,9 @@ class DownloaderWindow:
         # The stop flag belongs to the batch that was running; it is dropped
         # here, before this batch's first item is submitted to the worker.
         self._worker.clear_stop()
+        self._render_tasks()
+        if self._notebook is not None:
+            self._notebook.select(self._task_tab)
         self._sync_controls()
         self._start_next()
 
@@ -942,6 +1036,11 @@ class DownloaderWindow:
             return
         self._stop_requested = True
         cancelled = self._batch.clear() if self._batch is not None else 0
+        for index in self._active_task_ids:
+            task = self._tasks[index]
+            if task.state == "waiting":
+                task.state, task.detail = "skipped", "停止批次时尚未开始"
+        self._render_tasks()
         self._worker.request_stop()
         pending = f"{cancelled} 项未开始已取消；" if cancelled else ""
         self._append_log(f"已请求停止：{pending}当前项目将在检查点结束")
@@ -968,6 +1067,7 @@ class DownloaderWindow:
                 continue
             self._stop_progress(0.0)
             self._set_status(self._item_line(f"正在下载 {item.label}……"))
+            self._update_task("running", "正在准备下载……")
             shared = self._batch_share
             self._worker.submit(
                 Download(
@@ -995,6 +1095,7 @@ class DownloaderWindow:
         self._batch_share = None
         self._stop_requested = False
         self._downloading = False
+        self._render_tasks()
         if batch is not None:
             self._set_status(
                 batch_summary(
@@ -1036,6 +1137,12 @@ class DownloaderWindow:
             self._logging_in = False
             self._sync_controls()
         if succeeded:
+            # A retained FID belongs to the account that supplied it. Successful
+            # login may switch accounts; old results stay readable, without retries.
+            if self._tasks:
+                self._tasks_valid = False
+                self._render_tasks()
+                self._sync_controls()
             self._open(self._location.fid)
         if self._credential_available():
             self._request_profile()
@@ -1230,7 +1337,52 @@ class DownloaderWindow:
             self._set_status(message)
             return
         self._append_log(item_status(batch.position, batch.total, message))
+        self._update_task(outcome.value, message)
         batch.settle(outcome)
+        self._render_tasks()
+
+    def _update_task(self, state: str, detail: str) -> None:
+        batch = self._batch
+        if batch is None or batch.current is None or batch.position > len(self._active_task_ids):
+            return
+        index = self._active_task_ids[batch.position - 1]
+        task = self._tasks[index]
+        task.state, task.detail = state, detail
+        if self._task_tree is not None:
+            self._task_tree.set(str(index), "status", task.state_label)
+            self._task_tree.set(str(index), "detail", display_text(detail))
+            self._show_task_detail()
+
+    def _render_tasks(self) -> None:
+        tree = self._task_tree
+        if tree is not None:
+            selected = tree.selection()
+            tree.delete(*tree.get_children())
+            for index, task in enumerate(self._tasks):
+                tree.insert("", "end", iid=str(index), text=task.entry.label,
+                            values=(task.state_label, display_text(task.detail)))
+            if selected and int(selected[0]) < len(self._tasks):
+                tree.selection_set(selected[0])
+            self._show_task_detail()
+        if self._task_summary_var is not None:
+            done = sum(task.state == "done" for task in self._tasks)
+            failed = sum(task.state == "failed" for task in self._tasks)
+            text = f"共 {len(self._tasks)} 项 · 已完成 {done} · 失败 {failed}" if self._tasks else "暂无下载任务"
+            if self._tasks and not self._tasks_valid:
+                text += " · 登录已变化"
+            self._task_summary_var.set(text)
+
+    def _show_task_detail(self, _event: Any = None) -> None:
+        if self._task_tree is None or self._task_detail_var is None:
+            return
+        selected = self._task_tree.selection()
+        if not selected:
+            self._task_detail_var.set("选择任务查看完整结果；新批次替换记录，关闭窗口后不保留")
+            return
+        task = self._tasks[int(selected[0])]
+        source = "分享" if self._task_share is not None else "我的网盘"
+        self._task_detail_var.set(display_text(
+            f"{source} · 保存到 {self._task_output_dir}\n{task.entry.name}：{task.detail or task.state_label}"))
 
     def _show_progress(self, fraction: float | None) -> None:
         bar = self._progress
@@ -1300,6 +1452,11 @@ class DownloaderWindow:
             selected_all = bool(self._entries) and all(entry.fid in self._checked for entry in self._entries.values())
             self._select_all_button.configure(text="取消全选" if selected_all else SELECT_ALL_TEXT)
         _set_state(self._connections_input, "disabled" if busy else "normal")
+        retry_ready = not busy and self._tasks_valid
+        _set_state(self._retry_button, "normal" if retry_ready and any(
+            task.state == "failed" for task in self._tasks) else "disabled")
+        _set_state(self._continue_button, "normal" if retry_ready and any(
+            task.state in ("failed", "stopped", "skipped") for task in self._tasks) else "disabled")
         chosen = len(self._checked_entries())
         ready = not busy and bool(self._output_dir) and chosen > 0
         _set_state(self._download_button, "normal" if ready else "disabled")

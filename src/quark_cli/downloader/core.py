@@ -233,6 +233,22 @@ class Outcome(Enum):
     STOPPED = "stopped"
 
 
+@dataclass
+class DownloadTask:
+    """One session-only result; retry keeps the original entry and its place."""
+
+    entry: Entry
+    state: str = "waiting"
+    detail: str = ""
+
+    @property
+    def state_label(self) -> str:
+        return {
+            "waiting": "等待中", "running": "下载中", "done": "已完成",
+            "failed": "失败", "stopped": "已停止", "skipped": "未开始",
+        }[self.state]
+
+
 class Batch:
     """One click's frozen selection: the entries in list order, one at a time.
 
