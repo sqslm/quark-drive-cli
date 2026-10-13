@@ -334,6 +334,7 @@ class DownloaderWindow:
         self._notebook: Any = None
         self._task_tab: Any = None
         self._task_tree: Any = None
+        self._task_menu: Any = None
         self._task_summary_var: Any = None
         self._task_detail_var: Any = None
         self._retry_button: Any = None
@@ -575,7 +576,11 @@ class DownloaderWindow:
         task_scroll.pack(side="right", fill="y")
         self._task_tree.pack(side="left", fill="both", expand=True)
         self._task_tree.bind("<<TreeviewSelect>>", self._show_task_detail)
-        self._task_detail_var = tk.StringVar(value="选择任务可查看完整结果；记录保留至关闭窗口或开始新批次")
+        self._task_menu = tk.Menu(self._task_tree, tearoff=False)
+        self._task_menu.add_command(label="重试此项", command=self.retry_task)
+        self._task_menu.add_command(label="打开保存目录", command=self.open_task_folder)
+        self._task_tree.bind("<Button-3>", self._on_task_menu)
+        self._task_detail_var = tk.StringVar(value="选择任务查看完整结果；右键可重试此项或打开保存目录")
         ttk.Label(self._task_tab, textvariable=self._task_detail_var, wraplength=790,
                   justify="left", anchor="w").pack(fill="x", padx=6, pady=6)
         self._progress = ttk.Progressbar(root, mode="determinate", maximum=100.0)
@@ -646,6 +651,7 @@ class DownloaderWindow:
         self._notebook = None
         self._task_tab = None
         self._task_tree = None
+        self._task_menu = None
         self._task_summary_var = None
         self._task_detail_var = None
         self._retry_button = None
@@ -1057,16 +1063,22 @@ class DownloaderWindow:
     def continue_unfinished(self) -> None:
         self._retry_tasks(failed_only=False)
 
-    def _retry_tasks(self, *, failed_only: bool) -> None:
+    def retry_task(self) -> None:
+        self._retry_tasks(failed_only=False, selected_only=True)
+
+    def _retry_tasks(self, *, failed_only: bool, selected_only: bool = False) -> None:
         if self._busy():
             return
         if not self._tasks_valid:
             self._set_status("登录已变化，请重新勾选要下载的项目")
             return
         states = ("failed",) if failed_only else ("failed", "stopped", "skipped")
-        task_ids = [index for index, task in enumerate(self._tasks) if task.state in states]
+        selected = self._task_tree.selection() if selected_only and self._task_tree is not None else ()
+        task_ids = [index for index, task in enumerate(self._tasks) if task.state in states
+                    and (not selected_only or str(index) in selected)]
         if not task_ids:
-            self._set_status("没有需要重试的失败任务" if failed_only else "没有未完成的任务")
+            self._set_status("请选中一个未完成的任务" if selected_only else
+                             "没有需要重试的失败任务" if failed_only else "没有未完成的任务")
             return
         try:
             output_folder(self._task_output_dir)
@@ -1078,6 +1090,41 @@ class DownloaderWindow:
             self._tasks[index].state = "waiting"
             self._tasks[index].detail = ""
         self._begin_batch(task_ids, connections)
+
+    def open_task_folder(self) -> None:
+        if self._busy() or self._task_tree is None:
+            return
+        selected = self._task_tree.selection()
+        if not selected:
+            self._set_status("请先选中一个任务")
+            return
+        task = self._tasks[int(selected[0])]
+        try:
+            folder = output_folder(self._task_output_dir)
+            if task.entry.directory and task.state == "done":
+                folder = output_folder(str(download_plan(self._task_output_dir, task.entry).target))
+            self._folder_opener(str(folder))
+        except Exception as error:
+            self._set_status(describe_error(error, OPEN_FOLDER_ACTION))
+
+    def _on_task_menu(self, event: Any) -> str:
+        if self._busy():
+            return "break"
+        iid = self._task_tree.identify_row(event.y)
+        if not iid:
+            return "break"
+        self._task_tree.selection_set(iid)
+        self._task_tree.focus(iid)
+        self._show_task_detail()
+        task = self._tasks[int(iid)]
+        ready = self._tasks_valid and task.state in ("failed", "stopped", "skipped")
+        self._task_menu.entryconfigure(0, state="normal" if ready else "disabled")
+        self._task_menu.entryconfigure(1, state="normal" if self._task_output_dir else "disabled")
+        try:
+            self._task_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._task_menu.grab_release()
+        return "break"
 
     def _begin_batch(self, task_ids: list[int], connections: int) -> None:
         self._save_preferences(connections=connections)
@@ -1481,7 +1528,7 @@ class DownloaderWindow:
             return
         selected = self._task_tree.selection()
         if not selected:
-            self._task_detail_var.set("选择任务查看完整结果；新批次替换记录，关闭窗口后不保留")
+            self._task_detail_var.set("选择任务查看完整结果；右键可重试此项或打开保存目录")
             return
         task = self._tasks[int(selected[0])]
         source = "分享" if self._task_share is not None else "我的网盘"

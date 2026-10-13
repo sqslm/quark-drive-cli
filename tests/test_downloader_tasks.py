@@ -4,10 +4,11 @@ import queue
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from quark_cli.downloader.app import DownloaderWindow, _tkinter
-from quark_cli.downloader.core import DOWNLOAD_ACTION, Entry
+from quark_cli.downloader.core import DOWNLOAD_ACTION, DownloadTask, Entry
 from quark_cli.downloader.share import ShareSource
 from quark_cli.downloader.worker import Download, DriveBackend, Failed, Finished, Progress, Stopped
 from tests.test_downloader_share import COOKIE, PASSCODE, SHARE_URL, ShareDownloadFixture
@@ -20,6 +21,7 @@ class TaskTree:
     def __init__(self):
         self.rows = {}
         self.selected = ()
+        self.focused = ""
 
     def get_children(self):
         return tuple(self.rows)
@@ -37,6 +39,13 @@ class TaskTree:
 
     def selection_set(self, item):
         self.selected = (item,)
+
+    def identify_row(self, y):
+        items = list(self.rows)
+        return items[y // 20] if 0 <= y // 20 < len(items) else ""
+
+    def focus(self, item):
+        self.focused = item
 
     def set(self, iid, column, value):
         self.rows[iid][1][0 if column == "status" else 1] = value
@@ -166,6 +175,121 @@ class TaskTests(WindowCase):
             self.assertIn("重新勾选", window._status_var.get())
             self.assertEqual(window._retry_button.state, "disabled")
 
+    def test_single_retry_leaves_other_failures_stops_and_successes_untouched(self):
+        with tempfile.TemporaryDirectory() as original, tempfile.TemporaryDirectory() as other:
+            window = self._task_window()
+            self._begin(window, original, "a.bin", "b.bin", "c.bin", "d.bin")
+            self._requests(window)
+            window._handle(Failed(DOWNLOAD_ACTION, "failed"))
+            self._requests(window)
+            window._handle(Finished(DOWNLOAD_ACTION, "done"))
+            self._requests(window)
+            window.stop_download()
+            window._handle(Stopped(DOWNLOAD_ACTION, "stopped"))
+            window._output_dir = other
+            window._task_tree.selection_set("3")
+            window.retry_task()
+            requests = self._requests(window)
+            self.assertEqual(len(requests), 1)
+            self.assertEqual((requests[0].fid, requests[0].target, requests[0].overwrite),
+                             ("3", str(Path(original) / "d.bin"), False))
+            window._handle(Finished(DOWNLOAD_ACTION, "done"))
+            self.assertEqual([task.state for task in window._tasks], ["failed", "done", "stopped", "done"])
+            self.assertEqual(self._requests(window), [])
+
+    def test_single_retry_refuses_no_selection_completed_task_busy_and_new_login(self):
+        with tempfile.TemporaryDirectory() as folder:
+            window = self._task_window()
+            self._begin(window, folder, "a.bin")
+            self._requests(window)
+            window.retry_task()
+            self.assertEqual(self._requests(window), [])
+            window._handle(Finished(DOWNLOAD_ACTION, "done"))
+            window.retry_task()
+            self.assertIn("选中一个未完成", window._status_var.get())
+            window._task_tree.selection_set("0")
+            window.retry_task()
+            self.assertEqual(self._requests(window), [])
+            window._tasks[0].state = "failed"
+            window._tasks_valid = False
+            window.retry_task()
+            self.assertIn("登录已变化", window._status_var.get())
+            self.assertEqual(self._requests(window), [])
+
+    def test_task_menu_targets_clicked_row_and_handles_empty_area_and_busy_state(self):
+        window = self._task_window()
+        window._task_menu = SimpleNamespace(entryconfigure=lambda index, **kw: states.update({index: kw["state"]}),
+                                            tk_popup=lambda x, y: popped.append((x, y)),
+                                            grab_release=lambda: released.append(True))
+        states, popped, released = {}, [], []
+        window._task_output_dir = "C:/out"
+        window._tasks = [DownloadTask(Entry("done", "done.bin", False), "done"),
+                         DownloadTask(Entry("failed", "failed.bin", False), "failed")]
+        window._render_tasks()
+        event = SimpleNamespace(y=21, x_root=120, y_root=220)
+        window._on_task_menu(event)
+        self.assertEqual(window._task_tree.selection(), ("1",))
+        self.assertEqual(window._task_tree.focused, "1")
+        self.assertEqual(states, {0: "normal", 1: "normal"})
+        self.assertEqual((popped, released), ([(120, 220)], [True]))
+        event.y = 1
+        window._on_task_menu(event)
+        self.assertEqual(states[0], "disabled")
+        event.y = 1000
+        window._on_task_menu(event)
+        self.assertEqual(len(popped), 2)
+        event.y = 21
+        for flag in ("_downloading", "_logging_in", "_searching", "_reading_share"):
+            setattr(window, flag, True)
+            window._on_task_menu(event)
+            window.retry_task()
+            setattr(window, flag, False)
+        self.assertEqual(len(popped), 2)
+        self.assertEqual(self._requests(window), [])
+        window._tasks_valid = False
+        window._on_task_menu(event)
+        self.assertEqual(states, {0: "disabled", 1: "normal"})
+
+    def test_open_task_folder_uses_original_location_and_completed_directory(self):
+        opened = []
+        window = self._task_window(folder_opener=opened.append)
+        with tempfile.TemporaryDirectory() as original, tempfile.TemporaryDirectory() as other:
+            window._output_dir = other
+            window._task_output_dir = original
+            target = Path(original) / "folder"
+            target.mkdir()
+            window._tasks = [DownloadTask(Entry("file", "file.bin", False), "done"),
+                             DownloadTask(Entry("folder", "folder", True), "done")]
+            window._render_tasks()
+            window._task_tree.selection_set("0")
+            window.open_task_folder()
+            window._task_tree.selection_set("1")
+            window.open_task_folder()
+            window._tasks[1].state = "failed"
+            window.open_task_folder()
+            self.assertEqual(opened, [original, str(target), original])
+        window.open_task_folder()
+        self.assertIn("打开保存目录失败", window._status_var.get())
+        self.assertEqual(len(opened), 3)
+
+    def test_open_task_folder_refuses_busy_and_reports_opener_failure_without_raw_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            opener = unittest.mock.Mock(side_effect=RuntimeError("private-cookie"))
+            window = self._task_window(folder_opener=opener)
+            window._task_output_dir = folder
+            window._tasks = [DownloadTask(Entry("file", "file.bin", False), "done")]
+            window._render_tasks()
+            window.open_task_folder()
+            opener.assert_not_called()
+            window._task_tree.selection_set("0")
+            window._downloading = True
+            window.open_task_folder()
+            opener.assert_not_called()
+            window._downloading = False
+            window.open_task_folder()
+            opener.assert_called_once_with(folder)
+            self.assertNotIn("private-cookie", window._status_var.get())
+
     def test_share_retry_uses_original_source_and_cleanup_on_both_attempts(self):
         fixture = ShareDownloadFixture()
         fixture.save_error = True
@@ -189,7 +313,8 @@ class TaskTests(WindowCase):
             fixture.save_error = False
             window._share_source = ShareSource("https://pan.quark.cn/s/another", "different")
             window._share_trail = ["/another-folder"]
-            window.retry_failed()
+            window._task_tree.selection_set("0")
+            window.retry_task()
             request = self._requests(window)[0]
             self.assertEqual((request.share_source, request.share_path), (original, "/"))
             window._worker._download(request)
@@ -237,6 +362,37 @@ class TaskTests(WindowCase):
 
 @unittest.skipUnless(_TK, "Tk is unavailable")
 class RealTaskControlsTests(unittest.TestCase):
+    def test_real_context_menu_selects_clicked_task_and_invokes_single_retry(self):
+        root = _tk_root()
+        opened = []
+        window = DownloaderWindow(cookie=lambda: "sid=test", backend_factory=lambda loader: _Backend(),
+                                  folder_opener=opened.append)
+        try:
+            window._root = root
+            window._build(_tkinter())
+            with tempfile.TemporaryDirectory() as folder:
+                window._output_dir = folder
+                window._adopt_rows([Entry("a", "a.bin", False), Entry("b", "b.bin", False)])
+                window._checked = {"a", "b"}
+                window.start_download()
+                window._handle(Finished(DOWNLOAD_ACTION, "done"))
+                window._handle(Failed(DOWNLOAD_ACTION, "failed"))
+                root.update()
+                bounds = window._task_tree.bbox("1")
+                self.assertTrue(bounds)
+                with patch.object(window._task_menu, "tk_popup") as popup:
+                    window._on_task_menu(SimpleNamespace(y=bounds[1] + 3, x_root=100, y_root=100))
+                popup.assert_called_once_with(100, 100)
+                self.assertEqual(window._task_tree.selection(), ("1",))
+                self.assertEqual(str(window._task_menu.entrycget(0, "state")), "normal")
+                window._task_menu.invoke(1)
+                self.assertEqual(opened, [folder])
+                window._task_menu.invoke(0)
+                self.assertEqual(window._batch.current.fid, "b")
+                window._handle(Finished(DOWNLOAD_ACTION, "done"))
+        finally:
+            window._shutdown()
+
     def test_real_tab_buttons_retry_failure_and_keep_completed_row(self):
         root = _tk_root()
         window = DownloaderWindow(cookie=lambda: "sid=test", backend_factory=lambda loader: _Backend(),
