@@ -26,12 +26,14 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
       window.testCalls = [];
       window.quark = {
         onEvent: callback => { listeners.add(callback); return () => listeners.delete(callback); },
-        chooseFolder: async () => 'C:\\Downloads', openFolder: async () => {},
+        chooseFolder: async () => 'C:\\Downloads', openFolder: async () => {}, copyText:async text => { window.testCalls.push({method:'clipboard',params:{text}}); },
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
           if(method === 'hello') return { protocol: 1, preferences };
           if(method === 'account') return { nickname: '测试账号' };
-          if(method === 'browse') return rows;
+          if(method === 'browse') return rows.map(row => ({...row}));
+          if(method === 'file.mkdir') { rows.push({fid:'new',name:params.name,directory:true,size:null,path:'',location:[]}); return {fid:'new'}; }
+          if(method === 'file.rename') { const row = rows.find(row => row.fid === params.entries[0].fid); row.name = params.name; return [{ name:row.name,state:'done',detail:'操作完成'}]; }
           if(method === 'locate') return { ...params.entry, path: '/知否/' + params.entry.name, location: [['0','我的网盘']] };
           if(method === 'search.cancel') { cancelled = true; return true; }
           if(method === 'search') {
@@ -53,6 +55,12 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.goto(`http://127.0.0.1:${server.address().port}/main_window/index.html`);
     await page.getByText('显示 10000 项', { exact: true }).waitFor();
     assert.ok(await page.locator('.file-row').count() < 60);
+    await page.getByRole('button',{name:'新建目录',exact:true}).click();
+    await page.getByLabel('新名称').fill('新建测试');
+    await page.getByRole('button',{name:'确认',exact:true}).click();
+    await page.getByText('显示 10001 项',{exact:true}).waitFor();
+    const created = await page.evaluate(() => window.testCalls.find(call => call.method === 'file.mkdir'));
+    assert.equal(created.params.parent,'0'); assert.equal(created.params.name,'新建测试');
     await page.getByLabel('搜索关键词').fill('知否');
     await page.getByRole('button', { name:'搜索', exact:true }).click();
     await page.getByRole('button', { name:'取消搜索' }).waitFor();

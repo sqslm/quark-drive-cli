@@ -12,5 +12,6 @@ const bridge: Bridge = {
   },
   chooseFolder: () => ipcRenderer.invoke('quark:choose-folder'),
   openFolder: (path) => ipcRenderer.invoke('quark:open-folder', path),
+  copyText: (text) => ipcRenderer.invoke('quark:copy-text', text),
 };
 contextBridge.exposeInMainWorld('quark', bridge);

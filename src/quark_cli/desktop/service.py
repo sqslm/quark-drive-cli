@@ -21,6 +21,7 @@ from ..downloader.share import ShareSource
 from ..downloader.share_input import parse_share_input
 from ..downloader.search import SearchCancelled
 from ..downloader.worker import Download, DriveBackend, Search
+from .file_operations import FileOperations
 
 
 class DesktopService:
@@ -33,12 +34,14 @@ class DesktopService:
         self.reads = ThreadPoolExecutor(2, thread_name_prefix="quark-read")
         self.transfers = ThreadPoolExecutor(1, thread_name_prefix="quark-transfer")
         self.lock = threading.RLock()
+        self.writes = threading.Lock()
         self.search_cancel = threading.Event()
         self.login_cancel = threading.Event()
         self.stop = threading.Event()
         self.tasks: list[dict] = []
         self.sources: dict[str, ShareSource] = {}
         self.busy = False
+        self.logging_in = False
         self.closed = False
         self.preferences_warning = ""
         self.preferences_writable = True
@@ -83,9 +86,11 @@ class DesktopService:
             self.search_cancel = threading.Event()
             cancel = self.search_cancel
         elif method == "login":
-            if self.busy:
-                self.send({"id": identifier, "error": "请先停止传输再登录"})
-                return
+            with self.lock:
+                if self.busy or self.logging_in:
+                    self.send({"id": identifier, "error": "请先结束传输或当前登录"})
+                    return
+                self.logging_in = True
             self.login_cancel.set()
             self.login_cancel = threading.Event()
             cancel = self.login_cancel
@@ -101,8 +106,25 @@ class DesktopService:
             self.send({"id": identifier, "result": {"cancelled": True}})
         except Exception as error:
             self.send({"id": identifier, "error": describe_error(error, "操作")})
+        finally:
+            if method == "login":
+                with self.lock:
+                    self.logging_in = False
 
     def dispatch(self, identifier, method, p, cancel):
+        if method.startswith("file."):
+            if p.get("handle"):
+                raise UsageError("分享文件只读，不能修改")
+            with self.writes, self.lock:
+                if (self.busy or self.logging_in) and method != "file.info":
+                    raise UsageError("请先停止传输再修改网盘文件")
+                with self.backend._client() as client:
+                    operations = FileOperations(client)
+                    if method == "file.info":
+                        return operations.info(p["entry"])
+                    if method == "file.mkdir":
+                        return operations.mkdir(str(p.get("parent", "0")), str(p.get("name", "")))
+                    return operations.apply(method[5:], p["entries"], name=p.get("name"), target=p.get("target"))
         if method == "hello":
             return {"protocol": 1, "preferences": asdict(self.current_preferences()), "extension_groups": EXTENSION_GROUPS,
                     "warning": self.preferences_warning}
@@ -167,7 +189,7 @@ class DesktopService:
             return [self.public_task(task) for task in self.tasks]
         if method == "download":
             with self.lock:
-                if self.busy:
+                if self.busy or self.logging_in:
                     raise UsageError("传输正在进行，请先停止")
                 entries = [self.entry(row) for row in p["entries"]]
                 if not entries:
@@ -186,7 +208,7 @@ class DesktopService:
                 return [self.public_task(task) for task in tasks]
         if method == "tasks.retry":
             with self.lock:
-                if self.busy:
+                if self.busy or self.logging_in:
                     raise UsageError("传输正在进行")
                 tasks = [task for task in self.tasks if task["valid"] and task["state"] in ("failed", "stopped", "waiting")
                          and (not p.get("ids") or task["id"] in p["ids"])]
@@ -252,7 +274,8 @@ class DesktopService:
 
 
 METHODS = frozenset({"hello", "account", "browse", "search", "search.cancel", "locate", "share.parse",
-    "share.open", "share.browse", "preferences.save", "login", "login.cancel", "download", "download.stop", "tasks", "tasks.retry"})
+    "share.open", "share.browse", "preferences.save", "login", "login.cancel", "download", "download.stop", "tasks", "tasks.retry",
+    "file.info", "file.mkdir", "file.rename", "file.move", "file.delete"})
 
 
 def main():

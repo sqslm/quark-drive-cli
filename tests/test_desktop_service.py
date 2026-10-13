@@ -107,3 +107,10 @@ class DesktopTests(unittest.TestCase):
         self.assertIn("窗口内", result["warning"])
         self.assertEqual(self.service.preferences_path.read_text('utf-8'), '{broken')
         self.assertEqual(self.service.current_preferences().connections, 8)
+
+    def test_share_writes_and_writes_during_login_are_rejected(self):
+        with self.assertRaises(Exception):
+            self.service.dispatch("write", "file.delete", {"handle":"share","entries":[]}, None)
+        self.service.logging_in = True
+        with self.assertRaises(Exception):
+            self.service.dispatch("write", "file.mkdir", {"parent":"0","name":"X"}, None)

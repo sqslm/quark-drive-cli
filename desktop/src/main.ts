@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, net, protocol, shell } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, net, protocol, shell } from 'electron';
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -81,6 +81,11 @@ app.whenReady().then(async () => {
     const error = await shell.openPath(folder); if (error) throw new Error('无法打开保存目录');
   });
   startBackend();
+  ipcMain.handle('quark:copy-text', (event, text: string) => {
+    trusted(event);
+    if (typeof text !== 'string') throw new Error('复制内容无效');
+    clipboard.writeText(text);
+  });
   await window.loadURL(app.isPackaged ? 'quark://app/main_window/index.html' : MAIN_WINDOW_WEBPACK_ENTRY);
 });
 app.on('window-all-closed', () => app.quit());

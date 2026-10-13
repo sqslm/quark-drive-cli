@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Entry, Event, Preferences, Task } from './types';
 import './style.css';
+import { FileDialog, FileAction } from './FileDialog';
 
 const labels: Record<string, string> = { waiting: '等待中', running: '传输中', done: '已完成', failed: '失败', stopped: '已暂停' };
 const units = (bytes: number | null) => bytes === null ? '—' : bytes < 1024 ? `${bytes} B` :
@@ -40,6 +41,8 @@ function App() {
   const [transferring, setTransferring] = useState(false);
   const [qr, setQr] = useState<string | null>(null);
   const [loggingIn, setLoggingIn] = useState(false);
+  const [fileDialog,setFileDialog] = useState<{ action:FileAction; entries:Entry[] } | null>(null);
+  const [context,setContext] = useState<{ row:Entry; x:number; y:number } | null>(null);
   const view = useRef(0);
   const searchId = useRef<string | null>(null);
   const loginId = useRef<string | null>(null);
@@ -174,6 +177,17 @@ function App() {
   }, [rows, query, kind, extensions, sort, extensionGroups]);
   const virtualizer = useVirtualizer({ count: filtered.length, getScrollElement: () => scroll.current, estimateSize: () => 46, overscan: 10 });
   const selected = filtered.filter(row => checked.has(row.fid));
+  function fileAction(action:FileAction, entries = selected) { setContext(null); setFileDialog({ action,entries }); }
+  async function copyPaths(entries = selected) {
+    await action(async () => {
+      const generation = view.current;
+      const located: Entry[] = [];
+      for(const row of entries) located.push(row.path ? row : await call('locate',{ entry:row }));
+      if(generation !== view.current) return;
+      await window.quark.copyText(located.map(row => row.path).join('\n'));
+      setStatus(`已复制 ${located.length} 项路径`);
+    });
+  }
   const all = filtered.length > 0 && selected.length === filtered.length;
   function toggle(fid: string) { setChecked(old => { const next = new Set(old); if (next.has(fid)) next.delete(fid); else next.add(fid); return next; }); }
   function sortBy(key: 'name' | 'size' | 'path') {
@@ -205,11 +219,16 @@ function App() {
           {searching && <button onClick={() => { cancelSearch(); setStatus('搜索已取消；已读结果可能不完整'); }}>取消搜索</button>}</div>
         <div className="filters"><select aria-label="类型筛选" value={kind} onChange={event => setKind(event.target.value)}><option value="all">全部类型</option><option value="files">仅文件</option><option value="directories">仅目录</option></select>
           <input aria-label="格式筛选" list="formats" placeholder="格式：mp4, mkv, tar.gz" value={extensions} onChange={event => setExtensions(event.target.value)} /><datalist id="formats">{[...Object.keys(extensionGroups),'无扩展名'].map(value => <option key={value} value={value}/>)}</datalist><span>显示 {filtered.length} 项{selected.length ? ` · 已选 ${selected.length} 项` : ''}</span></div>
+        {!share && <div className="file-actions"><button disabled={loading || searching || transferring} onClick={() => fileAction('mkdir',[])}>新建目录</button>
+          <button disabled={loading || searching || transferring || selected.length !== 1} onClick={() => fileAction('rename')}>重命名</button>
+          <button disabled={loading || searching || transferring || !selected.length} onClick={() => fileAction('move')}>移动</button>
+          <button disabled={loading || searching || transferring || !selected.length} onClick={() => fileAction('delete')}>移入回收站</button>
+          <button disabled={selected.length !== 1} onClick={() => fileAction('info')}>属性</button><button disabled={!selected.length} onClick={() => void copyPaths()}>复制路径</button></div>}
         <div className="file-header"><input aria-label="全选可见文件" type="checkbox" checked={all} onChange={() => setChecked(old => { const next = new Set(old); filtered.forEach(row => all ? next.delete(row.fid) : next.add(row.fid)); return next; })} />
           <button onClick={() => sortBy('name')}>名称{sort?.key === 'name' ? sort.descending ? ' ↓' : ' ↑' : ''}</button><button onClick={() => sortBy('size')}>大小</button><span>类型</span><button onClick={() => sortBy('path')}>路径</button></div>
         <div className="file-scroll" ref={scroll}>{loading && <div className="empty">正在读取目录…</div>}
           {!loading && !filtered.length && <div className="empty">{searching ? '正在搜索，结果将陆续显示…' : rows.length ? '没有符合筛选条件的项目' : '暂无文件'}</div>}
-          <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>{virtualizer.getVirtualItems().map(item => { const row = filtered[item.index]; return <div className={checked.has(row.fid) ? 'file-row selected' : 'file-row'} key={row.fid} style={{ transform: `translateY(${item.start}px)` }} onDoubleClick={() => void openRow(row)}>
+          <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>{virtualizer.getVirtualItems().map(item => { const row = filtered[item.index]; return <div className={checked.has(row.fid) ? 'file-row selected' : 'file-row'} key={row.fid} style={{ transform: `translateY(${item.start}px)` }} onDoubleClick={() => void openRow(row)} onContextMenu={event => { event.preventDefault(); if(!checked.has(row.fid)) setChecked(new Set([row.fid])); setContext({row,x:Math.min(event.clientX,window.innerWidth-180),y:Math.min(event.clientY,window.innerHeight-210)}); }}>
             <input type="checkbox" aria-label={`选择 ${row.name}`} checked={checked.has(row.fid)} onChange={() => toggle(row.fid)} />
             <button className="file-name" title={row.name} onClick={() => void openRow(row)}><FileIcon folder={row.directory} /><span>{row.name}</span></button>
             <span>{row.directory ? '—' : units(row.size)}</span><span>{row.directory ? '目录' : '文件'}</span><span title={row.path}>{row.path || (searchView ? '待定位' : '—')}</span></div>; })}</div></div>
@@ -237,6 +256,10 @@ function App() {
         <button className="primary" disabled={transferring} onClick={() => void saveSettings()}>保存设置</button><p className="note">文件队列逐项执行，线程数作用于单个文件。实际速度受账号与服务端限制。</p></section>}
       <div className="status" role="status">{status}</div>
     </main>
+    {context && <><div className="menu-dismiss" onClick={() => setContext(null)}/><div className="context-menu" role="menu" style={{left:context.x,top:context.y}}>
+      {!share && <><button disabled={transferring || searching || selected.length !== 1} onClick={() => fileAction('rename')}>重命名</button><button disabled={transferring || searching} onClick={() => fileAction('move')}>移动</button><button disabled={transferring || searching} onClick={() => fileAction('delete')}>移入回收站</button><button onClick={() => fileAction('info',[context.row])}>属性</button></>}
+      <button onClick={() => { const entries = selected; setContext(null); void copyPaths(entries); }}>复制路径</button></div></>}
+    {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} parent={trail} close={() => setFileDialog(null)} done={() => { void (searchView ? runSearch() : browse()); }}/ >}
     {loggingIn && <div className="modal-backdrop"><div className="modal"><h2>扫码登录</h2><p>使用手机夸克 App 扫描二维码</p>{qr ? <img src={qr} alt="夸克登录二维码" /> : <div className="qr-loading">正在获取二维码…</div>}
       <button onClick={() => { loginId.current = null; setLoggingIn(false); setQr(null); setNickname('未登录'); void action(() => call('login.cancel')); }}>取消登录</button></div></div>}
   </div>;

@@ -560,3 +560,5 @@ python packaging/desktop/build.py
 Electron 主进程通过白名单 IPC 管理本地 Python 子进程；Renderer 无 Node 权限，Cookie、分享令牌与签名地址仅在后端处理。设置继承下载器配置；损坏文件不覆盖，本次有效设置可仅在会话使用并明确提示。
 
 客户端离线测试：`python -m unittest tests.test_desktop_service -q`；构建后在 `desktop` 运行 `npm test`，包含浏览器中的受控交互检查和隔离配置的真实 Electron 启动检查。真实账号能力须与官方客户端对照，不将离线结果当作实盘验证。
+
+第三版文件页支持新建目录、重命名、批量移动和移入回收站，右键可查看属性或复制路径。每次修改展示选中项与目标，后台核对当前对象，拒绝同名覆盖和移动到自身子目录，逐项反馈结果并刷新。分享文件只读，传输或登录期间不能修改网盘文件。
