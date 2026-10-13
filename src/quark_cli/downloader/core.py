@@ -17,6 +17,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+import re
 from typing import Any
 
 from ..errors import LocalIOError, QuarkError, RemoteError, UsageError
@@ -36,6 +37,14 @@ DOWNLOAD_ACTION = "下载"
 SEARCH_ACTION = "搜索"
 
 SEARCH_KINDS = ("all", "files", "directories")
+EXTENSION_GROUPS = {
+    "视频": ("mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "m2ts", "mpg", "mpeg", "3gp"),
+    "音频": ("mp3", "flac", "wav", "aac", "m4a", "ogg", "opus", "wma", "aiff", "ape"),
+    "图片": ("jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "heic", "avif"),
+    "文档": ("pdf", "txt", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "md", "csv", "epub", "rtf", "odt", "ods", "odp"),
+    "压缩包": ("zip", "rar", "7z", "tar", "gz", "bz2", "xz", "tgz", "zst"),
+}
+EXTENSION_CHOICES = ("所有格式", *EXTENSION_GROUPS, "无扩展名")
 
 
 def display_text(value: Any) -> str:
@@ -106,7 +115,7 @@ def entries(records: Iterable[Mapping[str, Any]]) -> list[Entry]:
     return rows
 
 
-def filter_entries(rows: Iterable[Entry], query: str = "", kind: str = "all") -> list[Entry]:
+def filter_entries(rows: Iterable[Entry], query: str = "", kind: str = "all", *, extensions: str = "") -> list[Entry]:
     """Local narrowing of an already-read list: name substring and object kind.
 
     The query is stripped and matched case-insensitively as a substring of the
@@ -119,7 +128,19 @@ def filter_entries(rows: Iterable[Entry], query: str = "", kind: str = "all") ->
         raise UsageError("筛选类型必须是 all、files 或 directories")
     if not isinstance(query, str):
         raise UsageError("搜索关键词必须是文本")
+    if not isinstance(extensions, str):
+        raise UsageError("扩展名筛选必须是文本")
     needle = query.strip().casefold()
+    extension_filter = extensions.strip().casefold()
+    suffixes = None
+    if extension_filter and extension_filter not in ("所有格式", "无扩展名"):
+        tokens = EXTENSION_GROUPS.get(extension_filter)
+        if tokens is None:
+            tokens = tuple(token.removeprefix(".") for token in re.split(r"[\s,，;；、]+", extension_filter) if token)
+            if not tokens or any(not token or token.startswith(".") or token.endswith(".") or ".." in token
+                                 or any(c in token for c in '/\\:*?"<>|[]') for token in tokens):
+                raise UsageError("扩展名格式无效，请输入 mp4, mkv 或 tar.gz")
+        suffixes = tuple("." + token for token in tokens)
     selected: list[Entry] = []
     for entry in rows:
         if kind == "files" and entry.directory:
@@ -128,6 +149,14 @@ def filter_entries(rows: Iterable[Entry], query: str = "", kind: str = "all") ->
             continue
         if needle and needle not in entry.name.casefold():
             continue
+        if extension_filter and extension_filter != "所有格式":
+            if entry.directory:
+                continue
+            if extension_filter == "无扩展名":
+                if Path(entry.name).suffix:
+                    continue
+            elif not entry.name.casefold().endswith(suffixes):
+                continue
         selected.append(entry)
     return selected
 

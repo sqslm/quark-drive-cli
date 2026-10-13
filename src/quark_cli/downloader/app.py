@@ -92,6 +92,7 @@ from .core import (
     DOWNLOAD_ACTION,
     ROOT_FID,
     SEARCH_ACTION,
+    EXTENSION_CHOICES,
     Batch,
     DownloadTask,
     Entry,
@@ -362,6 +363,9 @@ class DownloaderWindow:
         self._count_var: Any = None
         self._keyword_entry: Any = None
         self._kind_combo: Any = None
+        self._extension_var: Any = None
+        self._extension_combo: Any = None
+        self._extension_error = ""
         self._share_var: Any = None
         self._passcode_var: Any = None
         self._share_entry: Any = None
@@ -528,6 +532,16 @@ class DownloaderWindow:
         self._count_var = tk.StringVar(value=match_text(0, 0))
         ttk.Label(find, textvariable=self._count_var, anchor="e").pack(side="right")
 
+        formats = ttk.Frame(root)
+        formats.pack(fill="x", padx=12, pady=(0, 6))
+        ttk.Label(formats, text="扩展名").pack(side="left", padx=(0, 6))
+        self._extension_var = tk.StringVar(value=EXTENSION_CHOICES[0])
+        self._extension_combo = ttk.Combobox(formats, textvariable=self._extension_var,
+                                            values=EXTENSION_CHOICES, width=24, state="normal")
+        self._extension_combo.pack(side="left", padx=(0, 8))
+        ttk.Label(formats, text="也可输入 mp4, mkv 或 tar.gz").pack(side="left")
+        self._extension_var.trace_add("write", self._on_filter_change)
+
         self._notebook = ttk.Notebook(root)
         self._notebook.pack(fill="both", expand=True, padx=12, pady=(0, 6))
         listing = ttk.Frame(self._notebook)
@@ -671,6 +685,8 @@ class DownloaderWindow:
         self._count_var = None
         self._keyword_entry = None
         self._kind_combo = None
+        self._extension_var = None
+        self._extension_combo = None
         self._share_var = None
         self._passcode_var = None
         self._share_entry = None
@@ -733,7 +749,7 @@ class DownloaderWindow:
             self._pending = None
             self._search = pending
             self._adopt_rows(event.entries)
-            self._set_status(IDLE_STATUS)
+            self._set_status(self._extension_error or IDLE_STATUS)
             self._sync_controls()
         elif isinstance(event, ShareListing):
             # Only the share folder the window is actually showing may fill the
@@ -747,7 +763,7 @@ class DownloaderWindow:
                 return
             self._reading_share = False
             self._adopt_rows(event.entries)
-            self._set_status(IDLE_STATUS)
+            self._set_status(self._extension_error or IDLE_STATUS)
             self._sync_controls()
         elif isinstance(event, Listing):
             # Navigating again before this answer arrived makes it stale: only
@@ -765,7 +781,7 @@ class DownloaderWindow:
             ):
                 return
             self._render_listing(event)
-            self._set_status(IDLE_STATUS)
+            self._set_status(self._extension_error or IDLE_STATUS)
             self._sync_controls()
             if self._profile_pending:
                 self._profile_pending = False
@@ -1316,7 +1332,18 @@ class DownloaderWindow:
         Filtering always starts from :attr:`_rows`, never from the rows already
         on screen, so relaxing a filter brings back every row it had hidden.
         """
-        rows = filter_entries(self._rows, query=self._keyword(), kind=self._kind())
+        try:
+            rows = filter_entries(self._rows, query=self._keyword(), kind=self._kind(),
+                                  extensions=self._extension_var.get() if self._extension_var is not None else "")
+        except UsageError as error:
+            self._render_rows(())
+            self._show_counts(0)
+            self._extension_error = str(error)
+            self._set_status(self._extension_error)
+            return
+        if self._extension_error and self._status_var is not None and self._status_var.get() == self._extension_error:
+            self._set_status(IDLE_STATUS)
+        self._extension_error = ""
         if self._sort_key is not None:
             rows = sort_entries(rows, self._sort_key, descending=self._sort_descending)
         self._render_rows(rows)
@@ -1448,6 +1475,8 @@ class DownloaderWindow:
         """
         if self._kind_var is not None:
             self._kind_var.set(KIND_CHOICES[0][0])
+        if self._extension_var is not None:
+            self._extension_var.set(EXTENSION_CHOICES[0])
         if self._search_var is not None:
             self._search_var.set("")
 
@@ -1589,6 +1618,7 @@ class DownloaderWindow:
                 self._return_button.pack_forget()
         _set_state(self._keyword_entry, free)
         _set_state(self._kind_combo, "disabled" if busy else "readonly")
+        _set_state(self._extension_combo, "disabled" if busy else "normal")
         _set_state(self._share_entry, free)
         _set_state(self._passcode_entry, free)
         _set_state(self._login_button, "disabled" if busy or share else "normal")
