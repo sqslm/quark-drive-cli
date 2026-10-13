@@ -19,3 +19,7 @@ dist/
 /video/node_modules/
 /video/.remotion/
 /video/stills/
+/desktop/node_modules/
+/desktop/.webpack/
+/desktop/out/
+/desktop/test-results/

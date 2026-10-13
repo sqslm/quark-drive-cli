@@ -1,0 +1,38 @@
+{
+  "name": "quark-drive-client",
+  "productName": "Quark Drive Client",
+  "version": "0.2.0",
+  "description": "夸克网盘第三方桌面客户端",
+  "private": true,
+  "main": ".webpack/main/index.cjs",
+  "scripts": {
+    "start": "electron-forge start",
+    "package": "electron-forge package",
+    "make": "electron-forge make",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.cjs"
+  },
+  "config": {
+    "forge": "./forge.config.cjs"
+  },
+  "dependencies": {
+    "@tanstack/react-virtual": "3.14.18",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "8.0.1",
+    "@electron-forge/maker-zip": "8.0.1",
+    "@electron-forge/plugin-webpack": "8.0.1",
+    "@playwright/test": "1.64.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "css-loader": "7.1.5",
+    "electron": "44.7.0",
+    "style-loader": "4.0.0",
+    "ts-loader": "9.6.2",
+    "typescript": "5.9.3",
+    "webpack": "5.111.1",
+    "webpack-cli": "7.2.3"
+  }
+}

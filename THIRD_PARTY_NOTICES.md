@@ -35,3 +35,7 @@ SOFTWARE.
 ## Backup workflow references
 
 The MIT-licensed [rclone](https://github.com/rclone/rclone) documentation and copy/backup implementation were reviewed for non-deleting directory copies, changed-file conflicts, and retention of old versions. No rclone source is copied and no rclone runtime is required. Quark operations use this project's existing HTTP client, transfer implementation, FID checks, and private state. The detailed references and adaptation boundaries are recorded in [extension API research](docs/research/2026-10-01-extension-apis.md).
+
+## Electron desktop client
+
+The desktop client uses Electron and Electron Forge (MIT), React/React DOM (MIT), TanStack Virtual (MIT), and TypeScript (Apache-2.0) as declared in `desktop/package-lock.json`. Electron redistributables retain the upstream `LICENSE` and `LICENSES.chromium.html`; webpack preserves bundled dependency license comments in `index.js.LICENSE.txt`. Build and browser testing also use webpack and Playwright. No source from third-party Quark clients is copied; the global search request shape was checked against the public Quark web bundle.

@@ -542,3 +542,21 @@ The share downloader's offline tests in `tests/test_downloader_share.py` exercis
 下载器的全盘搜索已改为服务端分页，子树搜索增量显示；新增取消搜索，导航和输入不再因搜索整体禁用。全盘结果路径按选中或打开时定位，暂停路径排序；部分失败明确标注结果不完整。下载引擎、续传及分享清理规则保持不变。
 
 后续按 Electron 基础客户端、文件管理、上传与持久传输中心、分享与回收站、发布完善五个阶段推进。详见 [客户端功能路线图](docs/网盘下载器待实现.md)。
+
+### Electron 桌面客户端
+
+第二版客户端使用 Electron + React + TypeScript，保留 Python 下载引擎和私有凭证。Windows x64 的免安装包在 `desktop/out/make/zip/win32/x64/`，解压后运行 `QuarkDriveClient.exe`；需要保留同目录资源，不能只复制 EXE。不依赖系统 Python。旧的 `dist/QuarkDriveDownloader.exe` 仍可独立使用。
+
+```powershell
+cd desktop
+npm ci
+npm run typecheck
+cd ..
+python packaging/desktop/build.py
+```
+
+界面提供我的文件、分享链接、传输任务和设置；支持扫码登录、昵称、分页搜索与取消、虚拟文件列表、复选框、名称/大小/路径排序、类型与格式筛选、分享目录导航、多线程续传、停止、逐项重试和保存目录打开。分享输入自动填入提取码，手工修改优先；服务端全盘结果路径按需定位。文件、目录、分享下载使用同一引擎和清理规则。
+
+Electron 主进程通过白名单 IPC 管理本地 Python 子进程；Renderer 无 Node 权限，Cookie、分享令牌与签名地址仅在后端处理。设置继承下载器配置；损坏文件不覆盖，本次有效设置可仅在会话使用并明确提示。
+
+客户端离线测试：`python -m unittest tests.test_desktop_service -q`；构建后在 `desktop` 运行 `npm test`，包含浏览器中的受控交互检查和隔离配置的真实 Electron 启动检查。真实账号能力须与官方客户端对照，不将离线结果当作实盘验证。
