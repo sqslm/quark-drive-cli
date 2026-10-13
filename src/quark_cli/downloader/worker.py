@@ -256,6 +256,15 @@ class DriveBackend:
     def account_nickname(self) -> str:
         return get_account_nickname(self._cookie(), transport=self._transport, guard=self._guard)
 
+    def verify_login(self, cookie: str) -> str:
+        with QuarkClient(cookie, transport=self._transport, guard=self._guard,
+                         timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+            client.auth_status()
+        try:
+            return get_account_nickname(cookie, transport=self._transport, guard=self._guard)
+        except Exception:
+            return "昵称暂不可用"
+
     def search_stream(self, request: Search, report: Callable, stopped: Callable) -> None:
         self._path_cache.clear()
         with QuarkClient(self._cookie(), transport=self._transport, guard=self._guard,

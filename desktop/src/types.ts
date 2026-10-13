@@ -9,7 +9,7 @@ export const METHODS = ['hello','account','browse','locate','search','search.can
   'preferences.save','login','login.cancel','download','download.stop','tasks','tasks.retry',
   'file.info','file.mkdir','file.rename','file.move','file.delete','upload','tasks.cancel','tasks.clear','tasks.authorize',
   'share.list','share.link','share.create','share.revoke','share.save','recycle.list','recycle.restore','recycle.remove',
-  'file.cut','file.paste','file.clearCut','favorites.list','favorites.add','favorites.remove','favorites.open'] as const;
+  'file.cut','file.paste','file.clearCut','favorites.list','favorites.add','favorites.remove','favorites.open','logout'] as const;
 export type Method = typeof METHODS[number];
 export interface Bridge {
   call(method: Method, params?: Record<string, unknown>, id?: string): Promise<any>;
@@ -18,5 +18,6 @@ export interface Bridge {
   chooseFiles(): Promise<string[]>;
   openFolder(path: string): Promise<void>;
   copyText(text: string): Promise<void>;
+  officialLogin(mode:'mobile'|'wechat'):Promise<{nickname?:string;logged_in?:boolean;cancelled?:boolean;warning?:string}>;
 }
 declare global { interface Window { quark: Bridge } }

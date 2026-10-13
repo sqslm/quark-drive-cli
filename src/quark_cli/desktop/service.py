@@ -13,9 +13,9 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Callable
 
-from ..auth import QRLogin, LoginCancelled, get_cookie, load_saved_cookie
-from ..errors import QuarkError, UsageError
-from ..state import config_directory
+from ..auth import QRLogin, LoginCancelled, get_cookie, load_saved_cookie, save_cookie, logout
+from ..errors import QuarkError, UsageError, AuthenticationError
+from ..state import config_directory, read_json, write_json
 from ..transfer import DownloadStopped, Transfer
 from ..recursive import RecursiveTransfer
 from ..paths import RemotePaths, valid_fid
@@ -41,6 +41,18 @@ class DesktopService:
         self.directory = Path(directory) if directory is not None else config_directory() / "downloader"
         self.preferences_path = self.directory / "preferences.json"
         self.saved_cookie = None
+        self.session_path = self.directory / "session.json"
+        self.session_warning = ""
+        try:
+            session = read_json(self.session_path, default={"version":1,"logged_out":False,"use_saved":False})
+            if session.get('version') != 1 or type(session.get('logged_out')) is not bool or type(session.get('use_saved')) is not bool:
+                raise UsageError('账号会话记录格式无效，请重新登录')
+            self.logged_out = session['logged_out']
+            self.use_saved = session['use_saved']
+        except QuarkError as error:
+            self.logged_out, self.use_saved = True, False
+            self.session_warning = describe_error(error,'读取账号状态')
+        self.web_login = None
         self.backend = backend or DriveBackend(self.cookie)
         self.reads = ThreadPoolExecutor(2, thread_name_prefix="quark-read")
         self.transfers = ThreadPoolExecutor(1, thread_name_prefix="quark-transfer")
@@ -78,6 +90,13 @@ class DesktopService:
         return self.preferences
 
     def cookie(self):
+        if self.logged_out:
+            raise AuthenticationError('已退出本客户端，请重新登录')
+        if self.use_saved and not self.saved_cookie:
+            saved = load_saved_cookie()
+            if not saved:
+                raise AuthenticationError('本客户端的登录凭证已失效，请重新登录')
+            return saved
         return self.saved_cookie or get_cookie()
 
     def event(self, identifier, event, data):
@@ -135,7 +154,61 @@ class DesktopService:
                     self.logging_in = False
 
     def dispatch(self, identifier, method, p, cancel):
+        if method == 'logout':
+            with self.lock:
+                if self.busy or self.logging_in or self.managing:
+                    raise UsageError('请先结束传输、登录或文件操作，再退出账号')
+            with self.writes, self.lock:
+                if self.busy or self.logging_in or self.managing:
+                    raise UsageError('请先结束传输、登录或文件操作，再退出账号')
+                write_json(self.session_path, {'version':1,'logged_out':True,'use_saved':False})
+                self.logged_out = True
+                self.saved_cookie = None
+                self.use_saved = False
+                self.clear_account_context()
+                warning = ''
+                try:
+                    logout()
+                except QuarkError as error:
+                    warning = '已退出本客户端，但本地凭证清理失败：' + describe_error(error,'清理凭证')
+                return {'logged_in':False,'nickname':'未登录','warning':warning}
+        if method == 'login.web.begin':
+            with self.lock:
+                if self.busy or self.logging_in or self.managing:
+                    raise UsageError('请先结束传输或当前账号操作')
+                self.logging_in = True
+                self.cut = None
+                self.web_login = uuid.uuid4().hex
+                self.search_cancel.set()
+                return {'token':self.web_login}
+        if method == 'login.web.cancel':
+            with self.lock:
+                if self.web_login is not None and self.web_login == p.get('token'):
+                    self.web_login = None
+                    self.logging_in = False
+                return True
+        if method == 'login.web.finish':
+            with self.writes:
+                with self.lock:
+                    if not self.web_login or self.web_login != p.get('token'):
+                        raise LoginCancelled('网页登录已取消，未保存凭证')
+                candidate = p.get('cookie')
+                if not isinstance(candidate,str) or not candidate.strip() or '\r' in candidate or '\n' in candidate:
+                    raise AuthenticationError('官方网页登录未返回有效凭证')
+                nickname = self.backend.verify_login(candidate)
+                with self.lock:
+                    if self.web_login != p.get('token'):
+                        raise LoginCancelled('网页登录已取消，未保存凭证')
+                    save_cookie(candidate)
+                    result = self.activate_login(candidate,nickname)
+                    self.web_login = None
+                    self.logging_in = False
+                    return result
+        if self.logged_out and method not in ('hello','account','preferences.save','tasks','tasks.clear','tasks.cancel','share.parse','login','favorites.list'):
+            raise AuthenticationError('已退出本客户端，请重新登录')
         if method.startswith('favorites.'):
+            if method == 'favorites.list' and self.logged_out:
+                return []
             if p.get('handle'):
                 raise UsageError('分享目录不能设为账号常用文件夹')
             with self.lock:
@@ -276,10 +349,20 @@ class DesktopService:
                         return operations.mkdir(str(p.get("parent", "0")), str(p.get("name", "")))
                     return operations.apply(method[5:], p["entries"], name=p.get("name"), target=p.get("target"))
         if method == "hello":
+            try:
+                self.cookie()
+                signed_in = True
+            except QuarkError:
+                signed_in = False
             return {"protocol": 1, "preferences": asdict(self.current_preferences()), "extension_groups": EXTENSION_GROUPS,
-                    "warning": "; ".join(value for value in (self.preferences_warning, self.task_store.warning) if value)}
+                    "signed_in":signed_in,
+                    "warning": "; ".join(value for value in (self.session_warning,self.preferences_warning, self.task_store.warning) if value)}
         if method == "account":
-            return {"nickname": self.backend.account_nickname()}
+            try:
+                self.cookie()
+            except AuthenticationError:
+                return {'nickname':'未登录','logged_in':False}
+            return {"nickname": self.backend.account_nickname(),'logged_in':True}
         if method == "browse":
             return [asdict(row) for row in self.backend.listing(str(p.get("fid", "0")))]
         if method == "locate":
@@ -326,15 +409,16 @@ class DesktopService:
             def qr(path):
                 self.event(identifier, "login.qr", "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode("ascii"))
             QRLogin(cancelled=cancel.is_set).run(on_qr_ready=qr)
-            self.saved_cookie = load_saved_cookie()
-            self.sources.clear()
-            for task in self.tasks:
-                task["valid"] = False
+            candidate = load_saved_cookie()
+            if not candidate:
+                raise AuthenticationError('扫码登录凭证缺失，请重新登录')
+            self.saved_cookie = candidate
+            self.logged_out = False
             try:
                 nickname = self.backend.account_nickname()
             except Exception:
                 nickname = "昵称暂不可用"
-            return {"nickname": nickname}
+            return self.activate_login(candidate,nickname)
         if method == "upload":
             with self.lock:
                 if self.logging_in or self.managing or (self.busy and self.stop.is_set()):
@@ -452,6 +536,28 @@ class DesktopService:
             finally:
                 with self.lock:
                     self.managing = False
+
+    def clear_account_context(self):
+        self.search_cancel.set()
+        self.cut = None
+        self.sources.clear()
+        if hasattr(self.backend,'_path_cache'):
+            self.backend._path_cache.clear()
+        for task in self.tasks:
+            task['valid'] = False
+
+    def activate_login(self, cookie, nickname):
+        warning = ''
+        try:
+            write_json(self.session_path, {'version':1,'logged_out':False,'use_saved':True})
+            self.session_warning = ''
+        except QuarkError as error:
+            warning = '本次登录已完成，但账号选择未持久化；下次启动请核对账号：' + describe_error(error,'保存账号状态')
+        self.saved_cookie = cookie
+        self.logged_out = False
+        self.use_saved = True
+        self.clear_account_context()
+        return {'nickname':nickname,'logged_in':True,'warning':warning}
 
     def cut_view(self):
         clipboard = self.cut
@@ -575,7 +681,8 @@ METHODS = frozenset({"hello", "account", "browse", "search", "search.cancel", "l
     "upload", "tasks.cancel", "tasks.clear", "tasks.authorize",
     'share.list','share.link','share.create','share.revoke','share.save','recycle.list','recycle.restore','recycle.remove',
     'file.cut','file.paste','file.clearCut',
-    'favorites.list','favorites.add','favorites.remove','favorites.open'})
+    'favorites.list','favorites.add','favorites.remove','favorites.open',
+    'logout','login.web.begin','login.web.finish','login.web.cancel'})
 
 
 def main():

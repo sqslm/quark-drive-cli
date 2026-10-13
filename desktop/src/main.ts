@@ -5,6 +5,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { stat } from 'node:fs/promises';
 import { METHODS } from './types';
+import { randomUUID } from 'node:crypto';
+import { officialLogin } from './WebLogin';
 
 declare const MAIN_WINDOW_WEBPACK_ENTRY: string;
 declare const MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
@@ -13,6 +15,7 @@ let window: BrowserWindow;
 let backend: ChildProcessWithoutNullStreams;
 const pending = new Map<string, { resolve: (data: unknown) => void; reject: (error: Error) => void }>();
 let stopping = false;
+let webLoginRunning = false;
 if (!app.requestSingleInstanceLock()) app.exit(0);
 app.on('second-instance', () => { if (window && !window.isDestroyed()) { window.restore(); window.focus(); } });
 function failPending(message: string) {
@@ -46,6 +49,13 @@ function startBackend() {
 function trusted(event: Electron.IpcMainInvokeEvent) {
   if (event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame) throw new Error('无效调用来源');
 }
+function backendRequest(method:string,params:Record<string,unknown>={},id=randomUUID()) {
+  if (!backend || backend.exitCode !== null || !backend.stdin.writable) return Promise.reject(new Error('网盘后端不可用'));
+  return new Promise<any>((resolve,reject) => {
+    pending.set(id,{resolve,reject});
+    backend.stdin.write(JSON.stringify({id,method,params})+'\n');
+  });
+}
 app.whenReady().then(async () => {
   if (app.isPackaged) {
     const root = path.dirname(path.dirname(fileURLToPath(MAIN_WINDOW_WEBPACK_ENTRY)));
@@ -67,11 +77,14 @@ app.whenReady().then(async () => {
   ipcMain.handle('quark:call', (event, message) => {
     trusted(event);
     if (!message || typeof message.id !== 'string' || message.id.length > 128 || pending.has(message.id) || !METHODS.includes(message.method)) throw new Error('无效操作');
-    if (!backend || backend.exitCode !== null || !backend.stdin.writable) throw new Error('网盘后端不可用');
-    return new Promise((resolve, reject) => {
-      pending.set(message.id, { resolve, reject });
-      backend.stdin.write(JSON.stringify(message) + '\n');
-    });
+    return backendRequest(message.method,message.params,message.id);
+  });
+  ipcMain.handle('quark:official-login',async (event,mode) => {
+    trusted(event);
+    if(!['mobile','wechat'].includes(mode) || webLoginRunning) throw new Error('请先结束当前登录');
+    webLoginRunning=true;
+    try {return await officialLogin(window,mode,backendRequest);}
+    finally {webLoginRunning=false;}
   });
   ipcMain.handle('quark:choose-folder', async event => {
     trusted(event);

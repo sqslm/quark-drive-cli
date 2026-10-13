@@ -20,7 +20,8 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     const page = await browser.newPage({ viewport: { width: 1180, height: 780 },reducedMotion:'no-preference' });
     const errors = []; page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(() => {
-      const listeners = new Set(); let cancelled = false; let tasks = [];let cut=null;let favorites=[];
+      const listeners = new Set(); let cancelled = false; let tasks = [];let cut=null;let favorites=[];let loggedIn=true;
+      window.testWebCancel=true;
       window.testClockMs = Date.now();Date.now = () => window.testClockMs;
       let shares = [], recycle = [{record_id:'trash-a',fid:'gone-a',name:'测试删除.txt',directory:false,size:4,parent:'0'}, {record_id:'trash-b',fid:'gone-b',name:'测试恢复.txt',directory:false,size:4,parent:'0'}];
       const rows = Array.from({ length: 10000 }, (_, index) => ({ fid: String(index), name: `知否 ${String(index).padStart(5,'0')}.txt`, directory: false, size: index + 1, path: '', location: [] }));
@@ -29,10 +30,12 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
       window.quark = {
         onEvent: callback => { listeners.add(callback); return () => listeners.delete(callback); },
         chooseFolder: async () => 'C:\\Downloads', chooseFiles:async () => ['C:\\Uploads\\测试.txt'], openFolder: async () => {}, copyText:async text => { window.testCalls.push({method:'clipboard',params:{text}}); },
+        officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
-          if(method === 'account') return { nickname: '测试账号' };
+          if(method === 'hello') return { protocol: 1,signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
+          if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
           if(method === 'favorites.add') {const [fid,name]=params.trail.at(-1);favorites=[...favorites.filter(row => row.fid !== fid),{fid,name}];return favorites;}
           if(method === 'favorites.remove') {favorites=favorites.filter(row => row.fid !== params.fid);return favorites;}
@@ -76,6 +79,9 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.goto(`http://127.0.0.1:${server.address().port}/main_window/index.html`);
     await page.getByText('显示 10000 项', { exact: true }).waitFor();
     assert.ok(await page.locator('.file-row').count() < 60);
+    assert.equal(await page.getByRole('button',{name:'重命名',exact:true}).count(),0);
+    assert.equal(await page.getByLabel('格式筛选',{exact:true}).count(),0);
+    await page.getByRole('button',{name:'筛选',exact:true}).click();
     await page.getByLabel('格式筛选',{exact:true}).selectOption('视频');
     await page.getByText('显示 0 项',{exact:true}).waitFor();
     assert.ok(await page.getByLabel('格式筛选',{exact:true}).locator('option').count() >= 5);
@@ -155,7 +161,8 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.keyboard.press('Escape');
     await page.getByLabel('选择 知否 00003.txt',{exact:true}).uncheck();
     await page.getByLabel('选择 知否 00001.txt',{exact:true}).check();
-    await page.getByRole('button',{name:'创建分享',exact:true}).click();
+    await page.getByRole('button',{name:'更多操作 知否 00001.txt',exact:true}).click();
+    await page.getByRole('menuitem',{name:'分享',exact:true}).click();
     await page.getByLabel('分享有效期').selectOption('30');
     await page.getByLabel('新分享提取码').fill('a123');
     await page.getByRole('button',{name:'确认创建',exact:true}).click();
@@ -223,6 +230,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     const downloaded = await page.evaluate(() => window.testCalls.find(call => call.method === 'download').params.entries);
     assert.equal(downloaded.length, 1); assert.equal(downloaded[0].fid, '0');
     await page.getByRole('button', {name:'我的文件',exact:true}).click();
+    await page.getByRole('button',{name:'上传',exact:true}).click();
     await page.getByRole('button', {name:'上传文件',exact:true}).click();
     await page.getByRole('heading', {name:'传输任务'}).waitFor();
     await page.getByText('测试.txt',{exact:true}).waitFor();
@@ -254,6 +262,31 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     await mkdir(path.resolve(__dirname, '../test-results'), { recursive:true });
     await page.screenshot({ path:path.resolve(__dirname, '../test-results/client.png') });
+    await page.getByRole('button',{name:'我的文件',exact:true}).click();
+    await page.getByRole('button',{name:'筛选',exact:true}).click();
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/compact-toolbar.png')});
+    await page.getByRole('button',{name:'账号操作',exact:true}).click();
+    await page.getByRole('menuitem',{name:'切换账号',exact:true}).click();
+    await page.getByRole('dialog',{name:'切换账号',exact:true}).waitFor();
+    for(const name of ['扫码登录','手机验证码登录','微信登录']) assert.ok(await page.getByRole('button',{name,exact:true}).isEnabled());
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/account-login-picker.png')});
+    await page.getByRole('button',{name:'手机验证码登录',exact:true}).click();
+    await page.locator('.account-name[title="测试账号"]').waitFor();
+    await page.locator('.toast').getByText('登录已取消，原账号保持不变',{exact:true}).waitFor();
+    await page.evaluate(() => {window.testWebCancel=false;});
+    await page.getByRole('button',{name:'切换账号',exact:true}).click();
+    await page.getByRole('button',{name:'微信登录',exact:true}).click();
+    await page.locator('.account-name[title="新账号"]').waitFor();
+    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method==='officialLogin').map(row => row.params.mode)),['mobile','wechat']);
+    await page.getByRole('button',{name:'账号操作',exact:true}).click();
+    await page.getByRole('menuitem',{name:'退出账号',exact:true}).click();
+    await page.getByText('登录后浏览和管理网盘文件',{exact:true}).waitFor();
+    assert.equal(await page.locator('.file-row').count(),0);
+    assert.ok(await page.getByRole('button',{name:'新建目录',exact:true}).isDisabled());
+    await page.getByRole('button',{name:'登录账号',exact:true}).first().click();
+    await page.getByRole('button',{name:'扫码登录',exact:true}).click();
+    await page.locator('.toast.error').getByText('登录服务暂时不可用',{exact:true}).waitFor();
+    await page.locator('.account-name[title="未登录"]').waitFor();
     assert.deepEqual(errors, []);
   } finally { await browser.close(); await new Promise(resolve => server.close(resolve)); }
 });
@@ -280,5 +313,19 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     await page.waitForTimeout(100);
     assert.equal(await app.evaluate(({BrowserWindow}) => BrowserWindow.getAllWindows()[0].isMaximized()),false);
     await assert.rejects(page.evaluate(() => window.quark.call('os.system')), /不支持/);
+    await assert.rejects(page.evaluate(() => window.quark.call('login.web.finish',{cookie:'never-import-from-renderer'})), /不支持/);
+    for(const mode of ['mobile','wechat']) {
+      const opening=app.waitForEvent('window');
+      await page.evaluate(mode => {window.loginPromise=window.quark.officialLogin(mode);},mode);
+      const official=await opening;
+      await official.waitForURL('https://pan.quark.cn/');
+      await official.locator(mode === 'mobile' ? 'iframe[src*="custom_login_type=mobile"]' : 'iframe[src*="/wechat_qrcode"]').waitFor();
+      assert.equal(await official.evaluate(() => typeof window.quark),'undefined');
+      const webPreferences=await app.evaluate(({BrowserWindow}) => BrowserWindow.getAllWindows().find(win => win.webContents.getURL().startsWith('https://pan.quark.cn/')).webContents.getLastWebPreferences());
+      assert.equal(webPreferences.sandbox,true);assert.equal(webPreferences.contextIsolation,true);assert.equal(webPreferences.nodeIntegration,false);
+      assert.ok(await app.evaluate(({BrowserWindow}) => BrowserWindow.getAllWindows().every(win => !win.webContents.getURL().startsWith('https://pan.quark.cn/') || !win.webContents.session.isPersistent())));
+      await app.evaluate(({BrowserWindow}) => BrowserWindow.getAllWindows().find(win => win.webContents.getURL().startsWith('https://pan.quark.cn/')).close());
+      assert.equal((await page.evaluate(() => window.loginPromise)).cancelled,true);
+    }
   } finally { await app.close(); await rm(directory, { recursive:true, force:true }); }
 });
