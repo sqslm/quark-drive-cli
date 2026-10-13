@@ -5,6 +5,8 @@ import { Entry, Event, Preferences, Task } from './types';
 import './style.css';
 import { FileDialog, FileAction } from './FileDialog';
 import { TasksPanel } from './TasksPanel';
+import { CatalogPanel } from './CatalogPanel';
+import { SharingDialog } from './SharingDialog';
 
 const units = (bytes: number | null) => bytes === null ? '—' : bytes < 1024 ? `${bytes} B` :
   bytes < 1048576 ? `${(bytes / 1024).toFixed(1)} KiB` : bytes < 1073741824 ? `${(bytes / 1048576).toFixed(1)} MiB` : `${(bytes / 1073741824).toFixed(2)} GiB`;
@@ -44,6 +46,8 @@ function App() {
   const [qr, setQr] = useState<string | null>(null);
   const [loggingIn, setLoggingIn] = useState(false);
   const [fileDialog,setFileDialog] = useState<{ action:FileAction; entries:Entry[] } | null>(null);
+  const [sharingDialog,setSharingDialog] = useState<'create'|'save'|null>(null);
+  const [accountRevision,setAccountRevision] = useState(0);
   const [context,setContext] = useState<{ row:Entry; x:number; y:number } | null>(null);
   const view = useRef(0);
   const searchId = useRef<string | null>(null);
@@ -126,7 +130,7 @@ function App() {
     const result = await action<{ handle: string; entries: Entry[] }>(() => call('share.open', { text: shareText, passcode }));
     if (generation !== view.current) return;
     setLoading(false);
-    if (result) { setShare(result.handle); setSharePath('/'); setRows(result.entries); setChecked(new Set()); setQuery(''); setSearchView(false); setPage('drive'); setStatus('分享只读浏览；下载后清理临时转存'); }
+    if (result) { setShare(result.handle); setSharePath('/'); setRows(result.entries); setChecked(new Set()); setQuery(''); setKind('all'); setFormat(''); setExtensions(''); setSearchView(false); setPage('drive'); setStatus('分享只读浏览；下载后清理临时转存'); }
   }
   async function saveSettings(folder = preferences.output_dir) {
     const n = Number(threads), limit = Number(rate);
@@ -216,16 +220,16 @@ function App() {
   async function login() {
     cancelSearch(); ++view.current; ++profileGeneration.current; setLoading(false); const id = crypto.randomUUID(); loginId.current = id; setLoggingIn(true); setNickname('正在登录');
     const result = await action<{ nickname: string; cancelled?: boolean }>(() => call('login', {}, id));
-    if (loginId.current === id) { setLoggingIn(false); setQr(null); if (result && !result.cancelled) { setNickname(result.nickname); acceptTasks(await call('tasks')); await browse([['0','我的网盘']]); } else setNickname('昵称暂不可用'); }
+    if (loginId.current === id) { setLoggingIn(false); setQr(null); if (result && !result.cancelled) { setNickname(result.nickname); setAccountRevision(old => old+1); acceptTasks(await call('tasks')); await browse([['0','我的网盘']]); } else setNickname('昵称暂不可用'); }
   }
   return <><div className="titlebar"><span>夸克网盘客户端</span></div><div className="app">
     <aside><div className="brand"><span className="brand-mark">Q</span><div>夸克网盘<small>桌面客户端</small></div></div>
-      <nav aria-label="主导航">{[['drive','我的文件'],['share','分享链接'],['tasks','传输任务'],['settings','设置']].map(([key,label]) =>
-        <button key={key} className={page === key ? 'nav active' : 'nav'} onClick={() => { setPage(key); if(key === 'drive' && share) void browse([['0','我的网盘']]); }}>{label}{key === 'tasks' && tasks.length > 0 && <span>{tasks.length}</span>}</button>)}</nav>
+      <nav aria-label="主导航">{[['drive','我的文件'],['share','分享链接'],['shares','我的分享'],['recycle','回收站'],['tasks','传输任务'],['settings','设置']].map(([key,label]) =>
+        <button key={key} className={page === key ? 'nav active' : 'nav'} onClick={() => { cancelSearch(); setPage(key); if(key === 'drive' && share) void browse([['0','我的网盘']]); }}>{label}{key === 'tasks' && tasks.length > 0 && <span>{tasks.length}</span>}</button>)}</nav>
       <div className="account"><span className="avatar">{nickname.slice(0,1)}</span><div className="account-name" title={nickname}>{nickname}<small>夸克网盘账号</small></div></div>
       <button className="login-button" disabled={transferring || loggingIn} onClick={() => void login()}>扫码登录</button>
     </aside>
-    <main><header><div><h1>{({drive: share ? '分享文件' : '我的文件', share:'分享链接',tasks:'传输任务',settings:'设置'} as Record<string,string>)[page]}</h1>
+    <main><header><div><h1>{({drive: share ? '分享文件' : '我的文件', share:'分享链接',shares:'我的分享',recycle:'回收站',tasks:'传输任务',settings:'设置'} as Record<string,string>)[page]}</h1>
       <p>{page === 'drive' ? `${rows.length} 项 · ${share ? sharePath : trail.map(item => item[1]).join(' / ')}` : page === 'tasks' ? '下载进度与逐项结果' : page === 'share' ? '粘贴链接或完整分享文案' : '下载与本地保存偏好'}</p></div>
       <span className="connection">{transferring ? '正在传输' : '就绪'}</span></header>
       {page === 'drive' && <>
@@ -244,7 +248,9 @@ function App() {
           <button disabled={loading || searching || transferring || selected.length !== 1} onClick={() => fileAction('rename')}>重命名</button>
           <button disabled={loading || searching || transferring || !selected.length} onClick={() => fileAction('move')}>移动</button>
           <button disabled={loading || searching || transferring || !selected.length} onClick={() => fileAction('delete')}>移入回收站</button>
+          <button disabled={loading || searching || transferring || loggingIn || selected.length !== 1} onClick={() => setSharingDialog('create')}>创建分享</button>
           <button disabled={selected.length !== 1} onClick={() => fileAction('info')}>属性</button><button disabled={!selected.length} onClick={() => void copyPaths()}>复制路径</button></div>}
+        {share && <div className="file-actions"><button disabled={loading || searching || transferring || loggingIn || !selected.length} onClick={() => setSharingDialog('save')}>永久转存到网盘</button><span className="note">下载仍使用临时转存并清理</span></div>}
         <div className="file-header"><input aria-label="全选可见文件" type="checkbox" checked={all} onChange={() => setChecked(old => { const next = new Set(old); filtered.forEach(row => all ? next.delete(row.fid) : next.add(row.fid)); return next; })} />
           <button onClick={() => sortBy('name')}>名称{sort?.key === 'name' ? sort.descending ? ' ↓' : ' ↑' : ''}</button><button onClick={() => sortBy('size')}>大小</button><span>类型</span><button onClick={() => sortBy('path')}>路径</button></div>
         <div className="file-scroll" ref={scroll}>{loading && <div className="empty">正在读取目录…</div>}
@@ -267,6 +273,7 @@ function App() {
         <label>提取码 <small>可手工修改</small><input aria-label="提取码" value={passcode} onChange={event => { codeRevision.current++; setPasscode(event.target.value); }} /></label><button className="primary" disabled={loading} onClick={() => void openShare()}>打开分享</button>
         <p className="note">浏览不会转存。分享下载使用临时目录，下载结束、失败或停止后清理。</p></section>}
       {page === 'tasks' && <TasksPanel tasks={tasks} busy={transferring} onTasks={acceptTasks} onStart={() => setTransferring(true)} onEnd={() => setTransferring(false)} onStatus={setStatus}/>}
+      {(page === 'shares' || page === 'recycle') && <CatalogPanel key={`${page}-${accountRevision}`} mode={page === 'shares' ? 'shares' : 'recycle'} busy={transferring || loggingIn} onStatus={setStatus}/>}
       {page === 'settings' && <section className="form-section"><h2>下载设置</h2><label>线程数 <small>1–16，默认 4</small><input type="number" min="1" max="16" disabled={transferring} value={threads} onChange={event => setThreads(event.target.value)} /></label>
         <label>总限速 <small>MiB/s，0 表示不限速</small><input type="number" min="0" step="0.1" disabled={transferring} value={rate} onChange={event => setRate(event.target.value)} /></label>
         <label>保存目录<input value={preferences.output_dir} readOnly /></label><button disabled={transferring} onClick={() => void action(async () => { const folder = await window.quark.chooseFolder(); if (folder) await saveSettings(folder); })}>选择目录</button>
@@ -277,6 +284,7 @@ function App() {
       {!share && <><button disabled={transferring || searching || selected.length !== 1} onClick={() => fileAction('rename')}>重命名</button><button disabled={transferring || searching} onClick={() => fileAction('move')}>移动</button><button disabled={transferring || searching} onClick={() => fileAction('delete')}>移入回收站</button><button onClick={() => fileAction('info',[context.row])}>属性</button></>}
       <button onClick={() => { const entries = selected; setContext(null); void copyPaths(entries); }}>复制路径</button></div></>}
     {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} parent={trail} close={() => setFileDialog(null)} done={() => { void (searchView ? runSearch() : browse()); }}/ >}
+    {sharingDialog && <SharingDialog mode={sharingDialog} entries={selected} handle={share} path={sharePath} close={() => setSharingDialog(null)} onStatus={setStatus}/>}
     {loggingIn && <div className="modal-backdrop"><div className="modal"><h2>扫码登录</h2><p>使用手机夸克 App 扫描二维码</p>{qr ? <img src={qr} alt="夸克登录二维码" /> : <div className="qr-loading">正在获取二维码…</div>}
       <button onClick={() => { loginId.current = null; setLoggingIn(false); setQr(null); setNickname('未登录'); void action(() => call('login.cancel')); }}>取消登录</button></div></div>}
   </div></>;

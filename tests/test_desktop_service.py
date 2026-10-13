@@ -55,6 +55,26 @@ class DesktopTests(unittest.TestCase):
         self.service.accept({"id": None, "method": "browse"})
         self.assertIn("error", self.messages[-1])
         self.assertEqual(self.backend.requests, [])
+    def test_management_reservation_blocks_login_and_new_transfers(self):
+        with self.service.mutation():
+            self.service.accept({'id':'during-write','method':'login'})
+            self.assertIn('error',self.wait_result('during-write'))
+            from quark_cli.errors import UsageError
+            for method in ('download','upload','tasks.retry'):
+                with self.assertRaises(UsageError):
+                    self.service.dispatch('write',method,{},None)
+            self.assertTrue(self.service.managing)
+        self.assertFalse(self.service.managing)
+    def test_unknown_permanent_save_is_a_non_repeatable_result(self):
+        from quark_cli.downloader.share import ShareSource
+        from quark_cli.errors import RemoteError
+        self.service.sources['source'] = ShareSource('https://pan.quark.cn/s/test')
+        with patch.object(self.backend,'_client',create=True), patch('quark_cli.desktop.service.Sharing') as sharing:
+            sharing.return_value.save.side_effect = RemoteError('结果无法确认')
+            result = self.service.dispatch('save','share.save',{'handle':'source','entries':[],'target':'0'},None)
+        self.assertFalse(result['saved'])
+        self.assertEqual(result['result'],'unknown')
+        self.assertFalse(self.service.managing)
     def test_handshake_preferences_and_browse_contain_no_credential(self):
         self.service.accept({"id": "init", "method": "hello"})
         data = self.wait_result("init")["result"]

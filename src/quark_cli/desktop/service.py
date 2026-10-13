@@ -7,6 +7,7 @@ import json
 import sys
 import threading
 import uuid
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -28,6 +29,9 @@ from ..downloader.search import SearchCancelled
 from ..downloader.worker import Download, DriveBackend, Search
 from .file_operations import FileOperations
 from .tasks import TaskStore, Upload
+from .sharing import Sharing
+from .recycle import Recycle
+from ..share_management import safe_operation_result
 
 
 class DesktopService:
@@ -54,6 +58,7 @@ class DesktopService:
         self.sources: dict[str, ShareSource] = {}
         self.busy = False
         self.logging_in = False
+        self.managing = False
         self.closed = False
         self.preferences_warning = ""
         self.preferences_writable = True
@@ -99,7 +104,7 @@ class DesktopService:
             cancel = self.search_cancel
         elif method == "login":
             with self.lock:
-                if self.busy or self.logging_in:
+                if self.busy or self.logging_in or self.managing:
                     self.send({"id": identifier, "error": "请先结束传输或当前登录"})
                     return
                 self.logging_in = True
@@ -126,10 +131,60 @@ class DesktopService:
                     self.logging_in = False
 
     def dispatch(self, identifier, method, p, cancel):
+        if method in ('share.list','share.link','recycle.list'):
+            with self.backend._client() as client:
+                if method == 'recycle.list':
+                    return Recycle(client).listing()
+                sharing = Sharing(client)
+                if method == 'share.list':
+                    return sharing.manager.list_own(all_pages=True)
+                return sharing.link(p['share_id'])
+        if method in ('share.create','share.revoke','share.save','recycle.restore','recycle.remove'):
+            with self.mutation(), self.backend._client() as client:
+                if method.startswith('recycle.'):
+                    return Recycle(client).apply(method.split('.')[1], p['entries'])
+                sharing = Sharing(client)
+                if method == 'share.save':
+                    source = self.sources[p['handle']]
+                    try:
+                        return sharing.save(source, str(p.get('path','/')), p['entries'], p['target'])
+                    except UsageError:
+                        raise
+                    except QuarkError as error:
+                        return {'saved':False,'result':'unknown','detail':describe_error(error,'永久转存') + '；结果未确认，未自动重发，请检查目标目录'}
+                if p.get('handle'):
+                    raise UsageError('分享浏览不能创建或取消账户分享')
+                if method == 'share.create':
+                    try:
+                        return sharing.create(p['entry'], passcode=p.get('passcode') or None, expire_days=p.get('expire_days',7))
+                    except QuarkError as error:
+                        evidence = safe_operation_result(getattr(error,'share_evidence',{}))
+                        if not evidence:
+                            raise
+                        return {**evidence, 'detail':describe_error(error,'创建分享')}
+                results = []
+                seen = set()
+                for entry in p['entries']:
+                    share_id = entry['share_id']
+                    try:
+                        if share_id in seen:
+                            raise UsageError('重复选择分享')
+                        seen.add(share_id)
+                        current = sharing.manager._own_record(share_id)
+                        if any(current.get(key) != entry.get(key) for key in ('pwd_id','title','share_url')):
+                            raise UsageError('本人分享记录已变化，请刷新后选择')
+                        result = sharing.manager.revoke(share_id)
+                        results.append({**result,'name':entry.get('title',share_id),'state':'done','detail':'已取消分享'})
+                    except QuarkError as error:
+                        evidence = safe_operation_result(getattr(error,'share_evidence',{}))
+                        results.append({**evidence,'share_id':share_id,'name':entry.get('title',share_id),
+                                        'state':'unknown' if evidence.get('result') == 'unknown' else 'failed',
+                                        'detail':describe_error(error,'取消分享')})
+                return results
         if method.startswith("file."):
             if p.get("handle"):
                 raise UsageError("分享文件只读，不能修改")
-            with self.writes:
+            with self.mutation() if method != 'file.info' else self.writes:
                 with self.lock:
                     if (self.busy or self.logging_in) and method != "file.info":
                         raise UsageError("请先停止传输再修改网盘文件")
@@ -202,7 +257,7 @@ class DesktopService:
             return {"nickname": nickname}
         if method == "upload":
             with self.lock:
-                if self.logging_in or (self.busy and self.stop.is_set()):
+                if self.logging_in or self.managing or (self.busy and self.stop.is_set()):
                     raise UsageError("请等待登录或停止操作结束")
             context = self.context()
             preferences = self.current_preferences()
@@ -227,7 +282,7 @@ class DesktopService:
                         "target":target + "/" + source.name,"request":request,"valid":True,"revision":0,
                         "context":context,"direction":"upload","_cancel":threading.Event(),"share_url":""})
             with self.lock:
-                if self.logging_in or (self.busy and self.stop.is_set()) or context != self.context():
+                if self.logging_in or self.managing or (self.busy and self.stop.is_set()) or context != self.context():
                     raise UsageError("登录或队列状态已经变化，请重新提交")
                 self.tasks.extend(tasks)
                 self.start_tasks(tasks)
@@ -271,7 +326,7 @@ class DesktopService:
                 return [self.public_task(task) for task in self.tasks]
         if method == "download":
             with self.lock:
-                if self.logging_in or (self.busy and self.stop.is_set()):
+                if self.logging_in or self.managing or (self.busy and self.stop.is_set()):
                     raise UsageError("请等待登录或停止操作结束")
                 entries = [self.entry(row) for row in p["entries"]]
                 if not entries:
@@ -292,7 +347,7 @@ class DesktopService:
                 return [self.public_task(task) for task in self.tasks]
         if method == "tasks.retry":
             with self.lock:
-                if self.busy or self.logging_in:
+                if self.busy or self.logging_in or self.managing:
                     raise UsageError("传输正在进行")
                 self.verify_context()
                 self.refresh_task_context()
@@ -304,6 +359,19 @@ class DesktopService:
                 self.start_tasks(tasks)
                 return [self.public_task(task) for task in self.tasks]
         raise UsageError("不支持的请求")
+
+    @contextmanager
+    def mutation(self):
+        with self.writes:
+            with self.lock:
+                if self.busy or self.logging_in:
+                    raise UsageError('请先结束传输或登录，再修改网盘内容')
+                self.managing = True
+            try:
+                yield
+            finally:
+                with self.lock:
+                    self.managing = False
 
     @staticmethod
     def entry(row):
@@ -418,7 +486,8 @@ class DesktopService:
 METHODS = frozenset({"hello", "account", "browse", "search", "search.cancel", "locate", "share.parse",
     "share.open", "share.browse", "preferences.save", "login", "login.cancel", "download", "download.stop", "tasks", "tasks.retry",
     "file.info", "file.mkdir", "file.rename", "file.move", "file.delete",
-    "upload", "tasks.cancel", "tasks.clear", "tasks.authorize"})
+    "upload", "tasks.cancel", "tasks.clear", "tasks.authorize",
+    'share.list','share.link','share.create','share.revoke','share.save','recycle.list','recycle.restore','recycle.remove'})
 
 
 def main():
