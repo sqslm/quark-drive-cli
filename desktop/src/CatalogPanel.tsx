@@ -13,7 +13,8 @@ export function CatalogPanel({mode,busy,onStatus}: {mode:'shares'|'recycle';busy
   const [ready,setReady] = useState(false);
   const [confirm,setConfirm] = useState<'revoke'|'restore'|'remove'|null>(null);
   const [confirmed,setConfirmed] = useState(false);
-  const [results,setResults] = useState<{name:string;detail:string;state:string}[]|null>(null);
+  const [results,setResults] = useState<{record_id?:string;name:string;detail:string;state:string}[]|null>(null);
+  const [stage,setStage] = useState('');
   const [now,setNow] = useState(Date.now);
   const scroll = useRef<HTMLDivElement>(null);
   const generation = useRef(0);
@@ -38,11 +39,23 @@ export function CatalogPanel({mode,busy,onStatus}: {mode:'shares'|'recycle';busy
   },[mode]);
   async function submit() {
     setLoading(true);setError('');
+    const id=crypto.randomUUID();
+    setStage(confirm === 'remove' ? `正在核验 ${picked.length} 条待删除记录…` : '');
+    const off=window.quark.onEvent(event => {if(event.id === id && event.event === 'recycle.progress') setStage(String(event.data));});
     try {
-      const response = await window.quark.call(confirm === 'revoke' ? 'share.revoke' : confirm === 'restore' ? 'recycle.restore' : 'recycle.remove',{entries:picked});
-      setResults(response);await refresh();const failed = response.some((row:{state:string}) => row.state !== 'done');onStatus(failed ? '部分项目未完成，请查看逐项结果' : '操作已完成，请查看逐项结果', failed ? 'warning' : 'success');
+      const response = await window.quark.call(confirm === 'revoke' ? 'share.revoke' : confirm === 'restore' ? 'recycle.restore' : 'recycle.remove',{entries:picked},id);
+      setResults(response);
+      if(confirm === 'remove') {
+        const done=new Set<string>(response.filter((row:{state:string}) => row.state === 'done').map((row:{record_id:string}) => row.record_id));
+        setRows(old => old.filter(row => !done.has(key(row))));
+        setSelected(old => new Set([...old].filter(value => !done.has(value))));
+        if(response.some((row:{state:string}) => row.state === 'unknown')) {
+          setReady(false);setError('有未确认的删除结果，请刷新核实后再操作。');
+        }
+      } else await refresh();
+      const failed = response.some((row:{state:string}) => row.state !== 'done');onStatus(failed ? '部分项目未完成，请查看逐项结果' : '操作已完成，请查看逐项结果', failed ? 'warning' : 'success');
     } catch(error) {const text=error instanceof Error ? error.message : '操作失败';setError(text);onStatus(text,'error');}
-    finally {setLoading(false);}
+    finally {off();setStage('');setLoading(false);}
   }
   async function copy(row:Row) {
     setLoading(true);setError('');
@@ -64,8 +77,9 @@ export function CatalogPanel({mode,busy,onStatus}: {mode:'shares'|'recycle';busy
       <span title={mode === 'shares' ? shareExpiry(row,now).title : undefined}>{mode === 'shares' ? shareExpiry(row,now).text : row.directory ? '目录' : `${row.size ?? '—'} B`}</span>
       {mode === 'shares' ? <button disabled={loading} onClick={() => void copy(row)}>复制分享文案</button> : <span>已删除</span>}</div>;})}</div></div>
     {confirm && <div className="modal-backdrop"><section className="modal file-modal" role="dialog" aria-modal="true" aria-label={title}><h2>{title}</h2>
+      {loading && stage && <p className="catalog-progress" aria-live="polite">{stage}</p>}
       {!results && <><p>已选择 {picked.length} 项：{picked.map(row => row.title || row.name).join('、')}</p><p>{confirm === 'remove' ? '这些记录将永久删除，无法从回收站恢复。' : confirm === 'restore' ? '恢复到原目录，同名冲突不覆盖。' : '选中链接将失效，网盘文件保留。'}</p>
-        {confirm === 'remove' && <label className="confirm-checkbox"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)}/>我确认永久删除这些记录</label>}</>}
+        {confirm === 'remove' && <label className="confirm-checkbox"><input type="checkbox" disabled={loading} checked={confirmed} onChange={event => setConfirmed(event.target.checked)}/>我确认永久删除这些记录</label>}</>}
       {results && <div className="operation-results">{results.map((row,index) => <p className={row.state !== 'done' ? 'error' : ''} key={index}>{row.name}：{row.detail}</p>)}</div>}
       {error && <p className="error" role="alert">{error}</p>}
       <div className="dialog-actions"><button disabled={loading} onClick={() => setConfirm(null)}>{results ? '关闭' : '取消'}</button>{!results && <button className="primary" disabled={loading || busy || (confirm === 'remove' && !confirmed)} onClick={() => void submit()}>{loading ? '处理中…' : '确认'}</button>}</div></section></div>}

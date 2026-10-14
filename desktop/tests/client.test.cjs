@@ -47,7 +47,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.17',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.18',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
@@ -82,7 +82,16 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
           if(method === 'share.link') return shares.find(row => row.share_id === params.share_id);
           if(method === 'share.revoke') {shares=shares.filter(row => !params.entries.some(entry => entry.share_id === row.share_id));return params.entries.map(row => ({name:row.title,state:'done',detail:'已取消分享'}));}
           if(method === 'recycle.list') return recycle.map(row => ({...row}));
-          if(method === 'recycle.remove' || method === 'recycle.restore') {recycle=recycle.filter(row => !params.entries.some(entry => entry.record_id === row.record_id));return params.entries.map(row => ({name:row.name,state:'done',detail:method === 'recycle.remove' ? '已永久删除' : '已恢复到原目录'}));}
+          if(method === 'recycle.remove' || method === 'recycle.restore') {
+            const unknown=method === 'recycle.remove' ? (window.testRecycleUnknownIds || []) : [];
+            if(method === 'recycle.remove') {
+              listeners.forEach(callback => callback({id,event:'recycle.progress',data:`已核验 ${params.entries.length} 条，正在批量永久删除…`}));
+              listeners.forEach(callback => callback({id:'old-recycle-request',event:'recycle.progress',data:'过期删除进度'}));
+              if(window.testHoldRecycleRemove) await new Promise(resolve => {window.releaseRecycleRemove=resolve;});
+            }
+            recycle=recycle.filter(row => !params.entries.some(entry => entry.record_id === row.record_id && !unknown.includes(row.record_id)));
+            return params.entries.map(row => ({record_id:row.record_id,name:row.name,state:unknown.includes(row.record_id) ? 'unknown' : 'done',detail:unknown.includes(row.record_id) ? '已提交，未重发，请刷新核实' : method === 'recycle.remove' ? '已永久删除' : '已恢复到原目录'}));
+          }
           if(method === 'share.save') return window.testSaveUnknown ? {saved:false,result:'unknown',detail:'结果未确认，请核实目标目录'} : {saved:true,item_count:params.entries.length,destination_path:'/'};
           if(method === 'preferences.save') return { preferences:params, persisted:!window.testSaveWarning, warning:window.testSaveWarning ? '设置仅在窗口内有效' : '' };
           if(method === 'download') { tasks.push({ id:'task', name: params.entries[0].name, state:'waiting', detail:'', target:'C:\\Downloads\\test.txt', valid:true,direction:'download',revision:1,scheduled:true }); return tasks.map(task => ({...task})); }
@@ -103,6 +112,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
       };
       window.testEmit=event => listeners.forEach(listener => listener(event));
       window.testGetTasks=() => tasks.map(task => ({...task}));
+      window.testSetRecycle=next => {recycle=next;};
       window.testSetTasks=next => {tasks=next;listeners.forEach(listener => listener({id:null,event:'tasks.changed',data:tasks}));};
     });
     await page.goto(`http://127.0.0.1:${server.address().port}/main_window/index.html`);
@@ -295,16 +305,46 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button',{name:'永久删除选中记录',exact:true}).click();
     assert.ok(await page.getByRole('button',{name:'确认',exact:true}).isDisabled());
     await page.getByLabel('我确认永久删除这些记录').check();
+    await page.evaluate(() => {window.testHoldRecycleRemove=true;});
     await page.getByRole('button',{name:'确认',exact:true}).click();
+    await page.locator('.catalog-progress').getByText('已核验 1 条，正在批量永久删除…',{exact:true}).waitFor();
+    assert.ok(await page.getByRole('button',{name:'处理中…',exact:true}).isDisabled());
+    assert.ok(await page.getByLabel('我确认永久删除这些记录').isDisabled());
+    assert.equal(await page.getByText('过期删除进度',{exact:true}).count(),0);
+    await page.evaluate(() => {window.testHoldRecycleRemove=false;window.releaseRecycleRemove();});
     await page.getByText('测试删除.txt：已永久删除',{exact:true}).waitFor();
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     const removed = await page.evaluate(() => window.testCalls.find(call => call.method === 'recycle.remove'));
     assert.deepEqual(removed.params.entries.map(row => row.record_id),['trash-a']);
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'recycle.list').length),1,'verified permanent deletion must not rescan the whole recycle bin again');
     await page.getByLabel('选择记录 测试恢复.txt',{exact:true}).check();
     await page.getByRole('button',{name:'恢复选中记录',exact:true}).click();
     await page.getByRole('button',{name:'确认',exact:true}).click();
     await page.getByText('测试恢复.txt：已恢复到原目录',{exact:true}).waitFor();
     await page.getByRole('button',{name:'关闭',exact:true}).click();
+    await page.evaluate(() => {window.testSetRecycle([
+      {record_id:'partial-done',fid:'partial-a',name:'已确认删除.txt',directory:false,size:4,parent:'0'},
+      {record_id:'partial-unknown',fid:'partial-b',name:'未确认删除.txt',directory:false,size:4,parent:'0'},
+      {record_id:'unselected',fid:'keep-c',name:'未选中记录.txt',directory:false,size:4,parent:'0'},
+    ]);window.testRecycleUnknownIds=['partial-unknown'];});
+    await page.getByRole('button',{name:'刷新',exact:true}).click();
+    await page.getByLabel('选择记录 已确认删除.txt',{exact:true}).check();
+    await page.getByLabel('选择记录 未确认删除.txt',{exact:true}).check();
+    const partialReads=await page.evaluate(() => window.testCalls.filter(call => call.method === 'recycle.list').length);
+    await page.getByRole('button',{name:'永久删除选中记录',exact:true}).click();
+    await page.getByLabel('我确认永久删除这些记录').check();
+    await page.getByRole('button',{name:'确认',exact:true}).click();
+    await page.getByText('未确认删除.txt：已提交，未重发，请刷新核实',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'关闭',exact:true}).click();
+    assert.equal(await page.getByLabel('选择记录 已确认删除.txt',{exact:true}).count(),0);
+    assert.ok(await page.getByLabel('选择记录 未确认删除.txt',{exact:true}).isDisabled());
+    assert.ok(await page.getByLabel('选择记录 未选中记录.txt',{exact:true}).isDisabled());
+    assert.ok(await page.getByRole('button',{name:'永久删除选中记录',exact:true}).isDisabled());
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'recycle.list').length),partialReads);
+    await page.getByRole('button',{name:'刷新',exact:true}).click();
+    assert.ok(await page.getByLabel('选择记录 未确认删除.txt',{exact:true}).isEnabled());
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'recycle.remove').length),2);
+
     await page.getByRole('button',{name:'我的文件',exact:true}).click();
     await page.getByRole('button',{name:'设置',exact:true}).click();
     assert.equal(await page.locator('.brand-logo').evaluate(image => image.complete && image.naturalWidth > 0),true);

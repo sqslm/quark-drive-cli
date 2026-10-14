@@ -64,9 +64,70 @@ class Recycle:
                 return records
         raise RemoteError("回收站分页超过上限")
 
-    def apply(self, operation, selected):
+    def _remove(self, selected, progress):
+        results = [{"record_id": entry.get("record_id"), "name": entry.get("name", ""),
+                    "state": "failed", "detail": ""} for entry in selected]
+        if progress:
+            progress(f"正在核验 {len(selected)} 条待删除记录…")
+        try:
+            records = {row["record_id"]: row for row in self.listing()}
+        except Exception as error:
+            for result in results:
+                result["detail"] = describe_error(error, "回收站核验")
+            return results
+        candidates, seen = [], set()
+        for index, entry in enumerate(selected):
+            try:
+                record_id = valid_fid(entry.get("record_id"))
+                if record_id in seen:
+                    raise UsageError("重复选择回收站记录")
+                seen.add(record_id)
+                actual = records.get(record_id)
+                if actual is None or any(actual.get(key) != entry.get(key)
+                        for key in ("fid", "name", "directory", "size", "parent")):
+                    raise UsageError("回收站记录已变化，请刷新后选择")
+                candidates.append(index)
+            except Exception as error:
+                results[index]["detail"] = describe_error(error, "回收站操作")
+        if not candidates:
+            return results
+        if progress:
+            progress(f"已核验 {len(candidates)} 条，正在批量永久删除…")
+        try:
+            self.client.post("file/recycle/remove", body={"select_mode": 2,
+                "record_list": [results[index]["record_id"] for index in candidates]})
+        except Exception as error:
+            for index in candidates:
+                results[index].update(state="unknown", detail=describe_error(error, "永久删除")
+                    + "；已提交，未重发，请刷新核实")
+            return results
+        pending = set(candidates)
+        detail = "已提交，但回收站结果尚未确认；未重发，请刷新核实"
+        for attempt in range(6):
+            if progress:
+                progress(f"正在核实删除结果，已确认 {len(candidates)-len(pending)}/{len(candidates)} 条…")
+            try:
+                remaining = {row["record_id"] for row in self.listing()}
+            except Exception as error:
+                detail = describe_error(error, "删除结果核验") + "；已提交，未重发，请刷新核实"
+                break
+            for index in tuple(pending):
+                if results[index]["record_id"] not in remaining:
+                    results[index].update(state="done", detail="已永久删除")
+                    pending.remove(index)
+            if not pending:
+                break
+            if attempt < 5:
+                time.sleep(0.5)
+        for index in pending:
+            results[index].update(state="unknown", detail=detail)
+        return results
+
+    def apply(self, operation, selected, *, progress=None):
         if operation not in ("restore", "remove") or not selected:
             raise UsageError("请明确选择回收站记录")
+        if operation == "remove":
+            return self._remove(selected, progress)
         results, seen = [], set()
         for entry in selected:
             submitted = False
@@ -100,11 +161,6 @@ class Recycle:
                     endpoint, body = (
                         "file/recycle/recover",
                         {"fid_list": [actual["fid"]]},
-                    )
-                else:
-                    endpoint, body = (
-                        "file/recycle/remove",
-                        {"select_mode": 2, "record_list": [record_id]},
                     )
                 submitted = True
                 self.client.post(endpoint, body=body)

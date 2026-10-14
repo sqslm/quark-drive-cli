@@ -308,7 +308,8 @@ class DesktopService:
         if method in ('share.create','share.revoke','share.save','recycle.restore','recycle.remove'):
             with self.mutation(), self.backend._client() as client:
                 if method.startswith('recycle.'):
-                    return Recycle(client).apply(method.split('.')[1], p['entries'])
+                    return Recycle(client).apply(method.split('.')[1], p['entries'],
+                        progress=lambda text: self.event(identifier, 'recycle.progress', text))
                 sharing = Sharing(client)
                 if method == 'share.save':
                     source = self.sources[p['handle']]
