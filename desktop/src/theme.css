@@ -114,3 +114,5 @@ aside{padding-top:28px}.brand{padding-bottom:30px;letter-spacing:.2px}.brand sma
 @media(max-width:950px){.transfer-setting{grid-template-columns:1fr 88px}.setting-slider{grid-column:1/-1}.transfer-setting{gap:12px}}
 .settings-section .settings-divider+h2{margin-top:0}
 @media(prefers-reduced-motion:reduce){button{transition:none}}
+
+.client-version{margin-left:8px;font-size:11px;color:var(--muted)}

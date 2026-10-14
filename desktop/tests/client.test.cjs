@@ -47,7 +47,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.12',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
@@ -579,6 +579,8 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     const page = await app.firstWindow();
     await page.getByRole('heading', { name:'我的文件' }).waitFor();
     const hello = await page.evaluate(() => window.quark.call('hello'));
+    assert.equal(hello.client_version,await app.evaluate(({app}) => app.getVersion()));
+    await page.locator('.titlebar').getByText('v'+hello.client_version,{exact:true}).waitFor();
     await assert.rejects(page.evaluate(() => window.quark.readDroppedFiles([new File(['payload'],'网页生成.txt')])),/本地文件/);
     const localDropFile=path.join(directory,'本地拖拽.txt'),localDropFolder=path.join(directory,'本地目录');
     await writeFile(localDropFile,'payload','utf8');await mkdir(localDropFolder);await writeFile(path.join(localDropFolder,'内部文件.txt'),'nested','utf8');
@@ -712,4 +714,63 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     const unsavedDesktop=await readonly.evaluate(() => window.quark.setClientSettings({closeBehavior:'quit',notifications:false}));
     assert.deepEqual(unsavedDesktop.settings,{closeBehavior:'quit',notifications:false});assert.match(unsavedDesktop.warning,/未能保存/);
   } finally { await app.close(); await rm(directory, { recursive:true, force:true }); }
+});
+
+
+test('native file drops on rows and empty space upload into the directory currently displayed', async () => {
+  const directory=await mkdtemp(path.join(tmpdir(),'quark-native-drop-'));
+  const executable=path.resolve(__dirname,'..',process.env.QUARK_DESKTOP_OUT || 'out','Quark Drive Client-win32-x64/QuarkDriveClient.exe');
+  const localFile=path.join(directory,'拖入.txt'),localFolder=path.join(directory,'拖入目录');
+  await writeFile(localFile,'small payload','utf8');await mkdir(localFolder);
+  const app=await _electron.launch({executablePath:executable,args:['--user-data-dir='+path.join(directory,'electron')],env:{...process.env,QUARK_CONFIG_DIR:directory,QUARK_COOKIE:'',QUARK_COOKIE_FILE:''}});
+  try {
+    const page=await app.firstWindow();await page.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
+    // Use the production UI, native File and preload validation; replace only cloud RPC replies.
+    await app.evaluate(({ipcMain,app},output) => {
+      globalThis.dropCalls=[];const tasks=[];
+      const preferences={output_dir:output,connections:4,limit_rate:null,width:1180,height:780};
+      ipcMain.removeHandler('quark:call');
+      ipcMain.handle('quark:call',(_event,{method,params}) => {
+        globalThis.dropCalls.push({method,params});
+        if(method === 'hello') return {protocol:1,signed_in:true,preferences,client_version:app.getVersion()};
+        if(method === 'account') return {nickname:'拖拽测试账号',logged_in:true};
+        if(method === 'browse') return params.fid === '0' ? [{fid:'folder',name:'当前列表里的子目录',directory:true,size:null,path:'',location:[],modified_at:null}] : [];
+        if(method === 'preferences.save') return {preferences:params,warning:''};
+        if(method === 'upload') {
+          params.sources.forEach(source => tasks.push({id:String(tasks.length),name:source.split('\\').at(-1),state:'waiting',detail:'',valid:true,direction:'upload',revision:1,target:params.parent}));
+          return [...tasks];
+        }
+        if(method === 'tasks') return [...tasks];
+        return [];
+      });
+    },directory);
+    await page.reload();
+    const child=page.locator('.file-row').getByRole('button',{name:'当前列表里的子目录',exact:true});await child.waitFor();
+    const session=await page.context().newCDPSession(page);
+    async function nativeDrop(target,paths) {
+      const box=await target.boundingBox();assert.ok(box);
+      const point={x:box.x+box.width/2,y:box.y+box.height/2,data:{items:[],files:paths,dragOperationsMask:1}};
+      await session.send('Input.dispatchDragEvent',{type:'dragEnter',...point});
+      await session.send('Input.dispatchDragEvent',{type:'dragOver',...point});
+      await page.getByText('松开鼠标，准备上传',{exact:true}).waitFor();
+      await session.send('Input.dispatchDragEvent',{type:'drop',...point});
+    }
+    await nativeDrop(child,[localFile,localFolder]);
+    const dialog=page.getByRole('dialog',{name:'确认拖拽上传',exact:true});
+    await dialog.getByText('目标：我的网盘',{exact:true}).waitFor();
+    await dialog.getByText('共 2 项 · 1 个目录',{exact:true}).waitFor();
+    assert.equal(await app.evaluate(() => globalThis.dropCalls.filter(row => row.method === 'upload').length),0);
+    await dialog.getByRole('button',{name:'确认上传',exact:true}).click();
+    await page.getByRole('heading',{name:'传输任务',exact:true}).waitFor();
+    assert.deepEqual(await app.evaluate(() => globalThis.dropCalls.find(row => row.method === 'upload').params),{sources:[localFile,localFolder],parent:'0'});
+    await page.getByRole('button',{name:'我的文件',exact:true}).click();await child.click();
+    await page.getByText('暂无文件',{exact:true}).waitFor();
+    await nativeDrop(page.locator('.file-list'),[localFile]);
+    await dialog.getByText('目标：我的网盘 / 当前列表里的子目录',{exact:true}).waitFor();
+    await dialog.getByRole('button',{name:'确认上传',exact:true}).click();
+    await page.getByRole('heading',{name:'传输任务',exact:true}).waitFor();
+    const uploads=await app.evaluate(() => globalThis.dropCalls.filter(row => row.method === 'upload').map(row => row.params));
+    assert.deepEqual(uploads,[{sources:[localFile,localFolder],parent:'0'},{sources:[localFile],parent:'folder'}]);
+    await session.detach();
+  } finally {await app.close();await rm(directory,{recursive:true,force:true});}
 });

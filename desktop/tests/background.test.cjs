@@ -77,6 +77,7 @@ async function runtime(closeBehavior='tray') {
   const electron=fakeTrayApi(),app=new EventEmitter(),ipc=new Map(),windows=[];
   app.requestSingleInstanceLock=() => true;app.whenReady=async () => {};
   app.isPackaged=false;app.getAppPath=() => path.resolve(__dirname,'..');
+  app.getVersion=() => '0.5.12';
   app.quit=() => {
     if(app.quitted) return;
     const event={preventDefault(){this.prevented=true;}};app.emit('before-quit',event);

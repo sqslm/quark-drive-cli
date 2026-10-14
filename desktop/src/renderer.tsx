@@ -43,6 +43,7 @@ function NavigationIcon({name}:{name:string}) {
 function App() {
   const toast = useFeedback();
   const [page, setPage] = useState('drive');
+  const [clientVersion,setClientVersion] = useState('');
   const [appearanceSource,setAppearanceSource] = useState<AppearanceSource>('system');
   const [appearanceSaving,setAppearanceSaving] = useState(false);
   const [clientSettings,setClientSettings] = useState<ClientSettings>({closeBehavior:'tray',notifications:true});
@@ -277,6 +278,7 @@ function App() {
     void action(async () => {
       const hello = await call('hello');
       if (hello.protocol !== 1) throw new Error('后端协议版本不支持');
+      setClientVersion(hello.client_version || '');
       setPreferences(hello.preferences); setThreads(String(hello.preferences.connections)); setRate(String(hello.preferences.limit_rate ? Math.max(.01, hello.preferences.limit_rate / 1048576) : 0));
       setSignedIn(hello.signed_in !== false);
       setExtensionGroups(hello.extension_groups || {});
@@ -464,7 +466,7 @@ function App() {
       notify(result.warning || '登录成功',result.warning ? 'warning' : 'success');
     } else {if(signedIn) void loadFavorites();if(result?.cancelled) notify(signedIn ? '登录已取消，原账号保持不变' : '登录已取消');}
   }
-  return <><div className="titlebar"><img src={logo} alt=""/><span>夸克网盘客户端</span></div><div className="app" inert={quitting || !!dropUpload} onKeyDown={shortcut} onDragOver={event => {if(fileDrag(event)) {event.preventDefault();event.dataTransfer.dropEffect='none';}}} onDrop={event => {if(fileDrag(event)) {event.preventDefault();clearDrag();notify('请把文件或目录拖入我的文件列表','warning');}}}>
+  return <><div className="titlebar"><img src={logo} alt=""/><span>夸克网盘客户端{clientVersion && <small className="client-version">v{clientVersion}</small>}</span></div><div className="app" inert={quitting || !!dropUpload} onKeyDown={shortcut} onDragOver={event => {if(fileDrag(event)) {event.preventDefault();event.dataTransfer.dropEffect='none';}}} onDrop={event => {if(fileDrag(event)) {event.preventDefault();clearDrag();notify('请把文件或目录拖入我的文件列表','warning');}}}>
     <aside><div className="brand"><img className="brand-logo" src={logo} alt=""/><div>夸克网盘<small>桌面客户端</small></div></div>
       <nav aria-label="主导航">{[['drive','我的文件'],['share','分享链接'],['shares','我的分享'],['recycle','回收站'],['tasks','传输任务'],['settings','设置']].map(([key,label]) =>
         <button key={key} className={page === key ? 'nav active' : 'nav'} aria-current={page === key ? 'page' : undefined} onClick={() => { cancelSearch(); setPage(key); if(key === 'drive' && share) void browse([['0','我的网盘']]); }}><NavigationIcon name={key}/>{label}{key === 'tasks' && tasks.length > 0 && <span>{tasks.length}</span>}</button>)}</nav>
