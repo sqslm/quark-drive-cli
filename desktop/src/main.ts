@@ -192,6 +192,17 @@ app.whenReady().then(async () => {
     const result = await dialog.showOpenDialog(window, { properties: ['openFile', 'multiSelections'] });
     return result.canceled ? [] : result.filePaths;
   });
+  ipcMain.handle('quark:dropped-files',async (event,values) => {
+    trusted(event);
+    if(!Array.isArray(values) || !values.length || values.some(value => typeof value !== 'string' || !path.isAbsolute(value))) throw new Error('拖入的项目必须是本地文件或目录');
+    return Promise.all([...new Set<string>(values)].map(async value => {
+      let info;
+      try {info=await stat(value);}
+      catch {throw new Error('拖入的项目不存在或无法访问，请重新选择');}
+      if(!info.isFile() && !info.isDirectory()) throw new Error('只能上传文件或目录');
+      return {path:value,name:path.basename(value),directory:info.isDirectory()};
+    }));
+  });
   startBackend();
   ipcMain.handle('quark:copy-text', (event, text: string) => {
     trusted(event);

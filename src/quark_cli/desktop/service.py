@@ -439,6 +439,7 @@ class DesktopService:
                 paths = RemotePaths(Files(client))
                 parent = paths.resolve(parent, directory=True).fid
                 target = paths.absolute_path(parent).rstrip("/")
+                operations = FileOperations(client)
                 for source in sources:
                     if not source.exists():
                         raise UsageError("上传来源不存在")
@@ -448,7 +449,7 @@ class DesktopService:
                         transfer = RecursiveTransfer(client)
                         _, state_path, _ = transfer._state("upload", str(source), parent, source.name)
                         if not state_path.exists():
-                            FileOperations(client).available(parent, source.name)
+                            operations.available(parent, source.name)
                     tasks.append({"id":uuid.uuid4().hex,"name":source.name,"state":"waiting","detail":"",
                         "target":target + "/" + source.name,"request":request,"valid":True,"revision":0,
                         "context":context,"direction":"upload","_cancel":threading.Event(),"share_url":""})

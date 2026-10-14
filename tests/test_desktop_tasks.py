@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -98,6 +99,26 @@ class QueueTests(unittest.TestCase):
         later = [message for message in self.messages if message.get('event') == 'batch.finished'][-1]['data']
         self.assertNotEqual(later['batch_id'], finished[0]['data']['batch_id'])
         self.assertEqual(later['counts']['done'], 1)
+
+    def test_mixed_upload_preflight_reads_target_listing_once_for_multiple_folders(self):
+        from quark_cli.downloader.worker import DriveBackend
+        from tests.test_desktop_files import Drive
+        from tests.test_downloader_worker import COOKIE
+        drive=Drive([])
+        backend=DriveBackend(lambda:COOKIE,transport=drive.transport())
+        service=DesktopService(self.messages.append,backend=backend,directory=Path(self.tmp.name)/'upload-state')
+        self.addCleanup(service.shutdown)
+        service.saved_cookie=COOKIE
+        sources=[Path(self.tmp.name)/name for name in ('资料一','资料二','文件.txt')]
+        sources[0].mkdir();sources[1].mkdir();sources[2].write_text('payload',encoding='utf8')
+        with patch.object(service,'start_tasks'), patch('quark_cli.recursive.config_directory',return_value=Path(self.tmp.name)/'checkpoints'):
+            result=service.dispatch('upload','upload',{'sources':[str(source) for source in sources],'parent':'0'},None)
+        self.assertEqual(len(result),3)
+        self.assertEqual([task['request'].recursive for task in service.tasks],[True,True,False])
+        listings=[request for request in drive.requests if request.url.path.endswith('file/sort')]
+        self.assertEqual(len(listings),1)
+        self.assertEqual(listings[0].url.params['pdir_fid'],'0')
+        self.assertEqual(drive.writes,[])
 
     def test_shutdown_waits_for_active_cleanup_and_persists_queued_pause(self):
         self.queue('active')

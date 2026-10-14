@@ -9,6 +9,7 @@ export type AppearanceSource = 'system'|'dark'|'light';
 export type Appearance = {source:AppearanceSource;dark:boolean;warning:string};
 export type ClientSettings = {closeBehavior:'tray'|'quit';notifications:boolean};
 export type ClientSettingsResult = {settings:ClientSettings;warning:string};
+export type LocalUploadItem = {path:string;name:string;directory:boolean};
 export const METHODS = ['hello','account','browse','locate','search','search.cancel','share.parse','share.open','share.browse',
   'preferences.save','login','login.cancel','download','download.stop','tasks','tasks.retry',
   'file.info','file.mkdir','file.rename','file.move','file.delete','upload','tasks.cancel','tasks.clear','tasks.authorize',
@@ -20,6 +21,7 @@ export interface Bridge {
   onEvent(listener: (event: Event) => void): () => void;
   chooseFolder(): Promise<string | null>;
   chooseFiles(): Promise<string[]>;
+  readDroppedFiles(files:File[]):Promise<LocalUploadItem[]>;
   openFolder(path: string): Promise<void>;
   copyText(text: string): Promise<void>;
   getAppearance():Promise<Appearance>;

@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { Bridge, Event, Method, METHODS } from './types';
 const bridge: Bridge = {
   call(method: Method, params = {}, id = crypto.randomUUID()) {
@@ -12,6 +12,11 @@ const bridge: Bridge = {
   },
   chooseFolder: () => ipcRenderer.invoke('quark:choose-folder'),
   chooseFiles: () => ipcRenderer.invoke('quark:choose-files'),
+  readDroppedFiles:files => {
+    const paths=files.map(file => webUtils.getPathForFile(file));
+    if(!paths.length || paths.some(value => !value)) return Promise.reject(new Error('请拖入本地文件或目录'));
+    return ipcRenderer.invoke('quark:dropped-files',paths);
+  },
   openFolder: (path) => ipcRenderer.invoke('quark:open-folder', path),
   copyText: (text) => ipcRenderer.invoke('quark:copy-text', text),
   getAppearance: () => ipcRenderer.invoke('quark:appearance.get'),

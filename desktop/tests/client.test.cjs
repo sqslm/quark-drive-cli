@@ -31,6 +31,12 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
       let clientSettings={closeBehavior:'tray',notifications:true};
       matchMedia('(prefers-color-scheme: dark)').addEventListener('change',event => {if(appearanceSource === 'system') listeners.forEach(listener => listener({id:null,event:'appearance',data:{source:'system',dark:event.matches,warning:''}}));});
       window.quark = {
+        readDroppedFiles:async files => {
+          window.testDropReads=(window.testDropReads || 0)+1;
+          if(window.testHoldDrop) await new Promise(resolve => {window.releaseDrop=resolve;});
+          if(window.testDropFailure) throw new Error('拖入项目无法访问');
+          return files.map(file => ({path:'C:\\Dropped\\'+file.name,name:file.name,directory:file.name.endsWith('目录')}));
+        },
         getClientSettings:async () => ({settings:clientSettings,warning:''}),
         setClientSettings:async settings => {clientSettings=settings;window.testCalls.push({method:'desktop.set',params:settings});return {settings,warning:window.testClientSettingsWarning ? '后台运行设置已生效，但未能保存；本次窗口内有效' : ''};},
         quit:async () => {listeners.forEach(listener => listener({id:null,event:'desktop.quitting',data:true}));},
@@ -80,15 +86,26 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
           if(method === 'share.save') return window.testSaveUnknown ? {saved:false,result:'unknown',detail:'结果未确认，请核实目标目录'} : {saved:true,item_count:params.entries.length,destination_path:'/'};
           if(method === 'preferences.save') return { preferences:params, persisted:!window.testSaveWarning, warning:window.testSaveWarning ? '设置仅在窗口内有效' : '' };
           if(method === 'download') { tasks.push({ id:'task', name: params.entries[0].name, state:'waiting', detail:'', target:'C:\\Downloads\\test.txt', valid:true,direction:'download',revision:1 }); return tasks.map(task => ({...task})); }
-          if(method === 'upload') { tasks.push({ id:'upload-task',name:'测试.txt',state:'waiting',detail:'',target:'/测试.txt',valid:true,direction:'upload',revision:1 }); return tasks.map(task => ({...task})); }
+          if(method === 'upload') {
+            if(window.testHoldUpload) await new Promise(resolve => {window.releaseUpload=resolve;});
+            params.sources.forEach(source => {const name=source.split('\\').at(-1);tasks.push({id:'upload-'+tasks.length,name,state:'waiting',detail:'',target:'/'+name,valid:true,direction:'upload',revision:1});});
+            return tasks.map(task => ({...task}));
+          }
           if(method === 'tasks.cancel') { tasks = tasks.map(task => params.ids.includes(task.id) ? {...task,state:'cancelled',revision:task.revision+1} : task); return tasks.map(task => ({...task})); }
           if(method === 'download.stop') { tasks = tasks.map(task => task.state === 'cancelled' ? task : {...task,state:'stopped',revision:task.revision+1}); tasks.forEach(task => listeners.forEach(callback => callback({id:null,event:'task',data:task}))); listeners.forEach(callback => callback({id:null,event:'batch.finished',data:{stopped:true}})); return true; }
           if(method === 'login') throw new Error('登录服务暂时不可用');
           return [];
         }
       };
+      window.testEmit=event => listeners.forEach(listener => listener(event));
     });
     await page.goto(`http://127.0.0.1:${server.address().port}/main_window/index.html`);
+    async function dragData(names) {
+      return page.evaluateHandle(names => {const data=new DataTransfer();names.forEach(name => data.items.add(new File(['payload'],name)));return data;},names);
+    }
+    async function drop(names) {
+      const data=await dragData(names);await page.locator('.file-list').dispatchEvent('drop',{dataTransfer:data});await data.dispose();
+    }
     await page.getByText('显示 10000 项', { exact: true }).waitFor();
     assert.ok(await page.locator('.file-row').count() < 60);
     const listBefore=await page.locator('.file-scroll').evaluate(element => ({height:element.scrollHeight,rowY:element.querySelector('.file-row').getBoundingClientRect().y}));
@@ -377,6 +394,74 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByText('已取消',{exact:true}).waitFor();
     await page.getByRole('button',{name:'暂停全部',exact:true}).click();
     await page.getByText('已暂停',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'我的文件',exact:true}).click();
+    const uploadsBefore=await page.evaluate(() => window.testCalls.filter(call => call.method === 'upload').length);
+    const readsBefore=await page.evaluate(() => window.testDropReads || 0);
+    await drop(['搜索视图.txt']);
+    await page.locator('.toast.warning').getByText('请先返回网盘目录，再拖入文件上传',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(() => window.testDropReads || 0),readsBefore);
+    await page.getByRole('button',{name:'返回目录',exact:true}).click();
+    const hover=await dragData(['拖拽.txt','资料目录']);
+    const beforeDrag=await page.locator('.file-scroll').evaluate(element => ({height:element.scrollHeight,rowY:element.querySelector('.file-row').getBoundingClientRect().y}));
+    await page.locator('.file-list').dispatchEvent('dragenter',{dataTransfer:hover});
+    await page.getByText('松开鼠标，准备上传',{exact:true}).waitFor();
+    const duringDrag=await page.locator('.file-scroll').evaluate(element => ({height:element.scrollHeight,rowY:element.querySelector('.file-row').getBoundingClientRect().y}));
+    assert.deepEqual(duringDrag,beforeDrag);
+    await page.locator('.file-row').first().dispatchEvent('dragenter',{dataTransfer:hover});
+    await page.locator('.file-row').first().dispatchEvent('dragleave',{dataTransfer:hover});
+    assert.ok(await page.locator('.drop-overlay').isVisible());
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/drop-overlay.png')});
+    await page.locator('.file-list').dispatchEvent('dragleave',{dataTransfer:hover});
+    assert.equal(await page.locator('.drop-overlay').count(),0);await hover.dispose();
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'upload').length),uploadsBefore);
+    await drop(['拖拽.txt','资料目录']);
+    const dropDialog=page.getByRole('dialog',{name:'确认拖拽上传',exact:true});
+    await dropDialog.getByText('目标：我的网盘',{exact:true}).waitFor();
+    await dropDialog.getByText('共 2 项 · 1 个目录',{exact:true}).waitFor();
+    assert.equal(await page.locator('.app').evaluate(element => element.inert),true);
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/drop-confirmation.png')});
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'upload').length),uploadsBefore);
+    await dropDialog.getByRole('button',{name:'取消',exact:true}).click();
+    await page.evaluate(() => {window.testHoldDrop=true;});
+    await drop(['迟到.txt']);await dropDialog.getByText('正在读取拖入项目…',{exact:true}).waitFor();
+    await dropDialog.getByRole('button',{name:'取消',exact:true}).click();
+    await page.evaluate(() => {window.testHoldDrop=false;window.releaseDrop();});
+    await page.waitForTimeout(20);assert.equal(await dropDialog.count(),0);
+    await page.evaluate(() => {window.testDropFailure=true;});
+    await drop(['失效.txt']);await page.locator('.toast.error').getByText('拖入项目无法访问',{exact:true}).waitFor();
+    assert.equal(await dropDialog.count(),0);await page.evaluate(() => {window.testDropFailure=false;});
+    await drop(['拖拽.txt','资料目录']);
+    await page.evaluate(() => {window.testHoldUpload=true;});
+    await dropDialog.getByRole('button',{name:'确认上传',exact:true}).click();
+    assert.ok(await dropDialog.getByRole('button',{name:'正在加入队列…',exact:true}).isDisabled());
+    assert.ok(await dropDialog.getByRole('button',{name:'取消',exact:true}).isDisabled());
+    await page.evaluate(() => window.testEmit({id:null,event:'navigate',data:'tasks'}));
+    assert.ok(await dropDialog.isVisible());
+    await page.evaluate(() => {window.testHoldUpload=false;window.releaseUpload();});
+    await page.getByText('拖拽.txt',{exact:true}).waitFor();
+    assert.equal(await dropDialog.count(),0);
+    const mixed=await page.evaluate(() => window.testCalls.filter(call => call.method === 'upload').at(-1).params);
+    assert.deepEqual(mixed,{sources:['C:\\Dropped\\拖拽.txt','C:\\Dropped\\资料目录'],parent:'0'});
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'upload').length),uploadsBefore+1);
+    await page.getByRole('button',{name:'我的文件',exact:true}).click();
+    const savesBeforeAppend=await page.evaluate(() => window.testCalls.filter(call => call.method === 'preferences.save').length);
+    await drop(['追加.txt']);await dropDialog.getByRole('button',{name:'确认上传',exact:true}).click();
+    await page.getByText('追加.txt',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'preferences.save').length),savesBeforeAppend);
+    await page.getByRole('button',{name:'暂停全部',exact:true}).click();
+    await page.getByRole('button',{name:'我的文件',exact:true}).click();
+    await page.locator('.file-row').getByRole('button',{name:'新建测试',exact:true}).click();
+    await drop(['子目录上传.txt']);await dropDialog.getByText('目标：我的网盘 / 新建测试',{exact:true}).waitFor();
+    await dropDialog.getByRole('button',{name:'确认上传',exact:true}).click();
+    await page.getByText('子目录上传.txt',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'upload').at(-1).params.parent),'new');
+    await page.getByRole('button',{name:'暂停全部',exact:true}).click();
+    await page.getByRole('button',{name:'我的文件',exact:true}).click();
+    await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'我的网盘',exact:true}).click();
+    await drop(Array.from({length:61},(_,index) => `批量${index}.txt`));
+    await dropDialog.getByText('另有 11 项，确认后全部加入队列。',{exact:true}).waitFor();
+    assert.equal(await dropDialog.locator('li').count(),50);
+    await page.keyboard.press('Escape');assert.equal(await dropDialog.count(),0);
     await page.getByRole('button', { name:'分享链接', exact:true }).click();
     await page.getByLabel('分享链接或文案').fill('https://pan.quark.cn/s/abcdef 提取码 1234');
     await page.getByLabel('提取码', { exact:true }).click();
@@ -384,6 +469,10 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button', { name:'打开分享', exact:true }).click();
     const opened = await page.evaluate(() => window.testCalls.find(call => call.method === 'share.open'));
     assert.equal(opened.params.passcode, '5678');
+    const beforeShareDrop=await page.evaluate(() => window.testDropReads || 0);
+    await drop(['分享不能上传.txt']);
+    await page.locator('.toast.warning').getByText('分享文件为只读，请进入我的文件上传',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(() => window.testDropReads || 0),beforeShareDrop);
     await page.getByLabel('选择 知否 00001.txt',{exact:true}).check();
     await page.getByRole('button',{name:'永久转存到网盘',exact:true}).click();
     await page.getByRole('button',{name:'确认永久转存',exact:true}).click();
@@ -421,6 +510,9 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByText('登录后浏览和管理网盘文件',{exact:true}).waitFor();
     assert.equal(await page.locator('.file-row').count(),0);
     assert.ok(await page.getByRole('button',{name:'新建目录',exact:true}).isDisabled());
+    const beforeSignedOutDrop=await page.evaluate(() => window.testDropReads || 0);
+    await drop(['未登录不能上传.txt']);await page.locator('.toast.warning').getByText('请先登录后上传',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(() => window.testDropReads || 0),beforeSignedOutDrop);
     await page.getByRole('button',{name:'登录账号',exact:true}).first().click();
     await page.getByRole('button',{name:'扫码登录',exact:true}).click();
     await page.locator('.toast.error').getByText('登录服务暂时不可用',{exact:true}).waitFor();
@@ -443,6 +535,24 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     const page = await app.firstWindow();
     await page.getByRole('heading', { name:'我的文件' }).waitFor();
     const hello = await page.evaluate(() => window.quark.call('hello'));
+    await assert.rejects(page.evaluate(() => window.quark.readDroppedFiles([new File(['payload'],'网页生成.txt')])),/本地文件/);
+    const localDropFile=path.join(directory,'本地拖拽.txt'),localDropFolder=path.join(directory,'本地目录');
+    await writeFile(localDropFile,'payload','utf8');await mkdir(localDropFolder);await writeFile(path.join(localDropFolder,'内部文件.txt'),'nested','utf8');
+    await page.evaluate(() => {
+      const target=document.createElement('div');target.id='native-drop-test';target.textContent='本地拖拽路径验证';target.style.cssText='position:fixed;left:260px;top:260px;width:300px;height:160px;z-index:200;background:#eef3ff';
+      for(const type of ['dragenter','dragover']) target.addEventListener(type,event => {event.preventDefault();event.dataTransfer.dropEffect='copy';});
+      target.addEventListener('drop',event => {event.preventDefault();event.stopPropagation();window.realDropFiles=Array.from(event.dataTransfer.files);window.nativeDropResult=window.quark.readDroppedFiles(window.realDropFiles);});
+      document.body.append(target);
+    });
+    const dragSession=await page.context().newCDPSession(page);
+    for(const type of ['dragEnter','dragOver','drop']) await dragSession.send('Input.dispatchDragEvent',{type,x:350,y:330,data:{items:[],files:[localDropFile,localDropFolder],dragOperationsMask:1}});
+    const nativeDropped=await page.evaluate(() => window.nativeDropResult);
+    assert.deepEqual(nativeDropped,[{path:localDropFile,name:'本地拖拽.txt',directory:false},{path:localDropFolder,name:'本地目录',directory:true}]);
+    const deduplicated=await page.evaluate(() => window.quark.readDroppedFiles([window.realDropFiles[0],window.realDropFiles[0]]));
+    assert.equal(deduplicated.length,1);
+    await rm(localDropFile);
+    await assert.rejects(page.evaluate(() => window.quark.readDroppedFiles([window.realDropFiles[0]])),/无法访问/);
+    await page.evaluate(() => document.getElementById('native-drop-test').remove());await dragSession.detach();
     assert.deepEqual((await page.evaluate(() => window.quark.getClientSettings())).settings,{closeBehavior:'tray',notifications:true});
     await assert.rejects(page.evaluate(() => window.quark.setClientSettings({closeBehavior:'unknown',notifications:true})),/设置无效/);
     await app.evaluate(({Tray}) => {

@@ -105,6 +105,9 @@ aside{padding-top:28px}.brand{padding-bottom:30px;letter-spacing:.2px}.brand sma
 .setting-slider input:disabled{opacity:.45;cursor:default}.setting-slider span:last-child{min-width:22px;text-align:right}
 .notification-option{display:flex!important;align-items:center;gap:10px}.desktop-options .notification-option input{margin:0;width:15px;height:15px;accent-color:var(--blue)}
 .exit-backdrop{z-index:110}.exit-backdrop .modal{width:420px}
+.drop-overlay{position:absolute;inset:8px;z-index:3;pointer-events:none;border:2px dashed var(--blue);border-radius:10px;background:var(--loading-bg);display:flex;flex-direction:column;justify-content:center;align-items:center;gap:12px;padding:24px;text-align:center;color:var(--accent)}
+.drop-overlay strong{font-size:18px;font-weight:600}.drop-overlay p{color:var(--text);word-break:break-word}.drop-overlay.blocked{border-color:var(--muted);color:var(--text)}
+.drop-items{list-style:none;padding:0;margin:12px 0;max-height:240px;overflow:auto;border-block:1px solid var(--line)}.drop-items li{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--row-line)}.drop-items span{flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.drop-items svg{flex-shrink:0}
 @media(max-width:950px){.transfer-setting{grid-template-columns:1fr 88px}.setting-slider{grid-column:1/-1}.transfer-setting{gap:12px}}
 .settings-section .settings-divider+h2{margin-top:0}
 @media(prefers-reduced-motion:reduce){button{transition:none}}
