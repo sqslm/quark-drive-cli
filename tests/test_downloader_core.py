@@ -305,6 +305,15 @@ class BatchTests(unittest.TestCase):
 
 
 class ProgressTests(unittest.TestCase):
+    def test_upload_preparation_reports_stage_without_zero_percent(self):
+        for phase in ('hashing','hashing_context','authorizing','verifying','merging'):
+            event=ProgressEvent('upload',phase,'报告.bin',0,0,100,0)
+            self.assertIsNone(progress_fraction(event))
+            self.assertNotIn('0 B /',progress_text(event))
+            self.assertIn('报告.bin',progress_text(event))
+        event=ProgressEvent('upload','authorizing','报告.bin',25,25,100,0)
+        self.assertEqual(progress_fraction(event),0.25)
+
     def test_share_preparation_and_cleanup_show_the_current_operation(self):
         for phase, action in (("saving", "正在临时转存"), ("cleaning", "正在清理临时目录")):
             event = ProgressEvent("download", phase, "报告.bin", 0, 0, None, 0.0)

@@ -182,6 +182,94 @@ class QueueTests(unittest.TestCase):
         self.assertNotEqual(later['batch_id'], finished[0]['data']['batch_id'])
         self.assertEqual(later['counts']['done'], 1)
 
+    def test_individual_pause_preserves_queue_and_can_restart(self):
+        self.queue('a');self.assertTrue(self.backend.entered.wait(1));self.queue('b')
+        first=self.service.tasks[0]['id']
+        paused=self.service.dispatch('pause','tasks.pause',{'ids':[first]},None)
+        self.assertTrue(paused[0]['pausing'])
+        self.assertFalse(self.service.stop.is_set())
+        self.backend.release.set();self.wait_idle()
+        self.assertEqual([row['state'] for row in self.service.tasks],['stopped','done'])
+        self.service.dispatch('start','tasks.retry',{'ids':[first]},None);self.wait_idle()
+        self.assertEqual([request.fid for request in self.backend.requests],['a','b','a'])
+        self.assertEqual(self.backend.maximum,1)
+
+    def test_resume_paused_pending_task_never_submits_duplicate_future(self):
+        self.queue('a');self.assertTrue(self.backend.entered.wait(1));self.queue('b')
+        second=self.service.tasks[1]['id']
+        self.service.dispatch('pause','tasks.pause',{'ids':[second]},None)
+        self.assertEqual(self.service.tasks[1]['state'],'stopped')
+        self.service.dispatch('start','tasks.retry',{'ids':[second]},None)
+        self.assertEqual(self.service.pending_count,2)
+        self.backend.release.set();self.wait_idle()
+        self.assertEqual([request.fid for request in self.backend.requests],['a','b'])
+        self.assertEqual(self.backend.maximum,1)
+
+    def test_restarting_paused_task_during_other_transfer_counts_each_record_once(self):
+        second_entered=threading.Event();second_release=threading.Event()
+        self.addCleanup(second_release.set)
+        original=self.backend.download
+        def download(request,progress,stopped):
+            if request.fid == 'b':
+                second_entered.set();second_release.wait(3)
+            return original(request,progress,stopped)
+        self.backend.download=download
+        self.queue('a');self.assertTrue(self.backend.entered.wait(1));self.queue('b')
+        first=self.service.tasks[0]['id']
+        self.service.dispatch('pause','tasks.pause',{'ids':[first]},None)
+        self.backend.release.set();self.assertTrue(second_entered.wait(1))
+        self.service.dispatch('restart','tasks.retry',{'ids':[first]},None)
+        second_release.set();self.wait_idle()
+        self.assertEqual([request.fid for request in self.backend.requests],['a','b','a'])
+        finished=[message for message in self.messages if message.get('event') == 'batch.finished']
+        self.assertEqual(len(finished),1)
+        self.assertEqual(finished[0]['data']['counts']['done'],2)
+
+    def test_remove_running_and_pending_records_waits_for_safe_stop_and_retains_files(self):
+        self.queue('a');self.assertTrue(self.backend.entered.wait(1));self.queue('b');self.queue('c')
+        first,second,third=[task['id'] for task in self.service.tasks]
+        local=Path(self.tmp.name)/'a.txt';local.write_text('retain me',encoding='utf8')
+        before=len(self.messages)
+        result=self.service.dispatch('remove','tasks.remove',{'ids':[first,second]},None)
+        self.assertEqual([task['id'] for task in result],[first,third])
+        self.assertTrue(result[0]['removing']);self.assertTrue(self.service.busy)
+        self.backend.release.set();self.wait_idle()
+        self.assertEqual([task['id'] for task in self.service.tasks],[third])
+        self.assertEqual([request.fid for request in self.backend.requests],['a','c'])
+        self.assertEqual(local.read_text('utf8'),'retain me')
+        self.assertFalse(any(message.get('event') == 'task' and message['data']['id'] in (first,second) for message in self.messages[before:]))
+        stored=json.loads(self.service.task_store.path.read_text('utf8'))
+        self.assertEqual([task['id'] for task in stored['tasks']],[third])
+        self.service.dispatch('remove-done','tasks.remove',{'ids':[third]},None)
+        self.assertEqual(self.service.tasks,[])
+        self.assertEqual(local.read_text('utf8'),'retain me')
+
+    def test_empty_retry_ids_does_not_restart_other_tasks(self):
+        self.queue('a');self.assertTrue(self.backend.entered.wait(1))
+        self.service.dispatch('pause','tasks.pause',{'ids':[self.service.tasks[0]['id']]},None)
+        self.backend.release.set();self.wait_idle()
+        from quark_cli.errors import UsageError
+        with self.assertRaises(UsageError):
+            self.service.dispatch('empty','tasks.retry',{'ids':[]},None)
+        self.assertEqual(len(self.backend.requests),1)
+
+    def test_remove_response_precedes_final_cleanup_event(self):
+        self.queue('a');self.assertTrue(self.backend.entered.wait(1))
+        identifier=self.service.tasks[0]['id']
+        dispatch=self.service.dispatch
+        def delayed_dispatch(*args):
+            result=dispatch(*args)
+            self.backend.release.set()
+            threading.Event().wait(0.04)
+            return result
+        with patch.object(self.service,'dispatch',side_effect=delayed_dispatch):
+            self.service.execute('remove','tasks.remove',{'ids':[identifier]})
+        self.wait_idle()
+        response=next(index for index,item in enumerate(self.messages) if item.get('id') == 'remove')
+        final=next(index for index,item in enumerate(self.messages) if item.get('event') == 'tasks.changed' and item['data'] == [])
+        self.assertLess(response,final)
+
+
     def test_mixed_upload_preflight_reads_target_listing_once_for_multiple_folders(self):
         from quark_cli.downloader.worker import DriveBackend
         from tests.test_desktop_files import Drive

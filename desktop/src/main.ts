@@ -79,7 +79,7 @@ function startBackend() {
       } else if (pending.has(message.id)) {
         const job = pending.get(message.id)!; pending.delete(message.id);
         if (message.error) job.reject(new Error(message.error)); else {
-          if(['tasks','download','upload','tasks.retry','tasks.cancel','tasks.clear','tasks.authorize'].includes(job.method)) background?.snapshot(message.result);
+          if(['tasks','download','upload','tasks.retry','tasks.cancel','tasks.pause','tasks.remove','tasks.clear','tasks.authorize'].includes(job.method)) background?.snapshot(message.result);
           job.resolve(message.result);
         }
       }

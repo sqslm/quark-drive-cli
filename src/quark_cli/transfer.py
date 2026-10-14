@@ -32,6 +32,7 @@ from .paths import RemotePaths, Scope, is_directory, valid_fid, validate_name
 from .state import private_path
 from .transfer_progress import Progress, ProgressEvent, RateLimiter
 from .transfer_state import CALLBACK_FIELDS, DownloadLedger, UploadLedger, safe_local_path, valid_version
+from .sha1_context import chaining_words
 
 
 # QuarkPan's MIT-licensed upload reference uses 4 MiB parts when the server
@@ -163,7 +164,11 @@ class _SHA1State:
     def update_aligned(self, data: bytes) -> None:
         if len(data) % 64:
             raise RemoteError("服务端分片大小不能生成有效的 SHA-1 增量上下文")
+        native = chaining_words(self.h, self.length, data)
         self.length += len(data)
+        if native is not None:
+            self.h = native
+            return
         for start in range(0, len(data), 64):
             block = data[start : start + 64]
             words = [int.from_bytes(block[index : index + 4], "big") for index in range(0, 64, 4)]
@@ -201,9 +206,8 @@ class _SHA1State:
         return base64.b64encode(encoded).decode("ascii")
 
 
-def _part_contexts(path: Path, size: int, part_size: int, count: int) -> dict[int, str]:
-    """Compute every later part's SHA-1 continuation state in one pass."""
-    contexts: dict[int, str] = {}
+def _part_contexts(path: Path, size: int, part_size: int, count: int, check_stop=lambda: None) -> Iterator[str]:
+    """Compute later states on demand, after the first PUT, in one pass."""
     state = _SHA1State()
     try:
         with path.open("rb") as source:
@@ -213,6 +217,7 @@ def _part_contexts(path: Path, size: int, part_size: int, count: int) -> dict[in
                 if remaining % 64:
                     raise RemoteError("服务端分片边界不能生成有效的 SHA-1 增量上下文")
                 while remaining:
+                    check_stop()
                     block = source.read(min(STREAM_CHUNK_SIZE, remaining))
                     if not block:
                         raise LocalIOError("上传文件在读取期间发生变化")
@@ -220,8 +225,7 @@ def _part_contexts(path: Path, size: int, part_size: int, count: int) -> dict[in
                     # aligned. STREAM_CHUNK_SIZE is also block aligned.
                     state.update_aligned(block)
                     remaining -= len(block)
-                contexts[part_number + 1] = state.context()
-        return contexts
+                yield state.context()
     except OSError:
         raise LocalIOError("读取本地上传文件失败") from None
 
@@ -483,6 +487,9 @@ class Transfer:
         parent = valid_fid(parent)
         pacing = _limiter(limit_rate, limiter)
         ledger = UploadLedger({"source": str(path), "parent": parent, "name": name}, directory=self.state_dir)
+        meter = Progress("upload", name, None, pacing, progress)
+        meter.connections = 0
+        meter.emit("hashing", force=True)
         with ledger.lock:
             local = self._fingerprint(path, should_stop=should_stop) if should_stop is not None else self._fingerprint(path)
             if local["size"] == 0:
@@ -520,7 +527,7 @@ class Transfer:
                         "upload_task_id": None, "finish_task_id": None, "final_fid": None, "final_identity": None, "callback_warning": False,
                         "created_at": now, "updated_at": now}
                 ledger.persist(data)
-            meter = Progress("upload", name, local["size"], pacing, progress)
+            meter.total = local["size"]
             if data["phase"] == "flash_confirmed":
                 return self._finish_flash(data, ledger, meter, scope, resumed, resume)
             if resumed:
@@ -533,6 +540,7 @@ class Transfer:
                 data["phase"] = "pre_submitting"
                 ledger.persist(data)
                 now_ms = int(time.time() * 1000)
+                meter.emit("authorizing", force=True)
                 pre = _data(self._post("file/upload/pre", {"ccp_hash_update": True, "parallel_upload": True,
                     "pdir_fid": parent, "dir_name": "", "size": local["size"], "file_name": name,
                     "format_type": mimetypes.guess_type(name)[0] or "application/octet-stream",
@@ -568,6 +576,7 @@ class Transfer:
                     offset, length = (number - 1) * size, min(size, max(0, local["size"] - (number - 1) * size))
                     data["parts"].append({"number": number, "offset": offset, "length": length,
                                           "md5": self._part_md5(path, offset, length), "etag": None, "confirmed": False})
+                meter.emit("hashing", force=True)
                 if self._fingerprint(path) != local:
                     raise LocalIOError("预上传期间本地文件发生变化")
                 data["phase"] = "pre_confirmed"
@@ -579,6 +588,7 @@ class Transfer:
                 self._parent(parent, scope, data["scope_fid"])
                 data["phase"] = "hash_submitting"
                 ledger.persist(data)
+                meter.emit("authorizing", force=True)
                 hashed = _data(self._post("file/update/hash", {"task_id": task_id, "md5": local["md5"], "sha1": local["sha1"]},
                                          "确认上传哈希"), "上传哈希")
                 if not isinstance(hashed, dict) or ("finish" in hashed and type(hashed["finish"]) is not bool):
@@ -609,16 +619,21 @@ class Transfer:
                 meter.transferred = meter.confirmed
                 meter.confirmed_parts = sum(part["confirmed"] for part in data["parts"])
                 meter.emit("resuming" if resumed else "starting", force=True)
-                contexts = _part_contexts(path, local["size"], upload["part_size"], part_count) if part_count > 1 else {}
+                contexts = _part_contexts(path, local["size"], upload["part_size"], part_count, check_stop)
                 for part in data["parts"]:
                     check_stop()
+                    if part["number"] > 1:
+                        meter.emit("hashing_context", force=True)
+                    hash_context = next(contexts) if part["number"] > 1 else None
                     if part["confirmed"]:
                         continue
                     self._parent(parent, scope, data["scope_fid"])
-                    if self._fingerprint(path) != local:
+                    current = safe_local_path(path).stat()
+                    if (current.st_size, current.st_mtime_ns, current.st_dev, current.st_ino) != (local["size"], local["mtime_ns"], local["device"], local["inode"]):
                         raise LocalIOError("上传源文件发生变化；未继续上传")
+                    meter.emit("authorizing", force=True)
                     url, headers = self._upload_auth(**self._auth_options(upload), part_number=part["number"],
-                                                    hash_context=contexts.get(part["number"]))
+                                                    hash_context=hash_context)
                     headers["Content-Length"] = str(part["length"])
                     confirmed_before = meter.confirmed
                     def blocks() -> Iterator[bytes]:
@@ -631,6 +646,7 @@ class Transfer:
                                 meter.transferred += len(chunk)
                                 meter.emit("transferring")
                                 yield chunk
+                    meter.connections = 1
                     response = self._storage_request("PUT", url, content=blocks() if part["length"] else b"", headers=headers)
                     if response.status_code != 200:
                         raise RemoteError(f"对象存储拒绝第 {part['number']} 个分片（HTTP {response.status_code}）")
@@ -643,7 +659,8 @@ class Transfer:
                     meter.confirmed_parts += 1
                     meter.emit("part_confirmed", force=True)
                 check_stop()
-                if self._fingerprint(path) != local:
+                meter.emit("verifying", force=True)
+                if self._fingerprint(path, should_stop=should_stop) != local:
                     raise LocalIOError("上传期间本地文件发生变化；未合并")
                 root = ET.Element("CompleteMultipartUpload")
                 for part in sorted(data["parts"], key=lambda item: item["number"]):
@@ -655,6 +672,7 @@ class Transfer:
                 self._parent(parent, scope, data["scope_fid"])
                 data["phase"] = "merge_submitting"
                 ledger.persist(data)
+                meter.emit("merging", force=True)
                 response = self._storage_request("POST", url, content=complete, headers=headers)
                 _check_merge(response)
                 data["callback_warning"] = response.status_code == 203
@@ -662,7 +680,8 @@ class Transfer:
                 ledger.persist(data)
             if data["phase"] == "merge_confirmed":
                 check_stop()
-                if self._fingerprint(path) != local:
+                meter.emit("verifying", force=True)
+                if self._fingerprint(path, should_stop=should_stop) != local:
                     raise LocalIOError("上传源文件发生变化；未确认完成")
                 self._parent(parent, scope, data["scope_fid"])
                 data["phase"] = "finish_submitting"

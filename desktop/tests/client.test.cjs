@@ -47,7 +47,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.14',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.15',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
@@ -85,14 +85,16 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
           if(method === 'recycle.remove' || method === 'recycle.restore') {recycle=recycle.filter(row => !params.entries.some(entry => entry.record_id === row.record_id));return params.entries.map(row => ({name:row.name,state:'done',detail:method === 'recycle.remove' ? '已永久删除' : '已恢复到原目录'}));}
           if(method === 'share.save') return window.testSaveUnknown ? {saved:false,result:'unknown',detail:'结果未确认，请核实目标目录'} : {saved:true,item_count:params.entries.length,destination_path:'/'};
           if(method === 'preferences.save') return { preferences:params, persisted:!window.testSaveWarning, warning:window.testSaveWarning ? '设置仅在窗口内有效' : '' };
-          if(method === 'download') { tasks.push({ id:'task', name: params.entries[0].name, state:'waiting', detail:'', target:'C:\\Downloads\\test.txt', valid:true,direction:'download',revision:1 }); return tasks.map(task => ({...task})); }
+          if(method === 'download') { tasks.push({ id:'task', name: params.entries[0].name, state:'waiting', detail:'', target:'C:\\Downloads\\test.txt', valid:true,direction:'download',revision:1,scheduled:true }); return tasks.map(task => ({...task})); }
           if(method === 'upload') {
             if(window.testHoldUpload) await new Promise(resolve => {window.releaseUpload=resolve;});
-            params.sources.forEach(source => {const name=source.split('\\').at(-1);tasks.push({id:'upload-'+tasks.length,name,state:'waiting',detail:'',target:'/'+name,valid:true,direction:'upload',revision:1});});
+            params.sources.forEach(source => {const name=source.split('\\').at(-1);tasks.push({id:'upload-'+tasks.length,name,state:'waiting',detail:'',target:'/'+name,valid:true,direction:'upload',revision:1,scheduled:true});});
             return tasks.map(task => ({...task}));
           }
           if(method === 'tasks.cancel') { tasks = tasks.map(task => params.ids.includes(task.id) ? {...task,state:'cancelled',revision:task.revision+1} : task); return tasks.map(task => ({...task})); }
-          if(method === 'tasks.retry') {tasks=tasks.map(task => (!params.ids || params.ids.includes(task.id)) ? {...task,state:'waiting',revision:task.revision+1} : task);return tasks.map(task => ({...task}));}
+          if(method === 'tasks.pause') {tasks=tasks.map(task => params.ids.includes(task.id) ? {...task,state:'stopped',scheduled:false,revision:task.revision+1} : task);return tasks.map(task => ({...task}));}
+          if(method === 'tasks.remove') {tasks=tasks.filter(task => !params.ids.includes(task.id));return tasks.map(task => ({...task}));}
+          if(method === 'tasks.retry') {tasks=tasks.map(task => (!params.ids || params.ids.includes(task.id)) ? {...task,state:'waiting',scheduled:true,revision:task.revision+1} : task);return tasks.map(task => ({...task}));}
           if(method === 'tasks.clear') {tasks=tasks.filter(task => !(['done','cancelled'].includes(task.state) && (!params.ids || params.ids.includes(task.id))));return tasks.map(task => ({...task}));}
           if(method === 'download.stop') { tasks = tasks.map(task => task.state === 'cancelled' ? task : {...task,state:'stopped',revision:task.revision+1}); tasks.forEach(task => listeners.forEach(callback => callback({id:null,event:'task',data:task}))); listeners.forEach(callback => callback({id:null,event:'batch.finished',data:{stopped:true}})); return true; }
           if(method === 'login') throw new Error('登录服务暂时不可用');
@@ -432,8 +434,8 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByText('测试.txt',{exact:true}).waitFor();
     const uploaded = await page.evaluate(() => window.testCalls.find(call => call.method === 'upload'));
     assert.equal(uploaded.params.parent,'0'); assert.deepEqual(uploaded.params.sources,['C:\\Uploads\\测试.txt']);
-    await page.locator('.task-row').filter({hasText:'测试.txt'}).getByRole('button',{name:'取消',exact:true}).click();
-    await page.getByText('已取消',{exact:true}).waitFor();
+    await page.locator('.task-row').filter({hasText:'测试.txt'}).getByRole('button',{name:'暂停',exact:true}).click();
+    await page.getByText('已暂停',{exact:true}).waitFor();
     await page.getByRole('button',{name:'暂停全部',exact:true}).click();
     await page.getByRole('group',{name:'传输方向'}).getByRole('button',{name:/^下载/}).click();
     await page.getByText('已暂停',{exact:true}).waitFor();
@@ -563,36 +565,35 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await page.getByText('下载失败.txt',{exact:true}).count(),0);
     await directions.getByRole('button',{name:/^下载/}).click();
     assert.equal(await page.getByText('下载成功.txt',{exact:true}).count(),0);
-    await page.getByRole('button',{name:'继续未完成',exact:true}).click();
-    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.retry').at(-1).params.ids),['df','ds']);
-    await page.evaluate(() => window.testEmit({id:null,event:'batch.finished',data:{stopped:true}}));
+    assert.equal(await page.locator('.task-row').first().locator('.task-controls button').count(),3);
+    assert.ok(await page.locator('.task-row').filter({hasText:'旧账号下载.txt'}).getByRole('button',{name:'开始',exact:true}).isDisabled());
+    await page.getByRole('button',{name:'开始全部',exact:true}).click();
+    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.retry').at(-1).params.ids),['df','ds','uw','uf','us']);
+    await page.getByRole('button',{name:'暂停全部',exact:true}).click();
     await directions.getByRole('button',{name:/^上传/}).click();
-    await page.getByRole('button',{name:'重试失败',exact:true}).click();
-    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.retry').at(-1).params.ids),['uf']);
-    await page.evaluate(() => window.testEmit({id:null,event:'batch.finished',data:{stopped:true}}));
-    await page.getByRole('button',{name:'清理已结束记录',exact:true}).click();
-    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.clear').at(-1).params.ids),['uc']);
-    await page.evaluate(() => window.testSetTasks(window.testGetTasks().map(task => task.id === 'uw' ? {...task,state:'done',revision:2} : task)));
+    await page.locator('.task-row').filter({hasText:'上传取消.txt'}).getByRole('button',{name:'删除记录',exact:true}).click();
+    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.remove').at(-1).params.ids),['uc']);
+    await page.evaluate(() => window.testSetTasks(window.testGetTasks().map(task => ['dd','ud','uw'].includes(task.id) ? {...task,state:'done',revision:task.revision+1} : task)));
     assert.equal(await completion.getByRole('button',{name:/^未完成/}).locator('span').textContent(),'2');
     assert.equal(await completion.getByRole('button',{name:/^已完成/}).locator('span').textContent(),'2');
     assert.equal(await page.getByText('上传等待.txt',{exact:true}).count(),0);
     await completion.getByRole('button',{name:/^已完成/}).click();
     assert.equal(await page.locator('.task-row').count(),2);
-    assert.ok(await page.getByRole('button',{name:'继续未完成',exact:true}).isDisabled());
+    await page.locator('.task-row').filter({hasText:'上传成功.txt'}).getByRole('button',{name:'打开文件夹',exact:true}).click();
     await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-groups-light.png')});
     await page.evaluate(() => window.quark.setAppearance('dark'));
     await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-groups-dark.png')});
     await page.setViewportSize({width:860,height:600});
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true);
     await page.setViewportSize({width:1180,height:780});
-    await page.getByRole('button',{name:'清理已结束记录',exact:true}).click();
-    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.clear').at(-1).params.ids),['uw','ud']);
+    await page.getByRole('button',{name:'清理已完成记录',exact:true}).click();
+    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.clear').at(-1).params.ids),['dd','uw','ud']);
     await page.getByText('暂无已完成的上传任务',{exact:true}).waitFor();
     await directions.getByRole('button',{name:/^下载/}).click();
-    await page.getByText('下载成功.txt',{exact:true}).waitFor();
+    await page.getByText('暂无已完成的下载任务',{exact:true}).waitFor();
     await completion.getByRole('button',{name:/^未完成/}).click();
     await page.getByText('下载取消.txt',{exact:true}).waitFor();
-    assert.ok(await page.locator('.task-row').filter({hasText:'旧账号下载.txt'}).getByRole('button',{name:'继续',exact:true}).isDisabled());
+    assert.ok(await page.locator('.task-row').filter({hasText:'旧账号下载.txt'}).getByRole('button',{name:'开始',exact:true}).isDisabled());
     await page.evaluate(() => window.testSetTasks(Array.from({length:1000},(_,index) => ({id:'large-'+index,name:'批量完成'+index,direction:'upload',state:'done',valid:true,revision:1,detail:'',target:'C:/Downloads/test'}))));
     await directions.getByRole('button',{name:/^上传/}).click();await completion.getByRole('button',{name:/^已完成/}).click();
     assert.equal(await completion.getByRole('button',{name:/^已完成/}).locator('span').textContent(),'1000');
@@ -609,6 +610,8 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         {id:'pc',name:'清理文件.bin',direction:'download',state:'running',progress:progress('清理文件.bin',0,0,null,0,1,'cleaning')},
         {id:'pl',name:'旧任务',direction:'download',state:'stopped',detail:'旧任务结果'},
         {id:'pa',name:'上传文件.bin',direction:'upload',state:'running',progress:progress('上传文件.bin',20*MB,10*MB,40*MB,5*MB,1)},
+        {id:'ph',name:'准备上传.bin',direction:'upload',state:'running',progress:progress('准备上传.bin',0,0,100*MB,0,0,'hashing')},
+        {id:'px',name:'授权下一段.bin',direction:'upload',state:'running',progress:progress('授权下一段.bin',10*MB,10*MB,40*MB,5*MB,1,'authorizing')},
         {id:'pe',name:'空文件.bin',direction:'upload',state:'done',progress:progress('空文件.bin',0,0,0,0,0,'completed')},
       ].map(task => ({valid:true,revision:1,detail:'',target:'C:/Downloads/'+task.name,...task})));
     });
@@ -645,6 +648,11 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.evaluate(() => window.testEmit({id:null,event:'task',data:window.testGetTasks().find(task => task.id === 'pd')}));
     assert.equal(await activeProgress.getByRole('progressbar').getAttribute('aria-valuenow'),'40');
     await directions.getByRole('button',{name:/^上传/}).click();
+    assert.equal(await progressRow('准备上传.bin').getByRole('progressbar').getAttribute('aria-valuenow'),null);
+    assert.equal(await progressRow('准备上传.bin').getByRole('progressbar').getAttribute('aria-valuetext'),'正在计算文件哈希');
+    assert.ok(await progressRow('准备上传.bin').getByRole('button',{name:'暂停',exact:true}).isEnabled());
+    assert.equal(await progressRow('授权下一段.bin').getByRole('progressbar').getAttribute('aria-valuenow'),'25');
+    await progressRow('授权下一段.bin').getByText('速度 —',{exact:true}).waitFor();
     await progressRow('上传文件.bin').getByText('速度 5.0 MB/s',{exact:true}).waitFor();
     await progressRow('上传文件.bin').getByText('预计剩余 约 4 秒',{exact:true}).waitFor();
     assert.equal(await progressRow('上传文件.bin').getByText('连接 1',{exact:true}).count(),0);
@@ -698,6 +706,8 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     await page.getByRole('heading', { name:'我的文件' }).waitFor();
     const hello = await page.evaluate(() => window.quark.call('hello'));
     assert.equal(hello.client_version,await app.evaluate(({app}) => app.getVersion()));
+    assert.deepEqual(await page.evaluate(() => window.quark.call('tasks.pause',{ids:[]})),[]);
+    assert.deepEqual(await page.evaluate(() => window.quark.call('tasks.remove',{ids:[]})),[]);
     await page.locator('.titlebar').getByText('v'+hello.client_version,{exact:true}).waitFor();
     await assert.rejects(page.evaluate(() => window.quark.readDroppedFiles([new File(['payload'],'网页生成.txt')])),/本地文件/);
     const localDropFile=path.join(directory,'本地拖拽.txt'),localDropFolder=path.join(directory,'本地目录');
@@ -860,7 +870,7 @@ test('native file drops on rows and empty space upload into the directory curren
         if(method === 'browse') return params.fid === '0' ? [{fid:'folder',name:'当前列表里的子目录',directory:true,size:null,path:'',location:[],modified_at:null}] : [];
         if(method === 'preferences.save') return {preferences:params,warning:''};
         if(method === 'upload') {
-          params.sources.forEach(source => tasks.push({id:String(tasks.length),name:source.split('\\').at(-1),state:'waiting',detail:'',valid:true,direction:'upload',revision:1,target:params.parent}));
+          params.sources.forEach(source => tasks.push({id:String(tasks.length),name:source.split('\\').at(-1),state:'waiting',detail:'',valid:true,direction:'upload',revision:1,scheduled:true,target:params.parent}));
           return [...tasks];
         }
         if(method === 'tasks') return [...tasks];

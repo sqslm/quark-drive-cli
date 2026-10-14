@@ -145,8 +145,15 @@ class DesktopService:
 
     def execute(self, identifier, method, params, cancel=None):
         try:
-            result = self.dispatch(identifier, method, params, cancel)
-            self.send({"id": identifier, "result": result})
+            if method == 'tasks.remove':
+                # Send the initial snapshot before cleanup can publish its final
+                # removal. A delayed response must not revive a deleted record.
+                with self.lock:
+                    result = self.dispatch(identifier, method, params, cancel)
+                    self.send({"id": identifier, "result": result})
+            else:
+                result = self.dispatch(identifier, method, params, cancel)
+                self.send({"id": identifier, "result": result})
         except SearchCancelled:
             self.send({"id": identifier, "result": {"cancelled": True}})
         except LoginCancelled:
@@ -211,7 +218,7 @@ class DesktopService:
                     self.web_login = None
                     self.logging_in = False
                     return result
-        if self.logged_out and method not in ('hello','account','preferences.save','tasks','tasks.clear','tasks.cancel','share.parse','login','favorites.list'):
+        if self.logged_out and method not in ('hello','account','preferences.save','tasks','tasks.clear','tasks.cancel','tasks.pause','tasks.remove','share.parse','login','favorites.list'):
             raise AuthenticationError('已退出本客户端，请重新登录')
         if method.startswith('favorites.'):
             if method == 'favorites.list' and self.logged_out:
@@ -470,8 +477,27 @@ class DesktopService:
                         if task["id"] != self.active_id:
                             task["state"] = "cancelled"
                             task["revision"] += 1
-                            self.event(None, "task", self.public_task(task))
+                            self.task_event(task)
                 self.persist_tasks()
+                return [self.public_task(task) for task in self.tasks]
+        if method == "tasks.pause":
+            with self.lock:
+                for task in self.tasks:
+                    if task['id'] in p.get('ids',[]) and task['state'] in ('running','waiting'):
+                        task.setdefault('_pause',threading.Event()).set()
+                        if task['id'] != self.active_id:
+                            task['state']='stopped';task['revision']+=1
+                            self.task_event(task)
+                self.persist_tasks()
+                return [self.public_task(task) for task in self.tasks]
+        if method == "tasks.remove":
+            with self.lock:
+                for task in self.tasks:
+                    if task['id'] in p.get('ids',[]):
+                        task['_remove']=True;task['_cancel'].set()
+                self.tasks=[task for task in self.tasks if not task.get('_remove') or task['id'] == self.active_id]
+                self.persist_tasks()
+                self.event(None,'tasks.changed',[self.public_task(task) for task in self.tasks])
                 return [self.public_task(task) for task in self.tasks]
         if method == "tasks.clear":
             with self.lock:
@@ -520,12 +546,15 @@ class DesktopService:
                 return [self.public_task(task) for task in self.tasks]
         if method == "tasks.retry":
             with self.lock:
-                if self.busy or self.logging_in or self.managing:
-                    raise UsageError("传输正在进行")
+                if self.logging_in or self.managing or (self.busy and self.stop.is_set()):
+                    raise UsageError("正在暂停队列或处理账号/文件操作，请稍后开始")
+                if any(task['id'] == self.active_id and task['state'] != 'running' for task in self.tasks):
+                    raise UsageError('当前任务正在安全停止，请稍后开始')
                 self.verify_context()
                 self.refresh_task_context()
-                tasks = [task for task in self.tasks if task["valid"] and task["state"] in ("failed", "stopped", "waiting")
-                         and (not p.get("ids") or task["id"] in p["ids"])]
+                tasks = [task for task in self.tasks if task["valid"] and not task.get('_remove') and task["state"] in ("failed", "stopped", "waiting")
+                         and (not task.get('_queued') or task['state'] == 'stopped')
+                         and (p.get("ids") is None or task["id"] in p["ids"])]
                 preferences = self.current_preferences()
                 for task in tasks:
                     task["request"] = replace(task["request"], **({"connections": preferences.connections} if task["direction"] == "download" else {}), limit_rate=preferences.limit_rate)
@@ -600,11 +629,18 @@ class DesktopService:
         output = {key: task[key] for key in ("id", "name", "state", "detail", "target", "valid", "revision", "direction")}
         progress = task.get("progress")
         output["progress"] = {**progress, "rate": progress["rate"] if task["state"] == "running" else 0} if progress else None
+        output['scheduled']=bool(task.get('_queued'))
+        output['removing']=bool(task.get('_remove'))
+        output['pausing']=bool(task['state'] == 'running' and task.get('_pause') and task['_pause'].is_set())
         output["needs_authorization"] = bool(task["state"] not in ("done", "cancelled") and task["share_url"] and task["request"].share_source is None)
         output["share_url"] = task["share_url"]
         output["local_dir"] = str(Path(task["request"].source).parent if task["direction"] == "upload" else
             Path(task["target"]) if task["request"].recursive and task["state"] == "done" else Path(task["target"]).parent)
         return output
+
+    def task_event(self,task):
+        if not task.get('_remove'):
+            self.event(None,'task',self.public_task(task))
 
     def persist_tasks(self):
         if not self.task_store.save(self.tasks):
@@ -621,35 +657,41 @@ class DesktopService:
             self.batch_id = uuid.uuid4().hex
             self.batch_tasks = []
         self.busy = True
-        self.batch_tasks.extend(tasks)
+        submitted=[]
         for task in tasks:
             task["state"] = "waiting"
             task.pop("progress", None)
             task["_cancel"].clear()
+            task.setdefault('_pause',threading.Event()).clear()
             task["revision"] += 1
-            self.pending_count += 1
+            if not task.get('_queued'):
+                task['_queued']=True
+                self.pending_count += 1
+                if not any(row['id'] == task['id'] for row in self.batch_tasks):
+                    self.batch_tasks.append(task)
+                submitted.append(task)
         self.persist_tasks()
         if new_batch:
             self.event(None, "batch.started", {"batch_id": self.batch_id})
-        for task in tasks:
+        for task in submitted:
             self.transfers.submit(self.run_task, task)
 
     def run_task(self, task):
         try:
             with self.lock:
-                if task["_cancel"].is_set() or self.stop.is_set():
+                if task["_cancel"].is_set() or self.stop.is_set() or task['_pause'].is_set():
                     task["state"] = "cancelled" if task["_cancel"].is_set() else "stopped"
                     task["revision"] += 1
                     self.persist_tasks()
-                    self.event(None, "task", self.public_task(task))
+                    self.task_event(task)
                     return
                 self.active_id = task["id"]
                 task["state"] = "running"
                 task["revision"] += 1
                 self.persist_tasks()
-                self.event(None, "task", self.public_task(task))
+                self.task_event(task)
             def stopped():
-                return self.stop.is_set() or task["_cancel"].is_set()
+                return self.stop.is_set() or task["_cancel"].is_set() or task['_pause'].is_set()
             def progress(event):
                 with self.lock:
                     task["detail"] = progress_text(event)
@@ -658,7 +700,7 @@ class DesktopService:
                         "rate": event.rate, "connections": event.connections,
                         "recursive": task["request"].recursive}
                     task["revision"] += 1
-                    self.event(None, "task", self.public_task(task))
+                    self.task_event(task)
             try:
                 if task["context"] != self.context():
                     raise UsageError("登录上下文已变化，请重新选择任务")
@@ -686,10 +728,15 @@ class DesktopService:
             with self.lock:
                 task["revision"] += 1
                 self.persist_tasks()
-                self.event(None, "task", self.public_task(task))
+                self.task_event(task)
         finally:
             with self.lock:
                 self.active_id = None
+                task['_queued']=False
+                if task.get('_remove'):
+                    self.tasks=[row for row in self.tasks if row['id'] != task['id']]
+                    self.persist_tasks()
+                    self.event(None,'tasks.changed',[self.public_task(row) for row in self.tasks])
                 self.pending_count -= 1
                 self.busy = self.pending_count > 0
                 if not self.busy:
@@ -712,7 +759,7 @@ class DesktopService:
 METHODS = frozenset({"hello", "account", "browse", "search", "search.cancel", "locate", "share.parse",
     "share.open", "share.browse", "preferences.save", "login", "login.cancel", "download", "download.stop", "tasks", "tasks.retry",
     "file.info", "file.mkdir", "file.rename", "file.move", "file.delete",
-    "upload", "tasks.cancel", "tasks.clear", "tasks.authorize",
+    "upload", "tasks.cancel", "tasks.pause", "tasks.remove", "tasks.clear", "tasks.authorize",
     'share.list','share.link','share.create','share.revoke','share.save','recycle.list','recycle.restore','recycle.remove',
     'file.cut','file.paste','file.clearCut',
     'favorites.list','favorites.add','favorites.remove','favorites.open',

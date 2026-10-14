@@ -27,7 +27,8 @@ export class Background {
     this.update();
   }
   event(event:string,data:any) {
-    if(event === 'task') {
+    if(event === 'tasks.changed') this.snapshot(data);
+    else if(event === 'task') {
       const previous=this.tasks.get(data.id);
       if(previous && (previous.revision || 0) > (data.revision || 0)) return;
       this.tasks.set(data.id,data);

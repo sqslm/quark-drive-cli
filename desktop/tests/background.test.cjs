@@ -56,6 +56,10 @@ test('tray actions reuse the queue, block duplicate resume, and skip progress me
   assert.equal(menu('resume').enabled,false,'an older event must not revive a completed task');
   background.snapshot([task('a','waiting',{revision:4})]);
   assert.equal(menu('resume').enabled,false,'a delayed response must not revive an already completed task');
+  background.event('tasks.changed',[task('paused','stopped')]);
+  assert.equal(menu('resume').enabled,true);
+  background.event('tasks.changed',[]);
+  assert.equal(menu('resume').enabled,false,'a removed task must not remain in the tray snapshot');
   assert.equal(menu('quit').enabled,true);menu('quit').click();assert.equal(events.at(-1).event,'quit');
   background.destroy();assert.equal(tray.destroyed,true);
 });

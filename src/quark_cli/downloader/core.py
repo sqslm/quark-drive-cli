@@ -406,6 +406,9 @@ def batch_summary(*, succeeded: int, failed: int, stopped: int, skipped: int, re
 def progress_text(event: ProgressEvent) -> str:
     """One status line for a transfer event; never contains a URL or a Cookie."""
     name = display_text(event.name)
+    stages = {'hashing':'正在计算文件哈希','hashing_context':'正在准备分片上下文','authorizing':'正在获取上传授权','verifying':'正在核验上传结果','merging':'正在合并上传分片'}
+    if event.phase in stages:
+        return f'{name}：{stages[event.phase]}'
     mode = "单线程" if event.connections == 1 else f"{event.connections} 线程"
     if event.phase == "non_resumable":
         mode = "单线程，停止后重新下载"
@@ -423,6 +426,8 @@ def progress_text(event: ProgressEvent) -> str:
 
 def progress_fraction(event: ProgressEvent) -> float | None:
     """Confirmed progress as 0.0-1.0, or ``None`` while the size is unknown."""
+    if event.transferred == 0 and event.phase in ('hashing','hashing_context','authorizing','verifying','merging'):
+        return None
     total, done = event.total, event.transferred
     if type(total) is not int or total <= 0 or type(done) is not int or done < 0:
         return None

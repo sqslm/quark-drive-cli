@@ -124,3 +124,5 @@ aside{padding-top:28px}.brand{padding-bottom:30px;letter-spacing:.2px}.brand sma
 .progress-metrics{display:flex;flex-wrap:wrap;gap:3px 12px;font-size:11px;color:var(--secondary);font-variant-numeric:tabular-nums}.progress-metrics span{white-space:nowrap}.task-progress .progress-phase{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .progress-track.indeterminate>span{width:30%;animation:transfer-indeterminate 1.5s ease-in-out infinite}@keyframes transfer-indeterminate{from{transform:translateX(-110%)}to{transform:translateX(440%)}}
 @media(prefers-reduced-motion:reduce){.progress-track>span{transition:none}.progress-track.indeterminate>span{animation:none}}
+
+.task-controls{display:flex;gap:8px;flex:0 0 auto!important}.task-icon-button{width:32px;height:32px;padding:6px!important;display:grid;place-items:center;color:var(--secondary)}.task-controls button:last-child:hover{color:var(--error)}

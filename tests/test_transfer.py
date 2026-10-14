@@ -138,6 +138,20 @@ class DownloadServer:
 
 
 class TransferTests(unittest.TestCase):
+    def test_native_sha1_matches_reference_across_aligned_updates_and_bit_counter_wrap(self):
+        from quark_cli.sha1_context import native_update
+        if native_update() is None:
+            self.skipTest('Native OpenSSL not available')
+        payload=bytes(range(256))*16
+        for length in (0, 2**29-64, 2**32):
+            native,reference=_SHA1State(),_SHA1State()
+            native.length=reference.length=length
+            for chunk in (payload[:64],payload[64:]):
+                native.update_aligned(chunk)
+                with patch('quark_cli.transfer.chaining_words',return_value=None):
+                    reference.update_aligned(chunk)
+                self.assertEqual((native.h,native.length),(reference.h,reference.length))
+
     def setUp(self):
         self.config = tempfile.TemporaryDirectory()
         self.addCleanup(self.config.cleanup)
@@ -866,6 +880,50 @@ class TransferTests(unittest.TestCase):
             return httpx.Response(404, request=request)
 
         return handler, seen
+
+    def test_first_upload_part_starts_before_later_context_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'start.bin';source.write_bytes(b'x'*(3*128*1024+17))
+            handler,seen=self._upload_handler(part_size=128*1024)
+            original=_SHA1State.update_aligned
+            started=[]
+            def update(state,data):
+                started.append(bool(seen['parts']))
+                return original(state,data)
+            with patch.object(_SHA1State,'update_aligned',update), QuarkClient('sid=test',transport=httpx.MockTransport(handler)) as client:
+                Transfer(client,state_dir=Path(directory)/'state').upload(source,resume=True)
+            self.assertTrue(started)
+            self.assertTrue(all(started),'later continuation work must not block the first PUT')
+
+    def test_upload_full_file_hashing_does_not_repeat_per_part(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'budget.bin';source.write_bytes(b'x'*(3*128*1024+17))
+            handler,seen=self._upload_handler(part_size=128*1024)
+            with QuarkClient('sid=test',transport=httpx.MockTransport(handler)) as client:
+                transfer=Transfer(client,state_dir=Path(directory)/'state')
+                with patch.object(transfer,'_fingerprint',wraps=transfer._fingerprint) as fingerprint:
+                    transfer.upload(source,resume=True)
+                self.assertLessEqual(fingerprint.call_count,4,'whole-file scans must be bounded, not one per part')
+            self.assertEqual(b''.join(seen['parts']),source.read_bytes())
+
+    def test_upload_final_hash_detects_same_stat_source_mutation(self):
+        # Per-part stat checks are deliberately cheap; the full final hash must
+        # still catch changes that preserve size, timestamps and the inode.
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'mutated.bin';source.write_bytes(b'a'*(256*1024+17))
+            saved=source.stat()
+            handler,seen=self._upload_handler(part_size=128*1024)
+            def mutate_after_first(request):
+                response=handler(request)
+                if request.method == 'PUT' and len(seen['parts']) == 1:
+                    with source.open('r+b') as stream:stream.write(b'b')
+                    os.utime(source,ns=(saved.st_atime_ns,saved.st_mtime_ns))
+                return response
+            with QuarkClient('sid=mock',transport=httpx.MockTransport(mutate_after_first)) as client:
+                with self.assertRaisesRegex(LocalIOError,'未合并'):
+                    Transfer(client).upload(source,resume=True)
+            self.assertEqual(seen['complete'],[])
+            self.assertEqual(seen['finish'],0)
 
     def test_upload_single_part(self):
         for content in (b"small file",):
