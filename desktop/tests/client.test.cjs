@@ -47,7 +47,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.12',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.13',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
@@ -92,12 +92,16 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
             return tasks.map(task => ({...task}));
           }
           if(method === 'tasks.cancel') { tasks = tasks.map(task => params.ids.includes(task.id) ? {...task,state:'cancelled',revision:task.revision+1} : task); return tasks.map(task => ({...task})); }
+          if(method === 'tasks.retry') {tasks=tasks.map(task => (!params.ids || params.ids.includes(task.id)) ? {...task,state:'waiting',revision:task.revision+1} : task);return tasks.map(task => ({...task}));}
+          if(method === 'tasks.clear') {tasks=tasks.filter(task => !(['done','cancelled'].includes(task.state) && (!params.ids || params.ids.includes(task.id))));return tasks.map(task => ({...task}));}
           if(method === 'download.stop') { tasks = tasks.map(task => task.state === 'cancelled' ? task : {...task,state:'stopped',revision:task.revision+1}); tasks.forEach(task => listeners.forEach(callback => callback({id:null,event:'task',data:task}))); listeners.forEach(callback => callback({id:null,event:'batch.finished',data:{stopped:true}})); return true; }
           if(method === 'login') throw new Error('登录服务暂时不可用');
           return [];
         }
       };
       window.testEmit=event => listeners.forEach(listener => listener(event));
+      window.testGetTasks=() => tasks.map(task => ({...task}));
+      window.testSetTasks=next => {tasks=next;listeners.forEach(listener => listener({id:null,event:'tasks.changed',data:tasks}));};
     });
     await page.goto(`http://127.0.0.1:${server.address().port}/main_window/index.html`);
     async function dragData(names) {
@@ -431,6 +435,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.locator('.task-row').filter({hasText:'测试.txt'}).getByRole('button',{name:'取消',exact:true}).click();
     await page.getByText('已取消',{exact:true}).waitFor();
     await page.getByRole('button',{name:'暂停全部',exact:true}).click();
+    await page.getByRole('group',{name:'传输方向'}).getByRole('button',{name:/^下载/}).click();
     await page.getByText('已暂停',{exact:true}).waitFor();
     await page.getByRole('button',{name:'我的文件',exact:true}).click();
     const uploadsBefore=await page.evaluate(() => window.testCalls.filter(call => call.method === 'upload').length);
@@ -536,6 +541,64 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button',{name:'筛选',exact:true}).click();
     await page.screenshot({path:path.resolve(__dirname,'../test-results/compact-toolbar.png')});
     await page.screenshot({path:path.resolve(__dirname,'../test-results/light-files.png')});
+    const originalTasks=await page.evaluate(() => window.testGetTasks());
+    await page.evaluate(() => window.testSetTasks([
+      {id:'df',name:'下载失败.txt',direction:'download',state:'failed'},
+      {id:'ds',name:'下载暂停.txt',direction:'download',state:'stopped'},
+      {id:'dd',name:'下载成功.txt',direction:'download',state:'done'},
+      {id:'dc',name:'下载取消.txt',direction:'download',state:'cancelled'},
+      {id:'legacy',name:'旧账号下载.txt',state:'failed',valid:false},
+      {id:'uw',name:'上传等待.txt',direction:'upload',state:'waiting'},
+      {id:'uf',name:'上传失败.txt',direction:'upload',state:'failed'},
+      {id:'us',name:'上传暂停.txt',direction:'upload',state:'stopped'},
+      {id:'ud',name:'上传成功.txt',direction:'upload',state:'done'},
+      {id:'uc',name:'上传取消.txt',direction:'upload',state:'cancelled'},
+    ].map(task => ({valid:true,revision:1,detail:'',target:'C:/Downloads/'+task.name,...task}))));
+    await page.getByRole('button',{name:/^传输任务/}).click();
+    const directions=page.getByRole('group',{name:'传输方向'}),completion=page.getByRole('group',{name:'传输完成状态'});
+    assert.equal(await directions.getByRole('button',{name:/^上传/}).getAttribute('aria-pressed'),'true');
+    assert.equal(await directions.getByRole('button',{name:/^下载/}).locator('span').textContent(),'5');
+    assert.equal(await completion.getByRole('button',{name:/^未完成/}).locator('span').textContent(),'4');
+    assert.equal(await page.locator('.task-row').count(),4);
+    assert.equal(await page.getByText('下载失败.txt',{exact:true}).count(),0);
+    await directions.getByRole('button',{name:/^下载/}).click();
+    assert.equal(await page.getByText('下载成功.txt',{exact:true}).count(),0);
+    await page.getByRole('button',{name:'继续未完成',exact:true}).click();
+    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.retry').at(-1).params.ids),['df','ds']);
+    await page.evaluate(() => window.testEmit({id:null,event:'batch.finished',data:{stopped:true}}));
+    await directions.getByRole('button',{name:/^上传/}).click();
+    await page.getByRole('button',{name:'重试失败',exact:true}).click();
+    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.retry').at(-1).params.ids),['uf']);
+    await page.evaluate(() => window.testEmit({id:null,event:'batch.finished',data:{stopped:true}}));
+    await page.getByRole('button',{name:'清理已结束记录',exact:true}).click();
+    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.clear').at(-1).params.ids),['uc']);
+    await page.evaluate(() => window.testSetTasks(window.testGetTasks().map(task => task.id === 'uw' ? {...task,state:'done',revision:2} : task)));
+    assert.equal(await completion.getByRole('button',{name:/^未完成/}).locator('span').textContent(),'2');
+    assert.equal(await completion.getByRole('button',{name:/^已完成/}).locator('span').textContent(),'2');
+    assert.equal(await page.getByText('上传等待.txt',{exact:true}).count(),0);
+    await completion.getByRole('button',{name:/^已完成/}).click();
+    assert.equal(await page.locator('.task-row').count(),2);
+    assert.ok(await page.getByRole('button',{name:'继续未完成',exact:true}).isDisabled());
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-groups-light.png')});
+    await page.evaluate(() => window.quark.setAppearance('dark'));
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-groups-dark.png')});
+    await page.setViewportSize({width:860,height:600});
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true);
+    await page.setViewportSize({width:1180,height:780});
+    await page.getByRole('button',{name:'清理已结束记录',exact:true}).click();
+    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.clear').at(-1).params.ids),['uw','ud']);
+    await page.getByText('暂无已完成的上传任务',{exact:true}).waitFor();
+    await directions.getByRole('button',{name:/^下载/}).click();
+    await page.getByText('下载成功.txt',{exact:true}).waitFor();
+    await completion.getByRole('button',{name:/^未完成/}).click();
+    await page.getByText('下载取消.txt',{exact:true}).waitFor();
+    assert.ok(await page.locator('.task-row').filter({hasText:'旧账号下载.txt'}).getByRole('button',{name:'继续',exact:true}).isDisabled());
+    await page.evaluate(() => window.testSetTasks(Array.from({length:1000},(_,index) => ({id:'large-'+index,name:'批量完成'+index,direction:'upload',state:'done',valid:true,revision:1,detail:'',target:'C:/Downloads/test'}))));
+    await directions.getByRole('button',{name:/^上传/}).click();await completion.getByRole('button',{name:/^已完成/}).click();
+    assert.equal(await completion.getByRole('button',{name:/^已完成/}).locator('span').textContent(),'1000');
+    assert.ok(await page.locator('.task-row').count() < 60);
+    await page.evaluate(tasks => {window.testSetTasks(tasks);return window.quark.setAppearance('light');},originalTasks);
+    await page.getByRole('button',{name:'我的文件',exact:true}).click();
     await page.getByRole('button',{name:'账号操作',exact:true}).click();
     await page.getByRole('menuitem',{name:'切换账号',exact:true}).click();
     await page.getByRole('dialog',{name:'切换账号',exact:true}).waitFor();
@@ -611,6 +674,11 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     const iconHeader=await readFile(packagedIcon);
     assert.equal(iconHeader.readUInt16LE(2),1);assert.ok(iconHeader.readUInt16LE(4) >= 6);
     assert.deepEqual(iconHeader,await readFile(path.resolve(__dirname,'../assets/app-icon.ico')));
+    const iconCorners=await app.evaluate(({nativeImage},filename) => [16,24,32,48,64,128,256].map(size => {
+      const bitmap=nativeImage.createFromPath(filename).resize({width:size,height:size}).toBitmap();
+      return [3,(size-1)*4+3,(size*(size-1))*4+3,(size*size-1)*4+3].map(offset => bitmap[offset]);
+    }),packagedIcon);
+    assert.ok(iconCorners.every(corners => corners.every(alpha => alpha === 0)),'all ICO sizes must have transparent corners');
     await page.locator('.brand-logo').waitFor();
     await page.waitForFunction(() => document.querySelector('.brand-logo').naturalWidth > 0);
     await app.evaluate(({BrowserWindow}) => BrowserWindow.getAllWindows()[0].close());

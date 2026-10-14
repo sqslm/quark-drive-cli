@@ -477,7 +477,7 @@ function App() {
       <button className="login-button" disabled={transferring || loggingIn} onClick={() => setLoginPicker(true)}>{signedIn ? '切换账号' : '登录账号'}</button>
     </aside>
     <main><header><div><h1>{({drive: share ? '分享文件' : '我的文件', share:'分享链接',shares:'我的分享',recycle:'回收站',tasks:'传输任务',settings:'设置'} as Record<string,string>)[page]}</h1>
-      <p>{page === 'drive' ? `${rows.length} 项${searchView ? ' · 搜索结果' : ''}` : ({tasks:'下载进度与逐项结果',share:'粘贴链接或完整分享文案',shares:'管理已创建的分享链接',recycle:'恢复文件或清理已删除记录',settings:'按你的习惯，调整外观与传输偏好'} as Record<string,string>)[page]}</p></div>
+      <p>{page === 'drive' ? `${rows.length} 项${searchView ? ' · 搜索结果' : ''}` : ({tasks:'分别查看上传、下载及完成情况',share:'粘贴链接或完整分享文案',shares:'管理已创建的分享链接',recycle:'恢复文件或清理已删除记录',settings:'按你的习惯，调整外观与传输偏好'} as Record<string,string>)[page]}</p></div>
       <span className="connection">{transferring ? '正在传输' : '就绪'}</span></header>
       {page === 'drive' && <>
         <div className="path-toolbar"><nav className="breadcrumbs" aria-label="文件路径">{(share ? [['/','分享文件'],...sharePath.split('/').filter(Boolean).map((name,index,parts) => ['/'+parts.slice(0,index+1).join('/'),name])] : trail).map(([fid,name],index,chain) => <React.Fragment key={fid}>{index > 0 && <span aria-hidden="true">/</span>}<button aria-current={index === chain.length-1 ? 'location' : undefined} disabled={loggingIn || !signedIn} onClick={() => void (share ? shareBrowse(fid) : browse(trail.slice(0,index+1)))}>{name}</button></React.Fragment>)}</nav>

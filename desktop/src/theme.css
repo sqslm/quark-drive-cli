@@ -116,3 +116,6 @@ aside{padding-top:28px}.brand{padding-bottom:30px;letter-spacing:.2px}.brand sma
 @media(prefers-reduced-motion:reduce){button{transition:none}}
 
 .client-version{margin-left:8px;font-size:11px;color:var(--muted)}
+.transfer-tabs,.transfer-filters{display:flex;gap:8px;padding:0 30px 14px;flex-shrink:0}
+.transfer-tabs{border-bottom:1px solid var(--line);margin-bottom:14px}.transfer-tabs button{border:0;background:transparent;font-size:14px;padding:9px 16px}.transfer-tabs button.active{background:var(--active);color:var(--accent)}
+.transfer-tabs span,.transfer-filters span{margin-left:8px;font-size:11px;font-variant-numeric:tabular-nums;opacity:.8}.transfer-filters button{border-color:transparent;padding:6px 12px;background:transparent}.transfer-filters button.active{background:var(--active);border-color:var(--control-border);color:var(--accent)}

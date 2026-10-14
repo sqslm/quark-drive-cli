@@ -76,6 +76,22 @@ class QueueTests(unittest.TestCase):
             threading.Event().wait(0.01)
         self.assertFalse(self.service.busy)
 
+    def test_clear_ids_removes_only_selected_finished_records_and_persists(self):
+        with patch.object(self.service,'start_tasks'):
+            for fid in ('selected','other','failed','cancelled'):
+                self.queue(fid)
+        for task,state in zip(self.service.tasks,('done','done','failed','cancelled')):
+            task['state']=state
+        selected,other,failed,cancelled=[task['id'] for task in self.service.tasks]
+        result=self.service.dispatch('clear','tasks.clear',{'ids':[selected,failed]},None)
+        self.assertEqual([task['id'] for task in result],[other,failed,cancelled])
+        stored=json.loads(self.service.task_store.path.read_text('utf8'))
+        self.assertEqual([task['id'] for task in stored['tasks']],[other,failed,cancelled])
+        result=self.service.dispatch('empty','tasks.clear',{'ids':[]},None)
+        self.assertEqual([task['id'] for task in result],[other,failed,cancelled])
+        result=self.service.dispatch('all','tasks.clear',{},None)
+        self.assertEqual([task['id'] for task in result],[failed])
+
     def test_append_during_download_remains_sequential_and_durable(self):
         self.queue("a")
         self.assertTrue(self.backend.entered.wait(1))

@@ -477,7 +477,8 @@ class DesktopService:
             with self.lock:
                 if self.busy:
                     raise UsageError("请在本批次结束后清理记录")
-                self.tasks = [task for task in self.tasks if task["state"] not in ("done", "cancelled")]
+                ids = p.get("ids")
+                self.tasks = [task for task in self.tasks if task["state"] not in ("done", "cancelled") or (ids is not None and task["id"] not in ids)]
                 self.persist_tasks()
                 return [self.public_task(task) for task in self.tasks]
         if method == "tasks.authorize":
