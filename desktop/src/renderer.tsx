@@ -355,7 +355,11 @@ function App() {
     await action(async () => {
       const generation = view.current;
       const located: Entry[] = [];
-      for(const row of entries) located.push(row.path ? row : share ? {...row,path:sharePath.replace(/\/$/,'')+'/'+row.name} : await call('locate',{ entry:row }));
+      const missing=share ? [] : entries.filter(row => !row.path);
+      if(missing.length) notify('正在读取选中项目的路径…');
+      const resolved:{fid:string;path:string}[]=missing.length ? await call('file.paths',{entries:missing}) : [];
+      const paths=new Map(resolved.map(row => [row.fid,row.path]));
+      for(const row of entries) located.push(row.path ? row : {...row,path:share ? sharePath.replace(/\/$/,'')+'/'+row.name : paths.get(row.fid)!});
       if(generation !== view.current) return;
       await window.quark.copyText(located.map(row => row.path).join('\n'));
       notify(`已复制 ${located.length} 项路径`,'success');

@@ -1,11 +1,14 @@
 import json
 import unittest
+import tempfile
+import httpx
+from pathlib import Path
 from unittest.mock import patch
 
 from quark_cli.client import QuarkClient
 from quark_cli.desktop.sharing import Sharing
 from quark_cli.downloader.share import ShareSource
-from quark_cli.errors import UsageError
+from quark_cli.errors import UsageError, RemoteError, RateLimitError
 from share_management_fixture import ManagementFixture
 from share_fixture import ShareFixture, SHARE_URL, SOURCE_PATH
 from tests.test_desktop_files import entry
@@ -13,6 +16,76 @@ from drive_fixture import item
 
 
 class SharingTests(unittest.TestCase):
+    def test_revoke_incomplete_catalog_and_cooldown_do_not_claim_success(self):
+        drive=ManagementFixture();drive.add_share('a',['file']);operations=self.operations(drive)
+        selected=operations.manager.list_own(all_pages=True)['items'];drive.calls.clear()
+        with patch.object(operations.client,'post',side_effect=RateLimitError('cooldown')):
+            results=operations.revoke(selected)
+        self.assertEqual(results[0]['state'],'unknown')
+        self.assertEqual(len(drive.calls),1)  # No readback during the cooldown.
+        drive.catalog_transform=lambda rows,page:[{'share_id':True}] if drive.delete_ids else rows
+        results=operations.revoke(selected)
+        self.assertEqual(results[0]['state'],'unknown')
+        self.assertEqual(len(drive.deletes),1)
+        drive.delete_ids.clear();drive.catalog_transform=lambda rows,page:[{'share_id':True}]
+        with self.assertRaises(RemoteError):operations.revoke(selected)
+        self.assertEqual(len(drive.deletes),1)
+
+    def test_revoke_partial_stale_and_lost_response_never_replays(self):
+        for lost in (False,True):
+            with self.subTest(lost=lost):
+                drive=ManagementFixture()
+                for fid in ('a','b','keep'):drive.add_share(fid,['file'])
+                operations=self.operations(drive)
+                selected=operations.manager.list_own(all_pages=True)['items']
+                selected[-1]['title']='stale'
+                drive.delete_timeout=lost
+                original=drive.handler
+                def handle(request):
+                    try:return original(request)
+                    finally:
+                        if request.url.path.endswith('/share/delete'):drive.delete_ids.discard('b')
+                drive.transport=lambda:httpx.MockTransport(handle)
+                operations=self.operations(drive)
+                with patch('quark_cli.desktop.sharing.time.sleep'):
+                    results=operations.revoke(selected)
+                self.assertEqual([row['state'] for row in results],['done','unknown','failed'])
+                self.assertEqual(drive.deletes,[{'share_ids':['a','b']}])
+                self.assertEqual([row['share_id'] for row in drive.catalog],['b','keep'])
+
+    def test_completed_creation_and_save_do_not_sleep_before_first_poll(self):
+        with patch('quark_cli.share_management.time.sleep') as sleep:
+            self.operations(ManagementFixture()).create(entry('child','中文 空格',True))
+        sleep.assert_not_called()
+
+        drive=ShareFixture();drive.items.append(item('dest','目标','0',directory=True))
+        with patch('quark_cli.shares.time.sleep') as sleep:
+            self.operations(drive).save(ShareSource(SHARE_URL,'1234'),SOURCE_PATH,
+                [entry('note','note.txt',size=4)],'dest')
+        sleep.assert_not_called()
+
+    def test_creation_respects_explicit_server_poll_gap(self):
+        operations=self.operations(ManagementFixture())
+        with patch('quark_cli.share_management.time.sleep') as sleep:
+            operations.manager._poll_creation('create-task',{'tq_gap':250})
+        sleep.assert_called_once_with(.25)
+
+    def test_revoke_many_uses_one_write_and_shared_catalog_readback(self):
+        drive=ManagementFixture()
+        for n in range(40):drive.add_share(f'own-{n}',['file'])
+        operations=self.operations(drive)
+        selected=operations.manager.list_own(all_pages=True)['items'];drive.calls.clear()
+        from quark_cli.desktop.service import DesktopService
+        from quark_cli.downloader.worker import DriveBackend
+        from tests.test_downloader_worker import COOKIE
+        with tempfile.TemporaryDirectory() as directory:
+            service=DesktopService(lambda message:None,backend=DriveBackend(lambda:COOKIE,transport=drive.transport()),directory=Path(directory))
+            try:result=service.dispatch('revoke','share.revoke',{'entries':selected},None)
+            finally:service.shutdown()
+        self.assertTrue(all(row['state'] == 'done' for row in result))
+        self.assertEqual(drive.deletes,[{'share_ids':[f'own-{n}' for n in range(40)]}])
+        self.assertLessEqual(len(drive.calls),3)
+
     def operations(self, drive):
         client = QuarkClient("sid=offline", transport=drive.transport())
         self.addCleanup(client.close)

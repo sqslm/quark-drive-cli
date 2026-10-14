@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from unittest.mock import patch
 
 import httpx
 
@@ -61,6 +62,27 @@ def entry(fid, name, directory=False, size=None):
 
 
 class FileTests(unittest.TestCase):
+    def test_batch_properties_share_parent_reads_and_discard_old_cache(self):
+        drive = Drive([item('folder','Folder',directory=True)] +
+                      [item(f'f{n}',f'{n}.txt','folder',size=4) for n in range(40)])
+        operations = self.operations(drive)
+        selected = [entry(f'f{n}',f'{n}.txt',size=4) for n in range(40)]
+        result = operations.info_many(selected)
+        self.assertEqual([row['path'] for row in result],[f'/Folder/{n}.txt' for n in range(40)])
+        self.assertEqual(len(drive.requests),43)  # 40 identities, 1 parent identity, 2 parent lists.
+        drive.records['f0']['file_name'] = 'changed.txt'
+        with self.assertRaises(UsageError):
+            operations.info_many(selected)
+
+    def test_rename_unknown_response_never_claims_failure_or_replays(self):
+        drive = Drive([item('a','A.txt',size=3)])
+        operations = self.operations(drive)
+        with patch.object(operations.files,'rename',side_effect=httpx.ReadTimeout('lost response')) as write:
+            result = operations.apply('rename',[entry('a','A.txt',size=3)],name='New.txt')
+        self.assertEqual(result[0]['state'],'unknown')
+        self.assertIn('未重发',result[0]['detail'])
+        write.assert_called_once()
+
     def test_batch_delete_reuses_preflight_and_submits_once(self):
         drive = Drive([item("a","A.txt",size=3),item("b","B.txt",size=4),item("keep","Keep.txt")])
         result = self.operations(drive).apply("delete",[entry("a","A.txt",size=3),entry("b","B.txt",size=4)])

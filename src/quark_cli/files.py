@@ -180,7 +180,7 @@ class Files:
         gap = payload.get("metadata", {}).get("tq_gap") if isinstance(payload.get("metadata"), dict) else None
         delay = max(0.0, min(float(gap) / 1000, 5.0)) if isinstance(gap, (int, float)) else poll_interval
         for retry_index in range(max_polls):
-            if delay:
+            if delay and (retry_index or (isinstance(gap,(int,float)) and gap > 0)):
                 time.sleep(delay)
             task_payload = self.client.get("task", params={"task_id": task_id, "retry_index": retry_index})
             task = _data(task_payload, "移动任务")

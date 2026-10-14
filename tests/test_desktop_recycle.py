@@ -54,12 +54,12 @@ class RecycleDrive(Drive):
                     ]
                 elif path.endswith("/recover"):
                     for row in self.recycle:
-                        if row["fid"] in body["fid_list"]:
+                        if row["fid"] in body["fid_list"] and row['record_id'] not in self.retained:
                             self.records[row["fid"]] = dict(row)
                     self.recycle = [
                         row
                         for row in self.recycle
-                        if row["fid"] not in body["fid_list"]
+                        if row["fid"] not in body["fid_list"] or row['record_id'] in self.retained
                     ]
                 else:
                     raise AssertionError(path)
@@ -81,6 +81,34 @@ def record(record_id, fid, name, parent="0"):
 
 
 class RecycleTests(unittest.TestCase):
+    def test_restore_partial_and_incoming_name_conflict_are_precise(self):
+        drive=RecycleDrive([record('a','fa','A.txt'),record('b','fb','B.txt'),record('c','fc','a.TXT')])
+        operations=self.operations(drive);selected=operations.listing();drive.retained={'b'}
+        with patch('quark_cli.desktop.recycle.time.sleep'):
+            result=operations.apply('restore',selected)
+        self.assertEqual([row['state'] for row in result],['done','unknown','failed'])
+        self.assertEqual(drive.writes[0][1],{'fid_list':['fa','fb']})
+        self.assertEqual(len(drive.writes),1)
+        self.assertEqual([row['record_id'] for row in drive.recycle],['b','c'])
+
+    def test_restore_readback_failure_or_lost_response_never_replays(self):
+        for lost in (False,True):
+            with self.subTest(lost=lost):
+                drive=RecycleDrive([record('a','fa','A.txt')]);operations=self.operations(drive)
+                selected=operations.listing();drive.unknown=lost;drive.read_failure=not lost
+                result=operations.apply('restore',selected)
+                self.assertEqual(result[0]['state'],'unknown')
+                self.assertEqual(len(drive.writes),1)
+
+    def test_restore_many_uses_one_write_and_shared_parent_readback(self):
+        drive=RecycleDrive([record(str(n),f'f{n}',f'{n}.txt') for n in range(40)]+[record('keep','keep','Keep.txt')])
+        operations=self.operations(drive);selected=operations.listing()[:-1];drive.requests.clear()
+        result=operations.apply('restore',selected)
+        self.assertTrue(all(row['state'] == 'done' for row in result))
+        self.assertEqual(len(drive.writes),1)
+        self.assertEqual(drive.writes[0][1],{'fid_list':[f'f{n}' for n in range(40)]})
+        self.assertLessEqual(len(drive.requests),5)
+
     def test_remove_partial_batch_keeps_unconfirmed_items_and_never_replays(self):
         drive=RecycleDrive([record('a','fa','A.txt'),record('b','fb','B.txt'),record('keep','fk','Keep.txt')])
         operations=self.operations(drive);selected=operations.listing()[:2]

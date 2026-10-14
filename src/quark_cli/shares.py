@@ -507,9 +507,9 @@ class ShareSaver:
             "source_fid": selection.source_fid,
         }
 
-    def _poll_task(self, task_id: str, *, poll_interval: float, max_polls: int) -> dict[str, Any]:
+    def _poll_task(self, task_id: str, *, poll_interval: float, max_polls: int, immediate: bool = False) -> dict[str, Any]:
         for retry_index in range(max_polls):
-            if poll_interval:
+            if poll_interval and (retry_index or not immediate):
                 time.sleep(poll_interval)
             try:
                 payload = self.client.get("task", params={"task_id": task_id, "retry_index": retry_index})

@@ -26,6 +26,7 @@ class _SelectionPaths(RemotePaths):
     def __init__(self, files):
         super().__init__(files)
         self.listings = {}
+        self.members = {}
 
     def children(self, fid):
         if fid not in self.listings:
@@ -37,12 +38,19 @@ class _SelectionPaths(RemotePaths):
                     raise RemoteError("目录列表的父 FID 与请求不符")
         return self.listings[fid]
 
+    def _fid_matches(self, parent, fid):
+        if parent not in self.members:
+            self.members[parent] = {valid_fid(row['fid']):row for row in self.children(parent)}
+        row = self.members[parent].get(fid)
+        return [row] if row is not None else []
+
 
 class FileOperations:
-    def __init__(self, client):
+    def __init__(self, client, *, progress=None):
         self.files = _SelectionFiles(client)
         self.paths = _SelectionPaths(self.files)
         self.client = client
+        self.report = progress or (lambda text:None)
 
     def checked(self, entry, paths=None):
         fid = valid_fid(entry["fid"])
@@ -75,6 +83,14 @@ class FileOperations:
 
     def info(self, entry):
         self.reset()
+        self.report('正在读取文件属性…')
+        return self._info(entry)
+
+    def info_many(self, entries):
+        self.reset()
+        return [self._info(entry) for entry in entries]
+
+    def _info(self, entry):
         actual, chain = self.checked(entry)
         safe = {
             key: actual[key]
@@ -96,19 +112,23 @@ class FileOperations:
 
     def mkdir(self, parent, name):
         self.reset()
+        self.report('正在核验新目录位置和名称…')
         parent = self.paths.resolve(parent, directory=True).fid
         self.available(parent, name)
+        self.report('正在创建目录…')
         result = self.files.mkdir(name, parent)
         fid = _optional_created_fid(result)
         if fid is None:
             raise RemoteError(
                 "创建目录已提交，但响应缺少 FID；结果未确认，请刷新查看，不要直接重复创建"
             )
+        self.report('正在核验创建结果…')
         ShareSaver(self.client)._confirm_created_directory(parent, name, fid)
         return {"fid": fid, "name": name, "state": "done"}
 
     def paste(self, entries, target):
         self.reset()
+        self.report(f'正在核验 {len(entries)} 项和目标目录…')
         paths = self.paths
         target = paths.resolve(str(target), directory=True).fid
         target_chain = paths.ancestry(target)
@@ -146,6 +166,7 @@ class FileOperations:
         if not candidates:
             return results
         try:
+            self.report(f'正在批量移动 {len(candidates)} 项…')
             self.files.move_many(
                 [valid_fid(actual["fid"]) for _, actual in candidates], target
             )
@@ -163,6 +184,7 @@ class FileOperations:
                 )
             return results
         self.reset()
+        self.report('正在核验移动结果…')
         # One fresh destination snapshot verifies the whole batch, rather than
         # one info request per successful member. Missing members need info to
         # distinguish an unchanged source from an unknown outcome.
@@ -206,8 +228,10 @@ class FileOperations:
     def reset(self):
         self.files.infos.clear()
         self.paths.listings.clear()
+        self.paths.members.clear()
 
     def delete(self, entries):
+        self.report(f'正在核验 {len(entries)} 个待删除项目…')
         results, candidates, seen = [], [], set()
         for entry in entries:
             index = len(results)
@@ -224,6 +248,7 @@ class FileOperations:
         if not candidates:
             return results
         try:
+            self.report(f'正在将 {len(candidates)} 项移入回收站…')
             self.files.delete_many([valid_fid(actual["fid"]) for _, actual in candidates])
         except Exception as error:
             for index, _ in candidates:
@@ -231,9 +256,14 @@ class FileOperations:
                                       detail=describe_error(error,"删除") + "；未重发，请刷新核实")
             return results
         self.reset()
+        self.report('正在核验删除结果…')
+        remaining = {}
         for index, actual in candidates:
             try:
-                if any(str(row.get("fid")) == str(actual["fid"]) for row in self.paths.children(str(actual["pdir_fid"]))):
+                parent = valid_fid(actual['pdir_fid'])
+                if parent not in remaining:
+                    remaining[parent] = {valid_fid(row['fid']) for row in self.paths.children(parent)}
+                if valid_fid(actual['fid']) in remaining[parent]:
                     raise RemoteError("删除已提交，此项仍在原目录；请刷新核实，未重发")
                 results[index].update(state="done",detail="已移入回收站")
             except Exception as error:
@@ -242,6 +272,7 @@ class FileOperations:
 
     def apply(self, operation, entries, *, name=None, target=None):
         self.reset()
+        self.report(f'正在核验 {len(entries)} 个选中项目…')
         if operation not in ("rename", "move", "delete"):
             raise UsageError("不支持的文件操作")
         if operation == "rename" and len(entries) != 1:
@@ -252,6 +283,7 @@ class FileOperations:
             return self.delete(entries)
         results, seen = [], set()
         for entry in entries:
+            submitted = False
             try:
                 actual, _chain = self.checked(entry)
                 fid = valid_fid(actual["fid"])
@@ -259,8 +291,11 @@ class FileOperations:
                     raise UsageError("重复选择同一对象")
                 seen.add(fid)
                 self.available(valid_fid(actual["pdir_fid"]), name, excluding=fid)
+                self.report('正在重命名…')
+                submitted = True
                 self.files.rename(fid, name)
                 self.files.infos.clear()
+                self.report('正在核验重命名结果…')
                 after = self.files.info(fid)
                 if after.get("file_name") != name or after.get("pdir_fid") != actual.get("pdir_fid"):
                     raise RemoteError("重命名已提交，但结果未确认，请刷新查看")
@@ -278,8 +313,8 @@ class FileOperations:
                     {
                         "fid": entry.get("fid"),
                         "name": entry.get("name", ""),
-                        "state": "failed",
-                        "detail": describe_error(error, "文件操作"),
+                        "state": "unknown" if submitted and not getattr(error,'api_rejected',False) else "failed",
+                        "detail": describe_error(error, "文件操作") + ('；未重发，请刷新核实' if submitted else ''),
                     }
                 )
         return results

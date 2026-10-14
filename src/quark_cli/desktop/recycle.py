@@ -128,81 +128,62 @@ class Recycle:
             raise UsageError("请明确选择回收站记录")
         if operation == "remove":
             return self._remove(selected, progress)
-        results, seen = [], set()
-        for entry in selected:
-            submitted = False
+        results = [{"record_id": entry.get("record_id"), "name": entry.get("name", ""),
+                    "state": "failed", "detail": ""} for entry in selected]
+        if progress:progress(f"正在核验 {len(selected)} 条待恢复记录…")
+        try:
+            records = self.listing()
+        except Exception as error:
+            for result in results:result["detail"] = describe_error(error,"恢复预检")
+            return results
+        indexed = {row["record_id"]:row for row in records}
+        counts = {}
+        for row in records:counts[row["fid"]] = counts.get(row["fid"],0)+1
+        candidates, seen, reserved = {}, set(), set()
+        for index, entry in enumerate(selected):
             try:
-                record_id = valid_fid(entry["record_id"])
-                if record_id in seen:
-                    raise UsageError("重复选择回收站记录")
+                record_id = valid_fid(entry.get("record_id"))
+                if record_id in seen:raise UsageError("重复选择回收站记录")
                 seen.add(record_id)
-                records = self.listing()
-                actual = next(
-                    (row for row in records if row["record_id"] == record_id), None
-                )
-                if actual is None or any(
-                    actual.get(key) != entry.get(key)
-                    for key in ("fid", "name", "directory", "size", "parent")
-                ):
+                actual = indexed.get(record_id)
+                if actual is None or any(actual.get(key) != entry.get(key) for key in ("fid","name","directory","size","parent")):
                     raise UsageError("回收站记录已变化，请刷新后选择")
-                if operation == "restore":
-                    if (
-                        actual["parent"] is None
-                        or sum(row["fid"] == actual["fid"] for row in records) != 1
-                    ):
-                        raise UsageError(
-                            "无法核实原目录或唯一文件身份，请使用官方客户端恢复"
-                        )
-                    parent = self.files.paths.resolve(
-                        actual["parent"], directory=True
-                    ).fid
-                    self.files.available(parent, actual["name"])
-                    # Recover uses exact FIDs; refuse ambiguous multiple recycle records.
-                    endpoint, body = (
-                        "file/recycle/recover",
-                        {"fid_list": [actual["fid"]]},
-                    )
-                submitted = True
-                self.client.post(endpoint, body=body)
-                for attempt in range(6):
-                    if not any(row["record_id"] == record_id for row in self.listing()):
-                        if operation == "restore":
-                            row = self.files.files.info(actual["fid"])
-                            if (
-                                row.get("file_name") != actual["name"]
-                                or str(row.get("pdir_fid")) != parent
-                                or is_directory(row) != actual["directory"]
-                                or (
-                                    not actual["directory"]
-                                    and row.get("size") != actual["size"]
-                                )
-                            ):
-                                raise RemoteError(
-                                    "恢复后的对象与原记录不符，结果未确认"
-                                )
-                        break
-                    if attempt < 5:
-                        time.sleep(0.5)
-                else:
-                    raise RemoteError("已提交，但回收站结果尚未确认")
-                results.append(
-                    {
-                        "record_id": record_id,
-                        "name": entry["name"],
-                        "state": "done",
-                        "detail": "已恢复到原目录"
-                        if operation == "restore"
-                        else "已永久删除",
-                    }
-                )
+                if actual["parent"] is None or counts[actual["fid"]] != 1:
+                    raise UsageError("无法核实原目录或唯一文件身份，请使用官方客户端恢复")
+                parent = self.files.paths.resolve(actual["parent"],directory=True).fid
+                self.files.available(parent,actual["name"])
+                key = (parent,actual["name"].casefold())
+                if key in reserved:raise UsageError("本次恢复在原目录中存在同名内容，未覆盖")
+                reserved.add(key);candidates[index] = actual
+            except Exception as error:results[index]["detail"] = describe_error(error,"恢复预检")
+        if not candidates:return results
+        if progress:progress(f"已核验 {len(candidates)} 条，正在批量恢复…")
+        try:
+            self.client.post("file/recycle/recover",body={"fid_list":[row["fid"] for row in candidates.values()]})
+        except Exception as error:
+            for index in candidates:results[index].update(state="unknown",detail=describe_error(error,"恢复")+"；已提交，未重发，请刷新核实")
+            return results
+        pending = set(candidates)
+        detail = "恢复已提交，结果尚未确认；未重发，请刷新核实"
+        for attempt in range(6):
+            if progress:progress(f"正在核实恢复结果，已确认 {len(candidates)-len(pending)}/{len(candidates)} 条…")
+            try:
+                recycled = {row["record_id"] for row in self.listing()}
+                self.files.reset()
+                parents = {candidates[index]["parent"] for index in pending}
+                restored = {parent:{valid_fid(row["fid"]):row for row in self.files.paths.children(parent)} for parent in parents}
             except Exception as error:
-                results.append(
-                    {
-                        "record_id": entry.get("record_id"),
-                        "name": entry.get("name", ""),
-                        "state": "unknown" if submitted else "failed",
-                        "detail": describe_error(error, "回收站操作")
-                        + ("；已提交，未重发，请刷新核实" if submitted else ""),
-                    }
-                )
+                detail = describe_error(error,"恢复结果核验")+"；未重发，请刷新核实";break
+            for index in tuple(pending):
+                actual = candidates[index]
+                row = restored[actual["parent"]].get(actual["fid"])
+                if actual["record_id"] not in recycled and row is not None:
+                    if (row.get("file_name") != actual["name"] or is_directory(row) != actual["directory"]
+                            or (not actual["directory"] and row.get("size") != actual["size"])):
+                        results[index].update(state="unknown",detail="恢复后的对象与原记录不符；未重发，请刷新核实")
+                    else:results[index].update(state="done",detail="已恢复到原目录")
+                    pending.remove(index)
+            if not pending:break
+            if attempt < 5:time.sleep(0.5)
+        for index in pending:results[index].update(state="unknown",detail=detail)
         return results

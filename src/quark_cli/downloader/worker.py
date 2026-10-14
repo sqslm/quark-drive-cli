@@ -243,7 +243,7 @@ class DriveBackend:
         self._cookie = cookie
         self._transport = transport
         self._guard = default_guard(transport, None)
-        # Interactive desktop writes retain the shared durable cooldown, with
+        # Interactive desktop operations retain the shared durable cooldown, with
         # shorter spacing than unattended scans/transfers.
         from ..request_guard import RequestGuard
         self._operation_guard = RequestGuard.memory() if isinstance(transport, httpx.MockTransport) else RequestGuard.durable(pacing=0.1)
@@ -272,7 +272,7 @@ class DriveBackend:
             stream(Files(client), request.fid, request.query, request.recursive, report, stopped)
 
     def locate(self, entry: Entry) -> Entry:
-        with self._client() as client:
+        with self._client(interactive=True) as client:
             paths = RemotePaths(Files(client))
             item = Files(client).info(entry.fid)
             if item.get("file_name") != entry.name or is_directory(item) != entry.directory:
@@ -293,8 +293,8 @@ class DriveBackend:
             return replace(entry, path=path, location=chain if entry.directory else chain[:-1])
 
     def listing(self, fid: str) -> list[Entry]:
-        with self._client() as client:
-            payload = Files(client).list_all(fid)
+        with self._client(interactive=True) as client:
+            payload = Files(client).list_all(fid, size=100)
         return entries(payload["data"]["list"])
 
     def share_listing(self, source: ShareSource, path: str) -> list[Entry]:
@@ -305,7 +305,7 @@ class DriveBackend:
         absolute path inside the share, which is what the download request needs
         as the source folder.
         """
-        with self._client() as client:
+        with self._client(interactive=True) as client:
             payload = ShareSaver(client).inspect(source.url, path=path, passcode=source.passcode)
         parent = path.rstrip("/") if path not in ("", "/") else ""
         return [replace(row, path=f"{parent}/{row.name}") for row in entries(payload["items"])]

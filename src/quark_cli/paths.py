@@ -82,6 +82,9 @@ class RemotePaths:
                 raise RemoteError("目录列表的父 FID 与请求不符")
         return records
 
+    def _fid_matches(self, parent: str, fid: str) -> list[dict[str, Any]]:
+        return [child for child in self.children(parent) if valid_fid(child.get("fid")) == fid]
+
     def _match(self, fid: str, name: str) -> dict[str, Any] | None:
         matches = [item for item in self.children(fid) if item.get("file_name") == name]
         if len(matches) > 1:
@@ -161,7 +164,7 @@ class RemotePaths:
                 raise UsageError("父目录信息缺失，无法确认对象范围") from None
             if parent == current:
                 raise UsageError("父目录链出现循环，无法确认对象范围")
-            matches = [child for child in self.children(parent) if valid_fid(child.get("fid")) == current]
+            matches = self._fid_matches(parent, current)
             if len(matches) != 1:
                 raise UsageError("对象不在其声明的父目录中，无法确认对象范围")
             listed = matches[0]

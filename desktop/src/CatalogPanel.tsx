@@ -13,7 +13,7 @@ export function CatalogPanel({mode,busy,onStatus}: {mode:'shares'|'recycle';busy
   const [ready,setReady] = useState(false);
   const [confirm,setConfirm] = useState<'revoke'|'restore'|'remove'|null>(null);
   const [confirmed,setConfirmed] = useState(false);
-  const [results,setResults] = useState<{record_id?:string;name:string;detail:string;state:string}[]|null>(null);
+  const [results,setResults] = useState<{record_id?:string;share_id?:string;name:string;detail:string;state:string}[]|null>(null);
   const [stage,setStage] = useState('');
   const [now,setNow] = useState(Date.now);
   const scroll = useRef<HTMLDivElement>(null);
@@ -40,19 +40,17 @@ export function CatalogPanel({mode,busy,onStatus}: {mode:'shares'|'recycle';busy
   async function submit() {
     setLoading(true);setError('');
     const id=crypto.randomUUID();
-    setStage(confirm === 'remove' ? `正在核验 ${picked.length} 条待删除记录…` : '');
-    const off=window.quark.onEvent(event => {if(event.id === id && event.event === 'recycle.progress') setStage(String(event.data));});
+    setStage(`正在核验 ${picked.length} 个选中项目…`);
+    const off=window.quark.onEvent(event => {if(event.id === id && ['recycle.progress','share.progress'].includes(event.event)) setStage(String(event.data));});
     try {
       const response = await window.quark.call(confirm === 'revoke' ? 'share.revoke' : confirm === 'restore' ? 'recycle.restore' : 'recycle.remove',{entries:picked},id);
       setResults(response);
-      if(confirm === 'remove') {
-        const done=new Set<string>(response.filter((row:{state:string}) => row.state === 'done').map((row:{record_id:string}) => row.record_id));
-        setRows(old => old.filter(row => !done.has(key(row))));
-        setSelected(old => new Set([...old].filter(value => !done.has(value))));
-        if(response.some((row:{state:string}) => row.state === 'unknown')) {
-          setReady(false);setError('有未确认的删除结果，请刷新核实后再操作。');
-        }
-      } else await refresh();
+      const done=new Set<string>(response.filter((row:{state:string}) => row.state === 'done').map((row:Row) => key(row)));
+      setRows(old => old.filter(row => !done.has(key(row))));
+      setSelected(old => new Set([...old].filter(value => !done.has(value))));
+      if(response.some((row:{state:string}) => row.state === 'unknown')) {
+        setReady(false);setError('有未确认的操作结果，请刷新核实后再操作。');
+      }
       const failed = response.some((row:{state:string}) => row.state !== 'done');onStatus(failed ? '部分项目未完成，请查看逐项结果' : '操作已完成，请查看逐项结果', failed ? 'warning' : 'success');
     } catch(error) {const text=error instanceof Error ? error.message : '操作失败';setError(text);onStatus(text,'error');}
     finally {off();setStage('');setLoading(false);}

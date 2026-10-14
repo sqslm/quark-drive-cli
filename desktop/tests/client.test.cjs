@@ -47,13 +47,14 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.18',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.19',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
           if(method === 'favorites.add') {const [fid,name]=params.trail.at(-1);favorites=[...favorites.filter(row => row.fid !== fid),{fid,name}];return favorites;}
           if(method === 'favorites.remove') {favorites=favorites.filter(row => row.fid !== params.fid);return favorites;}
           if(method === 'favorites.open') return [['0','我的网盘'],[params.fid,favorites.find(row => row.fid === params.fid).name]];
+          if(method === 'file.paths') return params.entries.map(row => ({fid:row.fid,path:'/'+row.name}));
           if(method === 'file.info') return {file_name:params.entry.name,size:3489662954,path:'/'+params.entry.name,directory:false};
           if(method === 'tasks') return tasks.map(task => ({...task}));
           if(method === 'browse') {
@@ -61,7 +62,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
             if(window.testBrowseFailure) throw new Error('测试目录读取失败');
             return rows.filter(row => (row.parent || '0') === (params.fid || '0')).map(row => ({...row}));
           }
-          if(method === 'file.mkdir') { rows.push({fid:'new',name:params.name,directory:true,size:null,path:'',location:[]}); return {fid:'new'}; }
+          if(method === 'file.mkdir') { listeners.forEach(callback => callback({id,event:'file.progress',data:'正在创建目录…'}));listeners.forEach(callback => callback({id:'old-file-operation',event:'file.progress',data:'过期文件进度'}));if(window.testHoldMkdir) await new Promise(resolve => {window.releaseMkdir=resolve;});rows.push({fid:'new',name:params.name,directory:true,size:null,path:'',location:[]}); return {fid:'new'}; }
           if(method === 'file.rename') { const row = rows.find(row => row.fid === params.entries[0].fid); row.name = params.name; return [{ name:row.name,state:'done',detail:'操作完成'}]; }
           if(method === 'file.cut') {cut={id:'cut-current',entries:params.entries,blocked:false};return cut;}
           if(method === 'file.clearCut') {cut=null;return null;}
@@ -80,7 +81,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
           if(method === 'share.create') { listeners.forEach(callback => callback({id,event:'share.progress',data:'正在等待服务器生成链接…'})); await new Promise(resolve => {window.releaseShareCreate = resolve;});const result={result:'created',share_id:'own-new',pwd_id:'new-public',title:params.entry.name,share_url:'https://pan.quark.cn/s/new-public',passcode:params.passcode,expired_type:4,expired_at:Date.now()+720*3600000};shares.push(result);return result; }
           if(method === 'share.list') return {items:shares.map(row => ({...row})),catalog_complete:true};
           if(method === 'share.link') return shares.find(row => row.share_id === params.share_id);
-          if(method === 'share.revoke') {shares=shares.filter(row => !params.entries.some(entry => entry.share_id === row.share_id));return params.entries.map(row => ({name:row.title,state:'done',detail:'已取消分享'}));}
+          if(method === 'share.revoke') {listeners.forEach(callback => callback({id,event:'share.progress',data:'正在批量取消 1 个分享…'}));if(window.testHoldRevoke) await new Promise(resolve => {window.releaseRevoke=resolve;});shares=shares.filter(row => !params.entries.some(entry => entry.share_id === row.share_id));return params.entries.map(row => ({share_id:row.share_id,name:row.title,state:'done',detail:'已取消分享'}));}
           if(method === 'recycle.list') return recycle.map(row => ({...row}));
           if(method === 'recycle.remove' || method === 'recycle.restore') {
             const unknown=method === 'recycle.remove' ? (window.testRecycleUnknownIds || []) : [];
@@ -159,7 +160,12 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByLabel('格式筛选',{exact:true}).selectOption('');
     await page.getByRole('button',{name:'新建目录',exact:true}).click();
     await page.getByLabel('新名称').fill('新建测试');
+    await page.evaluate(() => {window.testHoldMkdir=true;});
     await page.getByRole('button',{name:'确认',exact:true}).click();
+    await page.locator('.file-progress').getByText('正在创建目录…',{exact:true}).waitFor();
+    assert.equal(await page.getByText('过期文件进度',{exact:true}).count(),0);
+    assert.ok(await page.getByRole('button',{name:'处理中…',exact:true}).isDisabled());
+    await page.evaluate(() => {window.testHoldMkdir=false;window.releaseMkdir();});
     await page.getByText('显示 10001 项',{exact:true}).waitFor();
     const created = await page.evaluate(() => window.testCalls.find(call => call.method === 'file.mkdir'));
     assert.equal(created.params.parent,'0'); assert.equal(created.params.name,'新建测试');
@@ -265,6 +271,12 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByLabel('选择 知否 00003.txt',{exact:true}).check();
     await page.locator('.file-row').filter({hasText:'知否 00001.txt'}).click({button:'right'});
     await page.getByRole('menuitem',{name:'下载（2）',exact:true}).waitFor();
+    await page.getByRole('menuitem',{name:/^复制路径/}).click();
+    await page.locator('.toast.success').getByText('已复制 2 项路径',{exact:true}).waitFor();
+    const pathRequests=await page.evaluate(() => window.testCalls.filter(call => call.method === 'file.paths'));
+    assert.equal(pathRequests.length,1);
+    assert.deepEqual(pathRequests[0].params.entries.map(row => row.fid),['1','3']);
+    assert.ok(await page.evaluate(() => window.testCalls.some(call => call.method === 'clipboard' && call.params.text === '/知否 00001.txt\n/知否 00003.txt')));
     await page.keyboard.press('Escape');
     await page.getByLabel('选择 知否 00003.txt',{exact:true}).uncheck();
     await page.getByLabel('选择 知否 00001.txt',{exact:true}).check();
@@ -297,8 +309,14 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'share.list').length),1);
     await page.getByLabel('选择记录 知否 00001.txt',{exact:true}).check();
     await page.getByRole('button',{name:'取消选中分享',exact:true}).click();
+    await page.evaluate(() => {window.testHoldRevoke=true;});
     await page.getByRole('button',{name:'确认',exact:true}).click();
+    await page.locator('.catalog-progress').getByText('正在批量取消 1 个分享…',{exact:true}).waitFor();
+    assert.ok(await page.getByRole('button',{name:'处理中…',exact:true}).isDisabled());
+    await page.evaluate(() => {window.testHoldRevoke=false;window.releaseRevoke();});
     await page.getByText('知否 00001.txt：已取消分享',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'share.list').length),1);
+    assert.equal(await page.getByLabel('选择记录 知否 00001.txt',{exact:true}).count(),0);
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     await page.getByRole('button',{name:'回收站',exact:true}).click();
     await page.getByLabel('选择记录 测试删除.txt',{exact:true}).check();
@@ -321,6 +339,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button',{name:'恢复选中记录',exact:true}).click();
     await page.getByRole('button',{name:'确认',exact:true}).click();
     await page.getByText('测试恢复.txt：已恢复到原目录',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'recycle.list').length),1);
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     await page.evaluate(() => {window.testSetRecycle([
       {record_id:'partial-done',fid:'partial-a',name:'已确认删除.txt',directory:false,size:4,parent:'0'},

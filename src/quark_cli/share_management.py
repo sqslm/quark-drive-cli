@@ -475,7 +475,9 @@ class ShareManager:
     def _poll_creation(self, task_id: str, metadata: Any) -> tuple[dict[str, Any], bool]:
         delay, incomplete = _poll_delay(metadata), False
         for retry in range(_MAX_POLLS):
-            time.sleep(delay)
+            gap = metadata.get('tq_gap') if isinstance(metadata,dict) else None
+            if retry or (_number(gap) and gap > 0):
+                time.sleep(delay)
             payload = self._call("get", "task", params={"task_id": task_id, "retry_index": retry})
             data = payload.get("data")
             if not isinstance(data, dict):

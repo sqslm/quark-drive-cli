@@ -37,6 +37,47 @@ class Backend:
 
 
 class DesktopTests(unittest.TestCase):
+    def test_crud_request_and_pacing_budgets_without_network_latency(self):
+        from quark_cli.request_guard import RequestGuard
+        from tests.test_desktop_files import Drive, entry
+        from tests.test_desktop_recycle import RecycleDrive, record
+        from share_management_fixture import ManagementFixture
+        from quark_cli.desktop.sharing import Sharing
+        from quark_cli.client import QuarkClient
+        cases={'browse':1,'file.paths':2,'file.info':2,'file.mkdir':3,'file.rename':4,
+               'file.move':6,'file.delete':4,'recycle.remove':3,'recycle.restore':5,
+               'share.create':21,'share.revoke':3,'share.list':1,'share.link':2}
+        for method,budget in cases.items():
+            with self.subTest(method=method):
+                drive=Drive([item('a','A.txt',size=3),item('target','Target',directory=True)])
+                params={'entries':[entry('a','A.txt',size=3)],'entry':entry('a','A.txt',size=3),
+                        'name':'New.txt','target':'target','parent':'0','fid':'0'}
+                if method.startswith('recycle.'):
+                    drive=RecycleDrive([record(str(n),f'f{n}',f'{n}.txt') for n in range(40)])
+                    params={'entries':[{'record_id':str(n),'fid':f'f{n}','name':f'{n}.txt',
+                        'directory':False,'size':4,'parent':'0'} for n in range(40)]}
+                if method.startswith('share.'):
+                    drive=ManagementFixture();params={'entry':entry('child','中文 空格',True)}
+                    if method in ('share.revoke','share.list','share.link'):
+                        for n in range(40):drive.add_share(f'own-{n}',['file'])
+                        with QuarkClient(COOKIE,transport=drive.transport()) as client:
+                            params={'entries':Sharing(client).manager.list_own(all_pages=True)['items'],'share_id':'own-0'}
+                        drive.calls.clear()
+                clock=[0.0]
+                backend=DriveBackend(lambda:COOKIE,transport=drive.transport())
+                def sleep(delay):clock[0]+=delay
+                backend._operation_guard=RequestGuard.memory(pacing=.1,clock=lambda:clock[0],sleep=sleep)
+                backend._guard=RequestGuard.memory(pacing=.5,clock=lambda:clock[0],sleep=sleep)
+                with tempfile.TemporaryDirectory() as directory:
+                    service=DesktopService(lambda message:None,backend=backend,directory=Path(directory))
+                    try:
+                        result=service.dispatch('budget',method,params,None)
+                        if method in ('file.rename','file.move','file.delete','recycle.remove','recycle.restore','share.revoke'):
+                            self.assertTrue(all(row['state'] == 'done' for row in result))
+                    finally:service.shutdown()
+                self.assertLessEqual(len(drive.calls if hasattr(drive,'calls') else drive.requests),budget)
+                self.assertLessEqual(clock[0],(budget-1)*.1+.00001)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

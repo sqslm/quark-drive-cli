@@ -221,6 +221,17 @@ class FilesTests(unittest.TestCase):
             with self.assertRaisesRegex(RemoteError, "拒绝"):
                 Files(client).move("source", "target", poll_interval=0)
 
+    def test_move_checks_immediately_unless_server_requires_a_gap(self):
+        for gap in (None,250):
+            with self.subTest(gap=gap):
+                def handler(request):
+                    payload=ok({'task_id':'task'},metadata={} if gap is None else {'tq_gap':gap}) if request.method == 'POST' else ok({'status':2})
+                    return httpx.Response(200,json=payload,request=request)
+                with patch('quark_cli.files.time.sleep') as sleep, QuarkClient('sid=x',transport=httpx.MockTransport(handler)) as client:
+                    Files(client).move('source','target')
+                if gap is None:sleep.assert_not_called()
+                else:sleep.assert_called_once_with(.25)
+
 
 if __name__ == "__main__":
     unittest.main()

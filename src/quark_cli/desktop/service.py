@@ -285,7 +285,7 @@ class DesktopService:
                 clipboard['blocked'] = True
                 with self.backend._client(interactive=True) as client:
                     try:
-                        results = FileOperations(client).paste(clipboard['entries'],p['target'])
+                        results = FileOperations(client,progress=lambda text:self.event(identifier,'file.progress',text)).paste(clipboard['entries'],p['target'])
                     except QuarkError:
                         # paste reports write outcomes; an exception here is
                         # target preflight, before any move was submitted.
@@ -298,7 +298,7 @@ class DesktopService:
                     self.cut = None
                 return {'results':results,'clipboard':self.cut_view()}
         if method in ('share.list','share.link','recycle.list'):
-            with self.backend._client() as client:
+            with self.backend._client(interactive=True) as client:
                 if method == 'recycle.list':
                     return Recycle(client).listing()
                 sharing = Sharing(client)
@@ -306,7 +306,7 @@ class DesktopService:
                     return sharing.manager.list_own(all_pages=True)
                 return sharing.link(p['share_id'])
         if method in ('share.create','share.revoke','share.save','recycle.restore','recycle.remove'):
-            with self.mutation(), self.backend._client() as client:
+            with self.mutation(), self.backend._client(interactive=True) as client:
                 if method.startswith('recycle.'):
                     return Recycle(client).apply(method.split('.')[1], p['entries'],
                         progress=lambda text: self.event(identifier, 'recycle.progress', text))
@@ -314,7 +314,8 @@ class DesktopService:
                 if method == 'share.save':
                     source = self.sources[p['handle']]
                     try:
-                        return sharing.save(source, str(p.get('path','/')), p['entries'], p['target'])
+                        return sharing.save(source, str(p.get('path','/')), p['entries'], p['target'],
+                            progress=lambda text:self.event(identifier,'share.progress',text))
                     except UsageError:
                         raise
                     except QuarkError as error:
@@ -330,34 +331,19 @@ class DesktopService:
                         if not evidence:
                             raise
                         return {**evidence, 'detail':describe_error(error,'创建分享')}
-                results = []
-                seen = set()
-                for entry in p['entries']:
-                    share_id = entry['share_id']
-                    try:
-                        if share_id in seen:
-                            raise UsageError('重复选择分享')
-                        seen.add(share_id)
-                        current = sharing.manager._own_record(share_id)
-                        if any(current.get(key) != entry.get(key) for key in ('pwd_id','title','share_url')):
-                            raise UsageError('本人分享记录已变化，请刷新后选择')
-                        result = sharing.manager.revoke(share_id)
-                        results.append({**result,'name':entry.get('title',share_id),'state':'done','detail':'已取消分享'})
-                    except QuarkError as error:
-                        evidence = safe_operation_result(getattr(error,'share_evidence',{}))
-                        results.append({**evidence,'share_id':share_id,'name':entry.get('title',share_id),
-                                        'state':'unknown' if evidence.get('result') == 'unknown' else 'failed',
-                                        'detail':describe_error(error,'取消分享')})
-                return results
+                return sharing.revoke(p['entries'],progress=lambda text:self.event(identifier,'share.progress',text))
         if method.startswith("file."):
             if p.get("handle"):
                 raise UsageError("分享文件只读，不能修改")
-            with self.mutation() if method != 'file.info' else self.writes:
+            readonly = method in ('file.info','file.paths')
+            with self.mutation() if not readonly else self.writes:
                 with self.lock:
-                    if (self.busy or self.logging_in) and method != "file.info":
+                    if (self.busy or self.logging_in) and not readonly:
                         raise UsageError("请先停止传输再修改网盘文件")
                 with self.backend._client(interactive=True) as client:
-                    operations = FileOperations(client)
+                    operations = FileOperations(client,progress=lambda text:self.event(identifier,'file.progress',text))
+                    if method == 'file.paths':
+                        return operations.info_many(p['entries'])
                     if method == "file.info":
                         return operations.info(p["entry"])
                     if method == "file.mkdir":
@@ -759,7 +745,7 @@ class DesktopService:
 
 METHODS = frozenset({"hello", "account", "browse", "search", "search.cancel", "locate", "share.parse",
     "share.open", "share.browse", "preferences.save", "login", "login.cancel", "download", "download.stop", "tasks", "tasks.retry",
-    "file.info", "file.mkdir", "file.rename", "file.move", "file.delete",
+    "file.info", "file.paths", "file.mkdir", "file.rename", "file.move", "file.delete",
     "upload", "tasks.cancel", "tasks.pause", "tasks.remove", "tasks.clear", "tasks.authorize",
     'share.list','share.link','share.create','share.revoke','share.save','recycle.list','recycle.restore','recycle.remove',
     'file.cut','file.paste','file.clearCut',

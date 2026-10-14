@@ -36,7 +36,7 @@ export function SharingDialog({mode,entries,handle,path,close,onStatus}: {
     try {
       const response = mode === 'create'
         ? await window.quark.call('share.create',{entry:entries[0],expire_days:Number(days),passcode:code,handle},id)
-        : await window.quark.call('share.save',{entries,handle,path,target:trail.at(-1)![0]});
+        : await window.quark.call('share.save',{entries,handle,path,target:trail.at(-1)![0]},id);
       setResult(response);
       onStatus(mode === 'create' ? response.result === 'created' ? '分享已创建并核验' : '分享结果未完整确认，请查看对话框' : response.saved ? `已永久转存 ${response.item_count} 项` : '转存结果未确认，请检查目标目录',response.result === 'created' || response.saved ? 'success' : 'warning');
     } catch(error) { const text=error instanceof Error ? error.message : '操作失败';setError(text);onStatus(text,'error'); }

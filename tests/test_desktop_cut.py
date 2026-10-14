@@ -27,6 +27,8 @@ class CutTests(unittest.TestCase):
             self.call(service,'file.info',{'entry':entry('a','A.txt',size=3)})
         with self.assertRaises(RateLimitError):
             service.backend.listing('0')
+        with self.assertRaises(RateLimitError), service.backend._client() as client:
+            client.get('file/sort',params={'pdir_fid':'0'})
         self.assertEqual(len(drive.requests),1)
 
     def test_interactive_paste_reuses_info_and_shortens_pacing(self):
