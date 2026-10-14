@@ -16,14 +16,16 @@ function TransferProgress({task}:{task:Task}) {
   const progress=task.progress;
   if(!progress) return <p title={task.target}>{task.pausing || task.removing ? '正在安全停止…' : task.state === 'running' ? '正在准备传输…' : task.state === 'waiting' ? '等待进入传输队列' : task.detail || task.target}</p>;
   const active=task.state === 'running' && !task.pausing && !task.removing;
-  const preparing=['hashing','hashing_context','authorizing','verifying','merging'].includes(progress.phase);
-  const phase=phases[progress.phase] || '正在处理';
   const bytes=active || task.state === 'done' ? progress.transferred : progress.confirmed;
   const total=progress.total;
   const known=total !== null && Number.isFinite(total) && total > 0;
+  const uploadStarted=task.direction === 'upload' && progress.transferred > 0;
+  const uploadFinishing=uploadStarted && ((known && progress.confirmed >= total) || (!progress.recursive && ['verifying','merging','completed'].includes(progress.phase)));
+  const preparing=!uploadStarted && ['hashing','hashing_context','authorizing','verifying','merging'].includes(progress.phase);
+  const phase=uploadStarted ? uploadFinishing ? '正在完成上传…' : '正在上传' : phases[progress.phase] || '正在处理';
   const fraction=preparing && active && bytes === 0 ? null : known ? Math.min(100,Math.max(0,bytes/total*100)) : total === 0 && task.state === 'done' ? 100 : null;
   const rate=active && !preparing && Number.isFinite(progress.rate) && progress.rate > 0 ? progress.rate : 0;
-  const eta=known && rate > 0 && bytes < total && !['saving','cleaning','completed'].includes(progress.phase) ? (total-bytes)/rate : null;
+  const eta=known && rate > 0 && bytes < total && !uploadFinishing && !['saving','cleaning','completed'].includes(progress.phase) ? (total-bytes)/rate : null;
   const connections=active && !preparing && (task.direction || 'download') === 'download' && !['saving','cleaning','completed'].includes(progress.phase);
   return <div className="task-progress">
     <p className="progress-file" title={progress.name}>{active && !['saving','cleaning'].includes(progress.phase) ? `${progress.recursive ? '目录总进度 · ' : ''}当前文件：${progress.name}` : progress.recursive ? '目录总进度' : '文件传输进度'}</p>

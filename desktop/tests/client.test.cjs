@@ -47,7 +47,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.16',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.17',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
@@ -662,7 +662,31 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await progressRow('准备上传.bin').getByRole('progressbar').getAttribute('aria-valuetext'),'正在计算文件哈希');
     assert.ok(await progressRow('准备上传.bin').getByRole('button',{name:'暂停',exact:true}).isEnabled());
     assert.equal(await progressRow('授权下一段.bin').getByRole('progressbar').getAttribute('aria-valuenow'),'25');
+    await progressRow('授权下一段.bin').getByText('速度 5.0 MB/s',{exact:true}).waitFor();
+    await progressRow('授权下一段.bin').locator('.progress-phase').getByText('正在上传',{exact:true}).waitFor();
+    await progressRow('准备上传.bin').getByText('速度 —',{exact:true}).waitFor();
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/upload-progress-light.png')});
+    for(const [index,phase] of ['hashing_context','transferring','part_confirmed','authorizing'].entries()) {
+      await page.evaluate(({phase,index}) => {const task=window.testGetTasks().find(task => task.id === 'px');window.testEmit({id:null,event:'task',data:{...task,revision:index+2,progress:{...task.progress,phase}}});},{phase,index});
+      await progressRow('授权下一段.bin').locator('.progress-phase').getByText('正在上传',{exact:true}).waitFor();
+      await progressRow('授权下一段.bin').getByText('速度 5.0 MB/s',{exact:true}).waitFor();
+      await progressRow('授权下一段.bin').getByText('预计剩余 约 6 秒',{exact:true}).waitFor();
+    }
+    for(const [index,phase] of ['verifying','merging','completed'].entries()) {
+      await page.evaluate(({phase,index}) => {const task=window.testGetTasks().find(task => task.id === 'px');window.testEmit({id:null,event:'task',data:{...task,revision:index+6,progress:{...task.progress,phase,transferred:task.progress.total,confirmed:task.progress.total}}});},{phase,index});
+      await progressRow('授权下一段.bin').locator('.progress-phase').getByText('正在完成上传…',{exact:true}).waitFor();
+      await progressRow('授权下一段.bin').getByText('速度 5.0 MB/s',{exact:true}).waitFor();
+      await progressRow('授权下一段.bin').getByText('预计剩余 —',{exact:true}).waitFor();
+    }
+    for(const [index,phase] of ['verifying','merging'].entries()) {
+      await page.evaluate(({phase,index}) => {const task=window.testGetTasks().find(task => task.id === 'px');window.testEmit({id:null,event:'task',data:{...task,revision:index+9,progress:{...task.progress,phase,recursive:true}}});},{phase,index});
+      await progressRow('授权下一段.bin').locator('.progress-phase').getByText('正在上传',{exact:true}).waitFor();
+      await progressRow('授权下一段.bin').getByText('速度 5.0 MB/s',{exact:true}).waitFor();
+    }
+    await page.evaluate(() => {const task=window.testGetTasks().find(task => task.id === 'px');window.testEmit({id:null,event:'task',data:{...task,revision:11,pausing:true}});});
+    await progressRow('授权下一段.bin').locator('.progress-phase').getByText('正在安全停止…',{exact:true}).waitFor();
     await progressRow('授权下一段.bin').getByText('速度 —',{exact:true}).waitFor();
+    await progressRow('授权下一段.bin').getByText('预计剩余 —',{exact:true}).waitFor();
     await progressRow('上传文件.bin').getByText('速度 5.0 MB/s',{exact:true}).waitFor();
     await progressRow('上传文件.bin').getByText('预计剩余 约 4 秒',{exact:true}).waitFor();
     assert.equal(await progressRow('上传文件.bin').getByText('连接 1',{exact:true}).count(),0);
