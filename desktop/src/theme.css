@@ -100,6 +100,7 @@ aside{padding-top:28px}.brand{padding-bottom:30px;letter-spacing:.2px}.brand sma
 .transfer-setting+.transfer-setting{border-top:1px solid var(--line)}.transfer-setting label{margin:0;font-weight:500}.transfer-setting p{font-size:11px;margin:6px 0 0}
 .transfer-setting>input{min-width:0;width:100%;padding:9px}.setting-slider{display:flex;align-items:center;gap:12px;min-width:0;font-variant-numeric:tabular-nums;color:var(--secondary);font-size:12px}
 .setting-slider input[type=range]{appearance:none;min-width:0;width:100%;height:4px;padding:0;border:0;border-radius:4px;background:linear-gradient(to right,var(--blue) var(--range-fill),var(--control-border) var(--range-fill));cursor:pointer}
+.setting-slider input[type=range]:focus{outline:none}
 .setting-slider input[type=range]::-webkit-slider-thumb{appearance:none;width:15px;height:15px;background:var(--blue);border:2px solid var(--surface);border-radius:50%;box-shadow:0 0 0 1px var(--blue)}
 .setting-slider input:disabled{opacity:.45;cursor:default}.setting-slider span:last-child{min-width:22px;text-align:right}
 .notification-option{display:flex!important;align-items:center;gap:10px}.desktop-options .notification-option input{margin:0;width:15px;height:15px;accent-color:var(--blue)}

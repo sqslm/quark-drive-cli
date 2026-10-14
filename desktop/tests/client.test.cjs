@@ -260,10 +260,12 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await page.getByRole('spinbutton',{name:'线程数',exact:true}).inputValue(),'1');
     await page.getByRole('spinbutton',{name:'线程数',exact:true}).fill('8');
     assert.equal(await threadSlider.inputValue(),'8');
+    assert.equal(await page.getByRole('spinbutton',{name:'线程数',exact:true}).evaluate(element => getComputedStyle(element).outlineStyle),'solid');
     const sliderBounds=await threadSlider.boundingBox();
     await page.mouse.move(sliderBounds.x+7.5+(sliderBounds.width-15)*7/15,sliderBounds.y+sliderBounds.height/2);
     await page.mouse.down();
     await page.mouse.move(sliderBounds.x+sliderBounds.width*.85,sliderBounds.y+sliderBounds.height/2,{steps:5});
+    assert.equal(await threadSlider.evaluate(element => getComputedStyle(element).outlineStyle),'none');
     await page.mouse.up();
     const dragged=await threadSlider.inputValue();
     assert.ok(Number(dragged) > 8 && Number(dragged) <= 16);
@@ -271,6 +273,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('spinbutton',{name:'线程数',exact:true}).fill('8');
     const rateSlider=page.getByRole('slider',{name:'拖动调整总限速',exact:true});
     await rateSlider.focus();await rateSlider.press('End');
+    assert.equal(await rateSlider.evaluate(element => getComputedStyle(element).outlineStyle),'none');
     assert.equal(await page.getByRole('spinbutton',{name:'总限速',exact:true}).inputValue(),'100');
     await rateSlider.press('Home');
     assert.equal(await page.getByRole('spinbutton',{name:'总限速',exact:true}).inputValue(),'0');
@@ -451,6 +454,7 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     const packagedIcon=path.join(path.dirname(executable),'resources/app-icon.ico');
     const iconHeader=await readFile(packagedIcon);
     assert.equal(iconHeader.readUInt16LE(2),1);assert.ok(iconHeader.readUInt16LE(4) >= 6);
+    assert.deepEqual(iconHeader,await readFile(path.resolve(__dirname,'../assets/app-icon.ico')));
     await page.locator('.brand-logo').waitFor();
     await page.waitForFunction(() => document.querySelector('.brand-logo').naturalWidth > 0);
     await app.evaluate(({BrowserWindow}) => BrowserWindow.getAllWindows()[0].close());
