@@ -20,6 +20,7 @@ class AuthenticationError(QuarkError):
 class RemoteError(QuarkError):
     exit_code = 4
     label = "remote_error"
+    http_status: int | None = None
 
 
 class NetworkError(RemoteError):

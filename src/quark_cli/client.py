@@ -308,7 +308,9 @@ class QuarkClient:
                     retry_after=remaining,
                 )
         if status < 200 or status >= 300:
-            raise RemoteError(f"夸克 API 返回 HTTP {status}")
+            error = RemoteError(f"夸克 API 返回 HTTP {status}")
+            error.http_status = status
+            raise error
 
     def _retry_after_seconds(self, response: httpx.Response) -> float | None:
         """Parse Retry-After (delay-seconds or HTTP-date); None when absent/invalid."""

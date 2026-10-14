@@ -47,7 +47,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.15',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.16',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
@@ -586,11 +586,21 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.setViewportSize({width:860,height:600});
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true);
     await page.setViewportSize({width:1180,height:780});
+    await directions.getByRole('button',{name:/^下载/}).click();
+    await page.getByText('下载成功.txt',{exact:true}).waitFor();
     await page.getByRole('button',{name:'清理已完成记录',exact:true}).click();
-    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.clear').at(-1).params.ids),['dd','uw','ud']);
+    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.clear').at(-1).params.ids),['dd']);
+    await page.getByText('暂无已完成的下载任务',{exact:true}).waitFor();
+    assert.ok(await page.getByRole('button',{name:'清理已完成记录',exact:true}).isDisabled());
+    await directions.getByRole('button',{name:/^上传/}).click();
+    await page.getByText('上传成功.txt',{exact:true}).waitFor();
+    assert.equal(await page.locator('.task-row').count(),2);
+    await page.getByRole('button',{name:'清理已完成记录',exact:true}).click();
+    assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.clear').at(-1).params.ids),['uw','ud']);
     await page.getByText('暂无已完成的上传任务',{exact:true}).waitFor();
     await directions.getByRole('button',{name:/^下载/}).click();
     await page.getByText('暂无已完成的下载任务',{exact:true}).waitFor();
+    assert.ok(await page.getByRole('button',{name:'清理已完成记录',exact:true}).isDisabled());
     await completion.getByRole('button',{name:/^未完成/}).click();
     await page.getByText('下载取消.txt',{exact:true}).waitFor();
     assert.ok(await page.locator('.task-row').filter({hasText:'旧账号下载.txt'}).getByRole('button',{name:'开始',exact:true}).isDisabled());

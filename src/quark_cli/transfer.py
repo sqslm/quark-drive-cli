@@ -419,7 +419,8 @@ class Transfer:
         return result
 
     def _verify_uploaded(self, fid: str, parent: str, name: str, size: int, scope: Scope | None,
-                         saved_scope: str | None, *, local: dict[str, Any] | None = None) -> dict[str, Any]:
+                         saved_scope: str | None, *, local: dict[str, Any] | None = None,
+                         allow_missing: bool = False) -> dict[str, Any] | None:
         files = Files(self.client)
         for attempt in range(UPLOAD_READBACK_ATTEMPTS):
             if attempt:
@@ -427,7 +428,12 @@ class Transfer:
             # The expected parent predates this upload and is checked first.
             # Only its newly created child's missing index entry is retryable.
             self._scope(parent, scope, saved_scope, write=True)
-            item = files.info(fid)
+            try:
+                item = files.info(fid)
+            except RemoteError as error:
+                if allow_missing and error.http_status == 404:
+                    return None
+                raise
             identity = _remote_identity(item)
             if identity["parent"] != parent or identity["name"] != name or identity["size"] != size:
                 raise RemoteError("上传完成对象与请求的父目录、名称或大小不符")
@@ -496,20 +502,37 @@ class Transfer:
                 raise UsageError("夸克不支持上传空文件")
             data = ledger.load()
             resumed = data is not None
+            parent_rows = None
+            saved_scope = scope.fid if scope else None
             if data is not None:
                 if not resume:
                     raise UsageError("目标存在传输账本；使用 --resume 恢复原任务")
-                if data["local"] != local:
-                    raise LocalIOError("本地上传文件身份或完整哈希已变化，拒绝恢复")
                 self._parent(parent, scope, data["scope_fid"])
                 if data["phase"] == "completed":
-                    identity = self._verify_uploaded(data["final_fid"], parent, name, local["size"], scope, data["scope_fid"], local=local)
-                    if identity != data["final_identity"]:
-                        raise RemoteError("已完成上传的远端身份发生变化")
-                    if "updated_at" not in identity:
-                        raise RemoteError("已完成对象缺少可验证版本，不能仅凭名称/大小跳过")
-                    count = 0 if data["flash"] else len(data["parts"])
-                    return self._upload_result(data, count, True, count, include_resume=True)
+                    identity = self._verify_uploaded(data["final_fid"], parent, name, data["local"]["size"], scope,
+                        data["scope_fid"], local=data["local"], allow_missing=True)
+                    if identity is None:
+                        parent_rows = RemotePaths(Files(self.client)).children(parent)
+                        if any(str(row.get("fid", "")) == data["final_fid"] or str(row.get("file_name", "")).casefold() == name.casefold() for row in parent_rows):
+                            raise UsageError("旧上传对象不可访问或目标有同名项目，未重新上传")
+                        # Only a completed receipt with a missing exact FID and
+                        # an empty destination can become a new upload. Never
+                        # discard an unfinished or unknown write intent.
+                        saved_scope = data["scope_fid"]
+                        data = None
+                        resumed = False
+                    else:
+                        if data["local"] != local:
+                            raise LocalIOError("本地上传文件身份或完整哈希已变化，拒绝恢复")
+                        if identity != data["final_identity"]:
+                            raise RemoteError("已完成上传的远端身份发生变化")
+                        if "updated_at" not in identity:
+                            raise RemoteError("已完成对象缺少可验证版本，不能仅凭名称/大小跳过")
+                        count = 0 if data["flash"] else len(data["parts"])
+                        return self._upload_result(data, count, True, count, include_resume=True)
+            if data is not None:
+                if data["local"] != local:
+                    raise LocalIOError("本地上传文件身份或完整哈希已变化，拒绝恢复")
                 if data["phase"] in ("pre_submitting", "hash_submitting", "merge_submitting", "finish_submitting"):
                     raise RemoteError(f"上传处于 {data['phase']} 未知受理状态；无已证实的只读消歧接口，未重发写请求")
                 if data["phase"] == "finish_waiting":
@@ -517,13 +540,13 @@ class Transfer:
                     # Resolve its FID before testing same-name target conflicts.
                     self._confirm_finish_task(data, ledger)
             else:
-                self._parent(parent, scope)
-                rows = RemotePaths(Files(self.client)).children(parent)
+                self._parent(parent, scope, saved_scope)
+                rows = parent_rows if parent_rows is not None else RemotePaths(Files(self.client)).children(parent)
                 if any(str(row.get("file_name", "")).casefold() == name.casefold() for row in rows):
                     raise UsageError("远端目标同名文件或目录已存在，不能覆盖")
                 now = time.time()
                 data = {"version": 1, "direction": "upload", "phase": "prepared", "identity": ledger.identity,
-                        "local": local, "scope_fid": scope.fid if scope else None, "upload": {}, "parts": [], "flash": False,
+                        "local": local, "scope_fid": saved_scope, "upload": {}, "parts": [], "flash": False,
                         "upload_task_id": None, "finish_task_id": None, "final_fid": None, "final_identity": None, "callback_warning": False,
                         "created_at": now, "updated_at": now}
                 ledger.persist(data)

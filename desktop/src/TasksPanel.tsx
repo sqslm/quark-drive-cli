@@ -61,6 +61,7 @@ export function TasksPanel({ tasks,busy,onTasks,onStart,onEnd,onStatus }: {
     return next;
   },[tasks]);
   const visible=useMemo(() => tasks.filter(task => (task.direction === 'upload' ? 'upload' : 'download') === direction && (task.state === 'done') === completed),[tasks,direction,completed]);
+  const completedInDirection=useMemo(() => tasks.filter(task => (task.direction === 'upload' ? 'upload' : 'download') === direction && task.state === 'done'),[tasks,direction]);
   const scroll = useRef<HTMLDivElement>(null);
   const virtual = useVirtualizer({ count:visible.length,getScrollElement:() => scroll.current,estimateSize:() => 142,overscan:6 });
   function selectDirection(next:'download'|'upload') {setDirection(next);if(scroll.current) scroll.current.scrollTop=0;}
@@ -92,7 +93,7 @@ export function TasksPanel({ tasks,busy,onTasks,onStart,onEnd,onStatus }: {
     <div className="transfer-filters" role="group" aria-label="传输完成状态"><button aria-pressed={!completed} className={!completed ? 'active' : ''} onClick={() => selectCompleted(false)}>未完成<span>{counts[direction].pending}</span></button><button aria-pressed={completed} className={completed ? 'active' : ''} onClick={() => selectCompleted(true)}>已完成<span>{counts[direction].done}</span></button></div>
     <div className="toolbar"><button disabled={commandBusy || !tasks.some(eligible)} onClick={() => void command(() => start(tasks.filter(eligible).map(task => task.id)))}>开始全部</button>
       <button disabled={commandBusy || !busy} onClick={() => void command(async () => {await window.quark.call('download.stop');onStatus('正在暂停整个队列…');})}>暂停全部</button>
-      <button disabled={commandBusy || busy || !tasks.some(task => task.state === 'done')} onClick={() => void command(async () => {onTasks(await window.quark.call('tasks.clear',{ids:tasks.filter(task => task.state === 'done').map(task => task.id)}));onStatus('已清理已完成记录','success');})}>清理已完成记录</button></div>
+      <button disabled={commandBusy || busy || !completedInDirection.length} onClick={() => void command(async () => {onTasks(await window.quark.call('tasks.clear',{ids:completedInDirection.map(task => task.id)}));onStatus(`已清理${direction === 'upload' ? '上传' : '下载'}已完成记录`,'success');})}>清理已完成记录</button></div>
     <div className="task-list" ref={scroll}>{!visible.length && <div className="empty">{!tasks.length ? '尚无传输任务，请在文件页下载或上传' : `暂无${completed ? '已完成' : '未完成'}的${direction === 'upload' ? '上传' : '下载'}任务`}</div>}
       <div style={{height:virtual.getTotalSize(),position:'relative'}}>{virtual.getVirtualItems().map(item => { const task = visible[item.index]; return <div className="task-row virtual-task" key={task.id} style={{transform:`translateY(${item.start}px)`}}>
         <span className="task-direction">{task.direction === 'upload' ? '上传' : '下载'}</span><div><strong title={task.name}>{task.name}</strong><TransferProgress task={task}/></div><span className={'task-state ' + task.state}>{states[task.state] || task.state}</span>

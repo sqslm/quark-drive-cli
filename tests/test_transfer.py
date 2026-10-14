@@ -170,6 +170,86 @@ class TransferTests(unittest.TestCase):
         self.addCleanup(client.close)
         return Transfer(client, state_dir=state)
 
+    def test_upload_again_after_completed_remote_file_is_deleted(self):
+        for changed in (False,True):
+            with self.subTest(changed=changed),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);server=UploadServer();deleted=[False]
+                def handler(request):
+                    if request.url.path.endswith('/info') and request.url.params['fid'] == 'result' and deleted[0]:
+                        return httpx.Response(404,request=request)
+                    if request.url.path.endswith('/pre'):
+                        deleted[0]=False
+                    return server(request)
+                transfer=self._transfer(handler,root/'state');source=self._source(root)
+                transfer.upload(source,resume=True)
+                server.visible=False;server.parts.clear();deleted[0]=True
+                if changed:source.write_bytes(b'replacement upload bytes, different size')
+                result=transfer.upload(source,resume=True)
+                self.assertFalse(result['resumed'])
+                self.assertEqual(sum(call[0] == 'pre' for call in server.calls),2)
+                self.assertEqual(b''.join(server.parts.values()),source.read_bytes())
+
+    def test_completed_upload_404_with_name_or_fid_still_listed_keeps_receipt(self):
+        for same_fid in (False,True):
+            with self.subTest(same_fid=same_fid),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);server=UploadServer();missing=[False]
+                def handler(request):
+                    if missing[0] and request.url.path.endswith('/info') and request.url.params['fid'] == 'result':
+                        return httpx.Response(404,request=request)
+                    return server(request)
+                transfer=self._transfer(handler,root/'state');source=self._source(root)
+                transfer.upload(source,resume=True)
+                receipt=next((root/'state').glob('upload-*.json'));before=receipt.read_bytes()
+                missing[0]=True
+                if same_fid:server.item['file_name']='renamed.bin'
+                else:server.item.update(fid='different-owner',file_name='FILE.BIN')
+                with self.assertRaises(UsageError):transfer.upload(source,resume=True)
+                self.assertEqual(receipt.read_bytes(),before)
+                self.assertEqual(sum(call[0] == 'pre' for call in server.calls),1)
+
+    def test_completed_upload_other_read_failures_never_reset_receipt(self):
+        for failure in (401,403,500,'network','listing','parent'):
+            with self.subTest(failure=failure),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);server=UploadServer();failing=[False]
+                def handler(request):
+                    if failing[0] and request.url.path.endswith('/info'):
+                        fid=request.url.params['fid']
+                        if fid == 'result':
+                            if failure == 'network':raise httpx.ReadError('controlled read failure',request=request)
+                            return httpx.Response(failure if isinstance(failure,int) else 404,request=request)
+                        if failure == 'parent':return httpx.Response(404,request=request)
+                    if failing[0] and failure == 'listing' and request.url.path.endswith('/sort'):
+                        return httpx.Response(500,request=request)
+                    return server(request)
+                transfer=self._transfer(handler,root/'state');source=self._source(root)
+                transfer.upload(source,'folder',resume=True)
+                receipt=next((root/'state').glob('upload-*.json'));before=receipt.read_bytes()
+                server.visible=False;failing[0]=True
+                with self.assertRaises((RemoteError,AuthenticationError)):
+                    transfer.upload(source,'folder',resume=True)
+                self.assertEqual(receipt.read_bytes(),before)
+                self.assertEqual(sum(call[0] == 'pre' for call in server.calls),1)
+
+    def test_unverified_finished_upload_404_is_not_a_new_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);server=UploadServer();missing=[False]
+            def handler(request):
+                if missing[0] and request.url.path.endswith('/info') and request.url.params['fid'] == 'result':
+                    return httpx.Response(404,request=request)
+                return server(request)
+            transfer=self._transfer(handler,root/'state');source=self._source(root)
+            persist=TransferLedger.persist
+            def interrupt(ledger,data):
+                persist(ledger,data)
+                if data['phase'] == 'finish_confirmed':raise ProcessStopped()
+            with patch.object(TransferLedger,'persist',interrupt),self.assertRaises(ProcessStopped):
+                transfer.upload(source,resume=True)
+            receipt=next((root/'state').glob('upload-*.json'));before=receipt.read_bytes()
+            server.visible=False;missing[0]=True
+            with self.assertRaises(RemoteError):transfer.upload(source,resume=True)
+            self.assertEqual(receipt.read_bytes(),before)
+            self.assertEqual(sum(call[0] == 'pre' for call in server.calls),1)
+
     def _virtual_limiter(self):
         clock = [0.0]
         return RateLimiter(40, clock=lambda: clock[0], sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds))
