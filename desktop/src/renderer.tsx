@@ -269,7 +269,7 @@ function App() {
       else if(event.event === 'feedback') notify(event.data as string);
       else if (event.event === 'task') {
         const task = event.data as Task;
-        setTasks(old => old.some(row => row.id === task.id) ? old.map(row => row.id === task.id ? task : row) : [...old, task]);
+        setTasks(old => old.some(row => row.id === task.id) ? old.map(row => row.id === task.id && (task.revision || 0) >= (row.revision || 0) ? task : row) : [...old, task]);
       } else if (event.event === 'batch.finished') { setTransferring(false); notify('本批次已结束，请查看逐项结果'); }
       else if (event.event === 'login.qr' && event.id === loginId.current) setQr(event.data as string);
       else if (event.event === 'warning') notify(event.data as string,'warning');

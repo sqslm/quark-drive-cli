@@ -28,7 +28,9 @@ export class Background {
   }
   event(event:string,data:any) {
     if(event === 'task') {
-      const previous=this.tasks.get(data.id);this.tasks.set(data.id,data);
+      const previous=this.tasks.get(data.id);
+      if(previous && (previous.revision || 0) > (data.revision || 0)) return;
+      this.tasks.set(data.id,data);
       if(previous?.state !== data.state || previous?.valid !== data.valid || previous?.needs_authorization !== data.needs_authorization) this.update();
     } else if(event === 'batch.started') {this.busy=true;this.update();}
     else if(event === 'batch.finished') {

@@ -12,6 +12,8 @@ from pathlib import Path
 from quark_cli.desktop.service import DesktopService
 from quark_cli.downloader.preferences import Preferences, save_preferences
 from quark_cli.transfer import DownloadStopped
+from quark_cli.transfer_progress import ProgressEvent
+from quark_cli.recursive import RecursiveTransfer
 from tests.test_desktop_service import Backend
 
 
@@ -91,6 +93,70 @@ class QueueTests(unittest.TestCase):
         self.assertEqual([task['id'] for task in result],[other,failed,cancelled])
         result=self.service.dispatch('all','tasks.clear',{},None)
         self.assertEqual([task['id'] for task in result],[failed])
+
+    def test_progress_pauses_without_stale_rate_and_retry_discards_old_snapshot(self):
+        def download(request,progress,stopped):
+            progress(ProgressEvent('download','transferring','当前.txt',80,64,100,20,connections=4))
+            self.backend.entered.set()
+            self.backend.release.wait(3)
+            if stopped():
+                raise DownloadStopped('已暂停')
+            return {'size':100}
+        self.backend.download=download
+        self.queue('progress')
+        self.assertTrue(self.backend.entered.wait(1))
+        snapshot=self.service.dispatch('snapshot','tasks',{},None)[0]['progress']
+        self.assertEqual(snapshot,{'name':'当前.txt','phase':'transferring','transferred':80,'confirmed':64,
+            'total':100,'rate':20,'connections':4,'recursive':False})
+        self.service.stop.set();self.backend.release.set();self.wait_idle()
+        paused=self.service.dispatch('paused','tasks',{},None)[0]
+        self.assertEqual((paused['state'],paused['progress']['rate'],paused['progress']['confirmed']),('stopped',0,64))
+        document=json.loads(self.service.task_store.path.read_text('utf8'))
+        self.assertNotIn('progress',document['tasks'][0])
+        gate=threading.Event();self.addCleanup(gate.set)
+        self.service.transfers.submit(lambda:gate.wait(3))
+        waiting=self.service.dispatch('retry','tasks.retry',{'ids':[paused['id']]},None)[0]
+        self.assertEqual(waiting['state'],'waiting');self.assertIsNone(waiting['progress'])
+        gate.set();self.wait_idle()
+        finished=self.service.dispatch('done','tasks',{},None)[0]
+        self.assertEqual((finished['state'],finished['progress']['transferred'],finished['progress']['total']),('done',100,100))
+        self.assertEqual(finished['progress']['rate'],0)
+
+    def test_directory_progress_uses_existing_aggregate_and_relative_current_file(self):
+        def download(request,progress,stopped):
+            RecursiveTransfer._progress(progress,'子目录/当前.bin',20,100)(
+                ProgressEvent('download','transferring','当前.bin',50,30,60,10,connections=8))
+            return {'recursive':True,'size':100,'files':2,'directories':1,'path':'目录'}
+        self.backend.download=download
+        self.service.dispatch('directory','download',{'entries':[{'fid':'folder','name':'目录','directory':True}]},None)
+        self.wait_idle()
+        reports=[message['data']['progress'] for message in self.messages if message.get('event') == 'task' and message['data'].get('progress')]
+        self.assertEqual((reports[0]['recursive'],reports[0]['name'],reports[0]['transferred'],reports[0]['confirmed'],reports[0]['total']),
+            (True,'子目录/当前.bin',70,50,100))
+        self.assertEqual((reports[-1]['confirmed'],reports[-1]['total']),(100,100))
+
+    def test_unknown_share_phases_and_empty_file_have_no_invented_total(self):
+        def download(request,progress,stopped):
+            for phase in ('saving','cleaning'):
+                progress(ProgressEvent('download',phase,'当前.txt',0,0,None,0))
+            return {'size':0}
+        self.backend.download=download;self.queue('empty');self.wait_idle()
+        reports=[message['data']['progress'] for message in self.messages if message.get('event') == 'task' and message['data'].get('progress')]
+        self.assertEqual([report['phase'] for report in reports],['saving','cleaning','completed'])
+        self.assertIsNone(reports[0]['total']);self.assertIsNone(reports[1]['total'])
+        self.assertEqual((reports[-1]['total'],reports[-1]['transferred']),(0,0))
+
+    def test_upload_progress_and_verified_file_size_use_the_same_public_snapshot(self):
+        source=Path(self.tmp.name)/'上传.bin';source.write_bytes(b'0123456789')
+        def upload(source,parent,**options):
+            options['progress'](ProgressEvent('upload','transferring','上传.bin',5,0,10,2))
+            return {'file_size':10}
+        with patch('quark_cli.desktop.service.Transfer.upload',side_effect=upload):
+            self.service.dispatch('upload','upload',{'sources':[str(source)],'parent':'0'},None)
+            self.wait_idle()
+        reports=[message['data'] for message in self.messages if message.get('event') == 'task' and message['data'].get('progress')]
+        self.assertEqual((reports[0]['direction'],reports[0]['progress']['transferred']),('upload',5))
+        self.assertEqual((reports[-1]['state'],reports[-1]['progress']['confirmed'],reports[-1]['progress']['total']),('done',10,10))
 
     def test_append_during_download_remains_sequential_and_durable(self):
         self.queue("a")

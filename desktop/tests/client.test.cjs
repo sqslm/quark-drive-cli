@@ -47,7 +47,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.13',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.14',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
@@ -597,6 +597,61 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await directions.getByRole('button',{name:/^上传/}).click();await completion.getByRole('button',{name:/^已完成/}).click();
     assert.equal(await completion.getByRole('button',{name:/^已完成/}).locator('span').textContent(),'1000');
     assert.ok(await page.locator('.task-row').count() < 60);
+    const beforeProgressCalls=await page.evaluate(() => window.testCalls.length);
+    await page.evaluate(() => {
+      const MB=1048576;
+      const progress=(name,transferred,confirmed,total,rate,connections=4,phase='transferring',recursive=false) => ({name,transferred,confirmed,total,rate,connections,phase,recursive});
+      window.testSetTasks([
+        {id:'pd',name:'大文件.bin',direction:'download',state:'running',progress:progress('大文件.bin',50*MB,40*MB,100*MB,10*MB)},
+        {id:'pt',name:'测试目录',direction:'download',state:'running',progress:progress('子目录/视频.mkv',80*MB,70*MB,200*MB,10*MB,8,'transferring',true)},
+        {id:'pu',name:'未知大小.bin',direction:'download',state:'running',progress:progress('未知大小.bin',5*MB,0,null,MB,1)},
+        {id:'ps',name:'转存文件.bin',direction:'download',state:'running',progress:progress('转存文件.bin',0,0,null,0,1,'saving')},
+        {id:'pc',name:'清理文件.bin',direction:'download',state:'running',progress:progress('清理文件.bin',0,0,null,0,1,'cleaning')},
+        {id:'pl',name:'旧任务',direction:'download',state:'stopped',detail:'旧任务结果'},
+        {id:'pa',name:'上传文件.bin',direction:'upload',state:'running',progress:progress('上传文件.bin',20*MB,10*MB,40*MB,5*MB,1)},
+        {id:'pe',name:'空文件.bin',direction:'upload',state:'done',progress:progress('空文件.bin',0,0,0,0,0,'completed')},
+      ].map(task => ({valid:true,revision:1,detail:'',target:'C:/Downloads/'+task.name,...task})));
+    });
+    await directions.getByRole('button',{name:/^下载/}).click();await completion.getByRole('button',{name:/^未完成/}).click();
+    const progressRow=name => page.locator('.task-row').filter({hasText:name});
+    const activeProgress=progressRow('大文件.bin');
+    assert.equal(await activeProgress.getByRole('progressbar').getAttribute('aria-valuenow'),'50');
+    await activeProgress.getByText('已传输 50.0 MB / 100.0 MB',{exact:true}).waitFor();
+    await activeProgress.getByText('速度 10.0 MB/s',{exact:true}).waitFor();
+    await activeProgress.getByText('连接 4',{exact:true}).waitFor();
+    await activeProgress.getByText('预计剩余 约 5 秒',{exact:true}).waitFor();
+    const treeProgress=progressRow('测试目录');
+    await treeProgress.getByText('目录总进度 · 当前文件：子目录/视频.mkv',{exact:true}).waitFor();
+    assert.equal(await treeProgress.getByRole('progressbar').getAttribute('aria-valuenow'),'40');
+    assert.equal(await progressRow('未知大小.bin').getByRole('progressbar').getAttribute('aria-valuenow'),null);
+    await progressRow('未知大小.bin').getByText('预计剩余 —',{exact:true}).waitFor();
+    await progressRow('转存文件.bin').getByText('正在临时转存',{exact:true}).waitFor();
+    assert.equal(await progressRow('转存文件.bin').getByText('连接 1',{exact:true}).count(),0);
+    await progressRow('清理文件.bin').getByText('正在清理临时目录',{exact:true}).waitFor();
+    assert.equal(await progressRow('旧任务').getByRole('progressbar').count(),0);
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-progress-dark.png')});
+    await page.evaluate(() => window.quark.setAppearance('light'));
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-progress-light.png')});
+    await page.setViewportSize({width:860,height:600});
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true);
+    const phaseFits=await activeProgress.evaluate(row => row.querySelector('.progress-phase').getBoundingClientRect().bottom <= row.getBoundingClientRect().bottom);
+    assert.equal(phaseFits,true);
+    await page.setViewportSize({width:1180,height:780});
+    await page.evaluate(() => {const task=window.testGetTasks().find(task => task.id === 'pd');window.testEmit({id:null,event:'task',data:{...task,state:'stopped',revision:2}});});
+    await activeProgress.locator('.task-state').getByText('已暂停',{exact:true}).waitFor();
+    assert.equal(await activeProgress.getByRole('progressbar').getAttribute('aria-valuenow'),'40');
+    await activeProgress.getByText('已确认 40.0 MB / 100.0 MB',{exact:true}).waitFor();
+    await activeProgress.getByText('速度 —',{exact:true}).waitFor();await activeProgress.getByText('预计剩余 —',{exact:true}).waitFor();
+    await page.evaluate(() => window.testEmit({id:null,event:'task',data:window.testGetTasks().find(task => task.id === 'pd')}));
+    assert.equal(await activeProgress.getByRole('progressbar').getAttribute('aria-valuenow'),'40');
+    await directions.getByRole('button',{name:/^上传/}).click();
+    await progressRow('上传文件.bin').getByText('速度 5.0 MB/s',{exact:true}).waitFor();
+    await progressRow('上传文件.bin').getByText('预计剩余 约 4 秒',{exact:true}).waitFor();
+    assert.equal(await progressRow('上传文件.bin').getByText('连接 1',{exact:true}).count(),0);
+    await completion.getByRole('button',{name:/^已完成/}).click();
+    assert.equal(await progressRow('空文件.bin').getByRole('progressbar').getAttribute('aria-valuenow'),'100');
+    await progressRow('空文件.bin').getByText('已传输 0.000 KB / 0.000 KB',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(() => window.testCalls.length),beforeProgressCalls);
     await page.evaluate(tasks => {window.testSetTasks(tasks);return window.quark.setAppearance('light');},originalTasks);
     await page.getByRole('button',{name:'我的文件',exact:true}).click();
     await page.getByRole('button',{name:'账号操作',exact:true}).click();

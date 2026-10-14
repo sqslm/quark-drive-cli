@@ -21,7 +21,7 @@ from ..recursive import RecursiveTransfer
 from ..paths import RemotePaths, valid_fid
 from ..files import Files
 from ..shares import parse_share_url
-from ..downloader.core import Entry, EXTENSION_GROUPS, describe_error, download_plan, progress_text, summary_text
+from ..downloader.core import Entry, EXTENSION_GROUPS, describe_error, display_text, download_plan, progress_text, summary_text
 from ..downloader.preferences import Preferences, _validated, load_preferences, save_preferences
 from ..downloader.share import ShareSource
 from ..downloader.share_input import parse_share_input
@@ -598,6 +598,8 @@ class DesktopService:
     @staticmethod
     def public_task(task):
         output = {key: task[key] for key in ("id", "name", "state", "detail", "target", "valid", "revision", "direction")}
+        progress = task.get("progress")
+        output["progress"] = {**progress, "rate": progress["rate"] if task["state"] == "running" else 0} if progress else None
         output["needs_authorization"] = bool(task["state"] not in ("done", "cancelled") and task["share_url"] and task["request"].share_source is None)
         output["share_url"] = task["share_url"]
         output["local_dir"] = str(Path(task["request"].source).parent if task["direction"] == "upload" else
@@ -622,6 +624,7 @@ class DesktopService:
         self.batch_tasks.extend(tasks)
         for task in tasks:
             task["state"] = "waiting"
+            task.pop("progress", None)
             task["_cancel"].clear()
             task["revision"] += 1
             self.pending_count += 1
@@ -650,6 +653,10 @@ class DesktopService:
             def progress(event):
                 with self.lock:
                     task["detail"] = progress_text(event)
+                    task["progress"] = {"name": display_text(event.name), "phase": event.phase,
+                        "transferred": event.transferred, "confirmed": event.confirmed, "total": event.total,
+                        "rate": event.rate, "connections": event.connections,
+                        "recursive": task["request"].recursive}
                     task["revision"] += 1
                     self.event(None, "task", self.public_task(task))
             try:
@@ -667,6 +674,11 @@ class DesktopService:
                 else:
                     result = self.backend.download(task["request"], progress, stopped)
                 task["state"], task["detail"] = "done", summary_text({**result, "path": task["name"], "size": result.get("size", result.get("file_size"))}, task["name"]).replace("已下载", "已上传", 1) if task["direction"] == "upload" else summary_text(result, task["name"])
+                size = result.get("size", result.get("file_size"))
+                if type(size) is int and size >= 0:
+                    task["progress"] = {"name": task["name"], "phase": "completed", "transferred": size,
+                        "confirmed": size, "total": size, "rate": 0, "connections": 0,
+                        "recursive": task["request"].recursive}
             except DownloadStopped as error:
                 task["state"], task["detail"] = ("cancelled" if task["_cancel"].is_set() else "stopped"), str(error)
             except Exception as error:
