@@ -78,6 +78,9 @@ aside{padding-top:28px}.brand{padding-bottom:30px;letter-spacing:.2px}.brand sma
 .icon-button{display:grid;place-items:center;width:32px;height:32px;padding:6px;color:var(--secondary)}
 .upload-picker summary{background:var(--surface);border-color:var(--control-border);border-radius:7px}
 .file-header{border-radius:7px 7px 0 0}.file-header button{border-radius:0}
+.file-header,.file-row{grid-template-columns:28px minmax(150px,1fr) 90px 56px 128px minmax(90px,.65fr)}
+.modified-time{font-variant-numeric:tabular-nums}
+@media(max-width:950px){.file-header,.file-row{grid-template-columns:24px minmax(100px,1fr) 72px 42px 124px minmax(60px,.6fr)}}
 .file-row>span{font-variant-numeric:tabular-nums}.file-scroll,.task-list,.catalog-list{scrollbar-width:thin;scrollbar-color:var(--scrollbar) transparent}
 .modal{border:1px solid var(--line);box-shadow:0 12px 40px var(--shadow)}
 .context-menu{border-radius:10px;padding:6px}.context-menu button{border-radius:5px}

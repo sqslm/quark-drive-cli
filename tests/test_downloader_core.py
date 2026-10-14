@@ -47,6 +47,17 @@ class DisplayTests(unittest.TestCase):
 
 
 class EntryTests(unittest.TestCase):
+    def test_modified_time_uses_only_valid_server_milliseconds(self):
+        record = _record("f", "报告.txt")
+        for value in (1791952440000, 1791952440000.5):
+            with self.subTest(value=value):
+                self.assertEqual(entry_of({**record, "updated_at": value}).modified_at, value)
+        for value in (None, 0, -1, True, "1791952440000", float("nan"), float("inf"), 10**400):
+            with self.subTest(value=value):
+                self.assertIsNone(entry_of({**record, "updated_at": value, "created_at": 1791952440000}).modified_at)
+        self.assertIsNone(entry_of(record).modified_at)
+        self.assertEqual(entry_of({**_record("d", "目录", directory=True), "updated_at": 1791952440000}).modified_at, 1791952440000)
+
     def test_entry_of_keeps_the_remote_name_and_normalizes_an_unknown_size(self):
         entry = entry_of(_record(7, "报告.PDF", size=4))
         self.assertEqual((entry.fid, entry.name, entry.directory, entry.size), ("7", "报告.PDF", False, 4))

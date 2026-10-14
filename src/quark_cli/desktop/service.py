@@ -576,7 +576,7 @@ class DesktopService:
     @staticmethod
     def entry(row):
         return Entry(str(row["fid"]), str(row["name"]), bool(row["directory"]), row.get("size"),
-                     str(row.get("path", "")), tuple(tuple(item) for item in row.get("location", ())))
+                     str(row.get("path", "")), tuple(tuple(item) for item in row.get("location", ())), row.get("modified_at"))
 
     def context(self):
         return hashlib.sha256(self.cookie().encode("utf-8")).hexdigest()

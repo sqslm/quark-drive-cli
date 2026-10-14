@@ -1,4 +1,4 @@
-export type Entry = { fid: string; name: string; directory: boolean; size: number | null; path: string; location: [string, string][] };
+export type Entry = { fid: string; name: string; directory: boolean; size: number | null; path: string; location: [string, string][]; modified_at: number | null };
 export type Preferences = { output_dir: string; connections: number; limit_rate: number | null; width: number; height: number };
 export type Task = { id: string; name: string; state: string; detail: string; target: string; valid: boolean; revision?: number;
   direction?: 'upload' | 'download'; local_dir?: string; needs_authorization?: boolean; share_url?: string };

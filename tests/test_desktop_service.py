@@ -6,10 +6,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
+
 from quark_cli.desktop.service import DesktopService
 from quark_cli.downloader.core import Entry
 from quark_cli.downloader.preferences import Preferences, save_preferences
 from quark_cli.downloader.worker import Search
+from quark_cli.downloader.worker import DriveBackend
+from tests.test_downloader_worker import COOKIE, DriveFixture, item
 from quark_cli.transfer import DownloadStopped
 
 
@@ -55,6 +59,34 @@ class DesktopTests(unittest.TestCase):
         self.service.accept({"id": None, "method": "browse"})
         self.assertIn("error", self.messages[-1])
         self.assertEqual(self.backend.requests, [])
+    def test_listing_search_and_share_publish_time_without_detail_requests(self):
+        records = [item("f", "知否.txt", size=3, updated_at=1791952440000),
+                   item("g", "未知.txt", size=4, created_at=1791952440000)]
+        calls = []
+        fixture = DriveFixture(records)
+        fixture.share_items = records
+        def handler(request):
+            calls.append(request.url.path)
+            if request.url.path.endswith('/file/search'):
+                return httpx.Response(200,json={'status':200,'code':0,'data':{'list':records,'_total':2}})
+            return fixture.handler(request)
+        self.service.backend = DriveBackend(lambda:COOKIE,transport=httpx.MockTransport(handler))
+        listing = self.service.dispatch('browse','browse',{'fid':'0'},None)
+        self.assertEqual({row['fid']:row['modified_at'] for row in listing},{'f':1791952440000,'g':None})
+        self.service.dispatch('search','search',{'query':'知否'},threading.Event())
+        self.assertEqual(self.messages[-1]['data']['entries'][0]['modified_at'],1791952440000)
+        self.service.dispatch('subtree','search',{'query':'知否','recursive':True},threading.Event())
+        found = [message for message in self.messages if message.get('id') == 'subtree' and message['data']['entries']]
+        self.assertEqual(found[0]['data']['entries'][0]['modified_at'],1791952440000)
+        self.assertEqual(found[0]['data']['entries'][0]['path'],'/知否.txt')
+        share = self.service.dispatch('share','share.open',{'text':'https://pan.quark.cn/s/abcdef'},None)
+        self.assertEqual({row['fid']:row['modified_at'] for row in share['entries']},{'f':1791952440000,'g':None})
+        self.assertEqual(self.service.entry(next(row for row in listing if row['fid'] == 'f')).modified_at,1791952440000)
+        self.assertEqual(sum(path.endswith('/file/sort') for path in calls),2)
+        self.assertEqual(sum(path.endswith('/file/search') for path in calls),1)
+        self.assertFalse(any(path.endswith('/file/info') for path in calls))
+        located = self.service.dispatch('locate','locate',{'entry':next(row for row in listing if row['fid'] == 'f')},None)
+        self.assertEqual((located['modified_at'],located['path']),(1791952440000,'/知否.txt'))
     def test_management_reservation_blocks_login_and_new_transfers(self):
         with self.service.mutation():
             self.service.accept({'id':'during-write','method':'login'})

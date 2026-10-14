@@ -89,6 +89,7 @@ class Entry:
     size: int | None = None
     path: str = ""
     location: tuple[tuple[str, str], ...] = ()
+    modified_at: int | float | None = None  # API updated_at, Unix milliseconds.
 
     @property
     def label(self) -> str:
@@ -117,7 +118,10 @@ def entry_of(record: Mapping[str, Any]) -> Entry:
     size = record.get("size")
     if directory or type(size) is not int or size < 0:
         size = None
-    return Entry(fid, name, directory, size)
+    modified_at = record.get("updated_at")
+    if type(modified_at) not in (int, float) or not 0 < modified_at <= 8640000000000000:
+        modified_at = None
+    return Entry(fid, name, directory, size, modified_at=modified_at)
 
 
 def entries(records: Iterable[Mapping[str, Any]]) -> list[Entry]:

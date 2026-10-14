@@ -13,6 +13,14 @@ import { SharingDialog } from './SharingDialog';
 import { FeedbackProvider, useFeedback, Tone } from './Feedback';
 import { formatSize as units } from './size';
 
+function modificationTime(value:number|null|undefined) {
+  if(value == null) return '未知';
+  const date=new Date(value);
+  if(!Number.isFinite(date.getTime())) return '未知';
+  const pad=(number:number) => String(number).padStart(2,'0');
+  return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 function FileIcon({ folder }: { folder: boolean }) {
   return <svg className={folder ? 'folder-icon' : 'document-icon'} width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
     {folder ? <path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3V7Z" fill="var(--folder-fill)" stroke="var(--folder-stroke)" strokeWidth="1.5" /> :
@@ -83,7 +91,7 @@ function App() {
   const [kind, setKind] = useState('all');
   const [extensions, setExtensions] = useState('');
   const [extensionGroups, setExtensionGroups] = useState<Record<string, string[]>>({});
-  const [sort, setSort] = useState<{ key: 'name' | 'size' | 'path'; descending: boolean } | null>(null);
+  const [sort, setSort] = useState<{ key: 'name' | 'size' | 'path' | 'modified_at'; descending: boolean } | null>(null);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [searching, setSearching] = useState(false);
   const [searchView, setSearchView] = useState(false);
@@ -295,6 +303,10 @@ function App() {
     }
     if (sort) result = [...result].sort((a,b) => {
       if (a.directory !== b.directory) return a.directory ? -1 : 1;
+      if(sort.key === 'modified_at') {
+        if(a.modified_at == null || b.modified_at == null) return a.modified_at == b.modified_at ? 0 : a.modified_at == null ? 1 : -1;
+        return (a.modified_at-b.modified_at) * (sort.descending ? -1 : 1);
+      }
       if (sort.key === 'size') {
         if (a.directory) return a.name.localeCompare(b.name);
         if (a.size === null || b.size === null) return a.size === b.size ? 0 : a.size === null ? 1 : -1;
@@ -397,9 +409,9 @@ function App() {
   }
   const all = filtered.length > 0 && selected.length === filtered.length;
   function toggle(fid: string) { setChecked(old => { const next = new Set(old); if (next.has(fid)) next.delete(fid); else next.add(fid); return next; }); }
-  function sortBy(key: 'name' | 'size' | 'path') {
+  function sortBy(key: 'name' | 'size' | 'path' | 'modified_at') {
     if (key === 'path' && searchView && !resultsRecursive) { setStatus('全盘搜索路径按需定位，暂不支持路径排序'); return; }
-    setSort({ key, descending: sort?.key === key ? !sort.descending : false });
+    setSort({ key, descending: sort?.key === key ? !sort.descending : key === 'modified_at' });
   }
   async function enqueueUpload(sources:string[],parent:string) {
     const alreadyRunning = transferring;
@@ -486,14 +498,14 @@ function App() {
           {(format || kind !== 'all') && <button className="clear-filters" onClick={() => {setFormat('');setExtensions('');setKind('all');}}>清除筛选</button>}</div>}
         {share && <div className="file-actions"><button disabled={loading || searching || transferring || loggingIn || !selected.length} onClick={() => setSharingDialog('save')}>永久转存到网盘</button><span className="note">下载仍使用临时转存并清理</span></div>}
         <div className="file-header"><input aria-label="全选可见文件" type="checkbox" checked={all} onChange={() => setChecked(old => { const next = new Set(old); filtered.forEach(row => all ? next.delete(row.fid) : next.add(row.fid)); return next; })} />
-          <button onClick={() => sortBy('name')}>名称{sort?.key === 'name' ? sort.descending ? ' ↓' : ' ↑' : ''}</button><button onClick={() => sortBy('size')}>大小</button><span>类型</span><button onClick={() => sortBy('path')}>路径</button></div>
+          <button onClick={() => sortBy('name')}>名称{sort?.key === 'name' ? sort.descending ? ' ↓' : ' ↑' : ''}</button><button onClick={() => sortBy('size')}>大小</button><span>类型</span><button aria-label="按修改时间排序" aria-description={sort?.key === 'modified_at' ? sort.descending ? '最新在前' : '最早在前' : '点击按最新在前排序'} title="本地时间，点击切换新旧顺序" onClick={() => sortBy('modified_at')}>修改时间{sort?.key === 'modified_at' ? sort.descending ? ' ↓' : ' ↑' : ''}</button><button onClick={() => sortBy('path')}>路径</button></div>
         {cut && !share && <div className="cut-bar"><span>{cut.blocked ? '上次粘贴结果待核实' : `已剪切 ${cut.entries.length} 项，等待粘贴`}</span><button disabled={!canPaste} onClick={paste}>粘贴到当前目录</button><button onClick={() => void clearCut()}>取消剪切</button></div>}
         <div className="file-list" aria-busy={loading} onDragEnter={dragEnter} onDragLeave={dragLeave} onDragOver={event => {if(fileDrag(event)) {event.preventDefault();event.stopPropagation();event.dataTransfer.dropEffect=canDrop ? 'copy' : 'none';}}} onDrop={event => void receiveDrop(event)}><div className="file-scroll" ref={scroll} tabIndex={0} inert={loading} aria-label="文件列表" onContextMenu={event => contextAt(event,null)}>
           {!loading && !filtered.length && <div className="empty">{!signedIn ? <><p>登录后浏览和管理网盘文件</p><button className="primary" onClick={() => setLoginPicker(true)}>登录账号</button></> : searching ? '正在搜索，结果将陆续显示…' : rows.length ? '没有符合筛选条件的项目' : '暂无文件'}</div>}
           <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>{virtualizer.getVirtualItems().map(item => { const row = filtered[item.index]; return <div className={'file-row' + (checked.has(row.fid) ? ' selected' : '') + (cutIds.has(row.fid) && !share ? ' cut' : '')} key={row.fid} style={{ transform: `translateY(${item.start}px)` }} onDoubleClick={() => void openRow(row)} onContextMenu={event => contextAt(event,row)}>
             <input type="checkbox" aria-label={`选择 ${row.name}`} checked={checked.has(row.fid)} onChange={() => toggle(row.fid)} />
             <div className="file-title"><button className="file-name" title={row.name} onClick={() => void openRow(row)}><FileIcon folder={row.directory} /><span>{row.name}</span></button><div className="row-actions"><button title="更多操作" aria-label={`更多操作 ${row.name}`} onClick={event => contextAt(event,row)}>⋯</button></div></div>
-            <span>{row.directory ? '—' : units(row.size)}</span><span>{row.directory ? '目录' : '文件'}</span><span title={row.path}>{row.path || (searchView ? '待定位' : '—')}</span></div>; })}</div></div>
+            <span>{row.directory ? '—' : units(row.size)}</span><span>{row.directory ? '目录' : '文件'}</span><span className="modified-time" title={row.modified_at == null ? '服务器未提供有效修改时间' : '本地时间'}>{modificationTime(row.modified_at)}</span><span title={row.path}>{row.path || (searchView ? '待定位' : '—')}</span></div>; })}</div></div>
           {loading && <div className="list-loading" role="status">正在读取目录…</div>}
           {dragging && <div className={'drop-overlay'+(canDrop ? '' : ' blocked')} role="status"><strong>{canDrop ? '松开鼠标，准备上传' : dropBlocked}</strong>{canDrop && <p>目标：{trail.map(([,name]) => name).join(' / ')}</p>}<small>文件和目录均可，确认后加入上传队列</small></div>}</div>
         <footer><button disabled={transferring || loggingIn} onClick={() => void action(async () => { const folder = await window.quark.chooseFolder(); if (folder) await saveSettings(folder); })}>保存目录</button>
