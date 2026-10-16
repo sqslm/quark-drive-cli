@@ -16,6 +16,35 @@ def ok(data, **extra):
 
 
 class FilesTests(unittest.TestCase):
+    def test_copy_pending_tasks_and_invalid_completion_never_repost(self):
+        for completed in ({'status':2},{'status':1,'finish':True},{'status':2,'task_id':'other'},{'status':True}):
+            with self.subTest(completed=completed):
+                calls=[];states=iter([{'status':1},completed])
+                def handle(request):
+                    calls.append(request)
+                    return httpx.Response(200,json=ok({'task_id':'copy-task'} if request.method == 'POST' else next(states)))
+                with QuarkClient('sid=test',transport=httpx.MockTransport(handle)) as client, patch('quark_cli.files.time.sleep') as sleep:
+                    if completed == {'status':2}:Files(client).copy_many(['a'],'target')
+                    else:
+                        with self.assertRaises(RemoteError):Files(client).copy_many(['a'],'target')
+                self.assertEqual([r.method for r in calls],['POST','GET','GET'])
+                sleep.assert_called_once_with(.5)
+
+    def test_copy_one_batch_polls_accepted_task_and_does_not_retry_writes(self):
+        for status in (2,3,4):
+            calls=[]
+            def handle(request):
+                calls.append(request)
+                return httpx.Response(200,json=ok({'task_id':'copy-task'} if request.method == 'POST' else {'status':status}))
+            with QuarkClient('sid=test',transport=httpx.MockTransport(handle)) as client, patch('quark_cli.files.time.sleep') as sleep:
+                if status == 2:self.assertEqual(Files(client).copy_many(['a','b'],'target')['status'],2)
+                else:
+                    with self.assertRaises(RemoteError):Files(client).copy_many(['a','b'],'target')
+            self.assertEqual([r.method for r in calls],['POST','GET'])
+            self.assertTrue(calls[0].url.path.endswith('/file/copy'))
+            self.assertEqual(json.loads(calls[0].content)['filelist'],['a','b'])
+            sleep.assert_not_called()
+
     def test_stale_total_retries_reads_and_returns_only_consistent_snapshot(self):
         cases = [
             ({"list": [], "_total": 1}, {"list": [], "_total": 0}),

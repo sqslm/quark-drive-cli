@@ -114,7 +114,7 @@ function App() {
   const [loginMode,setLoginMode] = useState<'qr'|'mobile'|'wechat'>('qr');
   const [loginCancelling,setLoginCancelling] = useState(false);
   const [showFilters,setShowFilters] = useState(false);
-  const [fileDialog,setFileDialog] = useState<{ action:FileAction; entries:Entry[]; cutId?:string } | null>(null);
+  const [fileDialog,setFileDialog] = useState<{ action:FileAction; entries:Entry[]; cutId?:string; copying?:boolean } | null>(null);
   const [cut,setCut] = useState<Cut|null>(null);
   const [favorites,setFavorites] = useState<Favorite[]>([]);
   const [favoriteBusy,setFavoriteBusy] = useState(false);
@@ -320,7 +320,7 @@ function App() {
   }, [rows, query, kind, extensions, format, sort, extensionGroups]);
   const virtualizer = useVirtualizer({ count: filtered.length, getScrollElement: () => scroll.current, estimateSize: () => 46, overscan: 10 });
   const selected = filtered.filter(row => checked.has(row.fid));
-  const cutIds = useMemo(() => new Set(cut?.entries.map(row => row.fid) || []),[cut]);
+  const cutIds = useMemo(() => new Set(cut?.mode === 'cut' ? cut.entries.map(row => row.fid) : []),[cut]);
   const canModify = signedIn && !share && !transferring && !searching && !loading && !loggingIn;
   const dropBlocked=!signedIn ? '请先登录后上传' : share ? '分享文件为只读，请进入我的文件上传' : searchView ? '请先返回网盘目录，再拖入文件上传' : loading || searching ? '请等待目录读取或搜索完成' : loggingIn || fileDialog || sharingDialog || loginPicker || dropUpload ? '请先结束当前对话框' : '';
   const canDrop=page === 'drive' && !dropBlocked && !quitting;
@@ -365,21 +365,21 @@ function App() {
       notify(`已复制 ${located.length} 项路径`,'success');
     });
   }
-  async function cutSelected() {
+  async function cutSelected(copying=false) {
     setContext(null);
     if(!canModify || !selected.length) return;
     const generation = profileGeneration.current;
-    const clipboard = await action<Cut>(() => call('file.cut',{entries:selected}));
-    if(clipboard && generation === profileGeneration.current) {setCut(clipboard);notify(`已剪切 ${clipboard.entries.length} 项，请打开目标目录后粘贴`,'success');}
+    const clipboard = await action<Cut>(() => call(copying ? 'file.copy' : 'file.cut',{entries:selected}));
+    if(clipboard && generation === profileGeneration.current) {setCut(clipboard);notify(`已${copying ? '复制' : '剪切'} ${clipboard.entries.length} 项，请打开目标目录后粘贴`,'success');}
   }
   async function clearCut() {
     setContext(null);
     if(!cut) return;
-    await action(async () => {setCut(await call('file.clearCut',{id:cut.id}));notify('已取消剪切');});
+    await action(async () => {setCut(await call('file.clearCut',{id:cut.id}));notify('已取消复制或剪切');});
   }
   function paste() {
     setContext(null);
-    if(canPaste && cut) setFileDialog({action:'paste',entries:cut.entries,cutId:cut.id});
+    if(canPaste && cut) setFileDialog({action:'paste',entries:cut.entries,cutId:cut.id,copying:cut.mode === 'copy'});
   }
   async function downloadSelected() {
     setContext(null);
@@ -408,6 +408,7 @@ function App() {
       if(key === 'x' && canModify && selected.length) {event.preventDefault();void cutSelected();}
       else if(key === 'v' && canPaste) {event.preventDefault();paste();}
       else if(key === 'c' && event.shiftKey && selected.length) {event.preventDefault();setContext(null);void copyPaths();}
+      else if(key === 'c' && !event.shiftKey && canModify && selected.length) {event.preventDefault();void cutSelected(true);}
       else if(key === 'a' && !searching && !loading) {event.preventDefault();setChecked(new Set(filtered.map(row => row.fid)));}
     } else if(event.key === 'F2' && canModify && selected.length === 1) {event.preventDefault();fileAction('rename');}
     else if((event.key === 'Delete' || event.key === 'Backspace') && canModify && selected.length) {event.preventDefault();fileAction('delete');}
@@ -505,7 +506,7 @@ function App() {
         {share && <div className="file-actions"><button disabled={loading || searching || transferring || loggingIn || !selected.length} onClick={() => setSharingDialog('save')}>永久转存到网盘</button><span className="note">下载仍使用临时转存并清理</span></div>}
         <div className="file-header"><input aria-label="全选可见文件" type="checkbox" checked={all} onChange={() => setChecked(old => { const next = new Set(old); filtered.forEach(row => all ? next.delete(row.fid) : next.add(row.fid)); return next; })} />
           <button onClick={() => sortBy('name')}>名称{sort?.key === 'name' ? sort.descending ? ' ↓' : ' ↑' : ''}</button><button onClick={() => sortBy('size')}>大小</button><span>类型</span><button aria-label="按修改时间排序" aria-description={sort?.key === 'modified_at' ? sort.descending ? '最新在前' : '最早在前' : '点击按最新在前排序'} title="本地时间，点击切换新旧顺序" onClick={() => sortBy('modified_at')}>修改时间{sort?.key === 'modified_at' ? sort.descending ? ' ↓' : ' ↑' : ''}</button><button onClick={() => sortBy('path')}>路径</button></div>
-        {cut && !share && <div className="cut-bar"><span>{cut.blocked ? '上次粘贴结果待核实' : `已剪切 ${cut.entries.length} 项，等待粘贴`}</span><button disabled={!canPaste} onClick={paste}>粘贴到当前目录</button><button onClick={() => void clearCut()}>取消剪切</button></div>}
+        {cut && !share && <div className="cut-bar"><span>{cut.blocked ? '上次粘贴结果待核实' : `已${cut.mode === 'copy' ? '复制' : '剪切'} ${cut.entries.length} 项，等待粘贴`}</span><button disabled={!canPaste} onClick={paste}>粘贴到当前目录</button><button onClick={() => void clearCut()}>{cut.mode === 'copy' ? '取消复制' : '取消剪切'}</button></div>}
         <div className="file-list" aria-busy={loading} onDragEnter={dragEnter} onDragLeave={dragLeave} onDragOver={event => {if(fileDrag(event)) {event.preventDefault();event.stopPropagation();event.dataTransfer.dropEffect=canDrop ? 'copy' : 'none';}}} onDrop={event => void receiveDrop(event)}><div className="file-scroll" ref={scroll} tabIndex={0} inert={loading} aria-label="文件列表" onContextMenu={event => contextAt(event,null)}>
           {!loading && !filtered.length && <div className="empty">{!signedIn ? <><p>登录后浏览和管理网盘文件</p><button className="primary" onClick={() => setLoginPicker(true)}>登录账号</button></> : searching ? '正在搜索，结果将陆续显示…' : rows.length ? '没有符合筛选条件的项目' : '暂无文件'}</div>}
           <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>{virtualizer.getVirtualItems().map(item => { const row = filtered[item.index]; return <div className={'file-row' + (checked.has(row.fid) ? ' selected' : '') + (cutIds.has(row.fid) && !share ? ' cut' : '')} key={row.fid} style={{ transform: `translateY(${item.start}px)` }} onDoubleClick={() => void openRow(row)} onContextMenu={event => contextAt(event,row)}>
@@ -547,6 +548,7 @@ function App() {
         <button role="menuitem" disabled={!canDownload} onClick={() => void downloadSelected()}>下载{selected.length > 1 ? `（${selected.length}）` : ''}</button>
         {!share && <button role="menuitem" disabled={!canModify || selected.length !== 1} onClick={() => {setContext(null);setSharingDialog('create');}}>分享</button>}
         <hr/>{!share && <>
+          <button role="menuitem" disabled={!canModify || !selected.length} onClick={() => void cutSelected(true)}>复制<kbd>Ctrl+C</kbd></button>
           <button role="menuitem" disabled={!canModify || !selected.length} onClick={() => void cutSelected()}>剪切<kbd>Ctrl+X</kbd></button>
           <button role="menuitem" disabled={!canPaste} onClick={paste}>粘贴<kbd>Ctrl+V</kbd></button><hr/>
           <button role="menuitem" disabled={!canModify || !selected.length} onClick={() => fileAction('delete')}>删除<kbd>Delete</kbd></button>
@@ -559,7 +561,7 @@ function App() {
       </>}
       {!context.row && <><button role="menuitem" disabled={loading || searching} onClick={() => {setContext(null);void (share ? openShare() : browse());}}>刷新</button>{!share && <><button role="menuitem" disabled={!canModify} onClick={() => fileAction('mkdir',[])}>新建目录</button><button role="menuitem" disabled={!canPaste} onClick={paste}>粘贴<kbd>Ctrl+V</kbd></button></>}</>}
     </div></>}
-    {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} cutId={fileDialog.cutId} onCut={setCut} parent={trail} close={() => setFileDialog(null)} done={() => { void (searchView ? runSearch() : browse()); }} onStatus={notify}/ >}
+    {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} cutId={fileDialog.cutId} copying={fileDialog.copying} onCut={setCut} parent={trail} close={() => setFileDialog(null)} done={() => { void (searchView ? runSearch() : browse()); }} onStatus={notify}/ >}
     {sharingDialog && <SharingDialog mode={sharingDialog} entries={selected} handle={share} path={sharePath} close={() => setSharingDialog(null)} onStatus={notify}/>}
     {dropUpload && createPortal(<div className="modal-backdrop"><section className="modal file-modal" role="dialog" aria-modal="true" aria-label="确认拖拽上传"><h2>上传到当前目录</h2><p>目标：{dropUpload.target}</p>{dropUpload.items ? <><p>共 {dropUpload.items.length} 项 · {dropUpload.items.filter(item => item.directory).length} 个目录</p><ul className="drop-items">{dropUpload.items.slice(0,50).map(item => <li key={item.path}><FileIcon folder={item.directory}/><span title={item.path}>{item.name}</span><small>{item.directory ? '目录' : '文件'}</small></li>)}</ul>{dropUpload.items.length > 50 && <p className="note">另有 {dropUpload.items.length-50} 项，确认后全部加入队列。</p>}<p className="note">同名冲突不会自动覆盖。目录内容在正式上传时读取。</p></> : <p>正在读取拖入项目…</p>}<div className="dialog-actions"><button autoFocus disabled={dropBusy} onClick={cancelDrop}>取消</button><button className="primary" disabled={dropBusy || !dropUpload.items} onClick={() => void confirmDrop()}>{dropBusy ? '正在加入队列…' : '确认上传'}</button></div></section></div>,document.body)}
     {loginPicker && <div className="modal-backdrop"><section className="modal login-picker" role="dialog" aria-modal="true" aria-label={signedIn ? '切换账号' : '登录账号'}><h2>{signedIn ? '切换账号' : '登录夸克账号'}</h2><p>选择官方支持的登录方式</p><button disabled={transferring} onClick={() => void login('qr')}>扫码登录</button><button disabled={transferring} onClick={() => void login('mobile')}>手机验证码登录</button><button disabled={transferring} onClick={() => void login('wechat')}>微信登录</button><p className="note">手机和微信登录在独立的夸克官方页面完成。{signedIn && '取消登录会保留原账号。'}</p><button onClick={() => setLoginPicker(false)}>取消</button></section></div>}

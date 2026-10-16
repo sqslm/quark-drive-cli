@@ -4,7 +4,7 @@ export type TaskProgress = {name:string;phase:string;transferred:number;confirme
 export type Task = { id: string; name: string; state: string; detail: string; target: string; valid: boolean; revision?: number;
   direction?: 'upload' | 'download'; local_dir?: string; needs_authorization?: boolean; share_url?: string; progress?:TaskProgress|null; scheduled?:boolean; pausing?:boolean; removing?:boolean };
 export type Event = { id: string | null; event: string; data: unknown };
-export type Cut = {id:string;entries:Entry[];blocked:boolean};
+export type Cut = {id:string;entries:Entry[];blocked:boolean;mode:'copy'|'cut'};
 export type Favorite = {fid:string;name:string};
 export type AppearanceSource = 'system'|'dark'|'light';
 export type Appearance = {source:AppearanceSource;dark:boolean;warning:string};
@@ -15,7 +15,7 @@ export const METHODS = ['hello','account','browse','locate','search','search.can
   'preferences.save','login','login.cancel','download','download.stop','tasks','tasks.retry',
   'file.info','file.paths','file.mkdir','file.rename','file.move','file.delete','upload','tasks.cancel','tasks.pause','tasks.remove','tasks.clear','tasks.authorize',
   'share.list','share.link','share.create','share.revoke','share.save','recycle.list','recycle.restore','recycle.remove',
-  'file.cut','file.paste','file.clearCut','favorites.list','favorites.add','favorites.remove','favorites.open','logout'] as const;
+  'file.cut','file.copy','file.paste','file.clearCut','favorites.list','favorites.add','favorites.remove','favorites.open','logout'] as const;
 export type Method = typeof METHODS[number];
 export interface Bridge {
   call(method: Method, params?: Record<string, unknown>, id?: string): Promise<any>;

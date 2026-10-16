@@ -126,15 +126,16 @@ class FileOperations:
         ShareSaver(self.client)._confirm_created_directory(parent, name, fid)
         return {"fid": fid, "name": name, "state": "done"}
 
-    def paste(self, entries, target):
+    def paste(self, entries, target, *, copying=False):
         self.reset()
+        label = '复制' if copying else '移动'
         self.report(f'正在核验 {len(entries)} 项和目标目录…')
         paths = self.paths
         target = paths.resolve(str(target), directory=True).fid
         target_chain = paths.ancestry(target)
-        existing = {
-            str(row.get("file_name", "")).casefold() for row in paths.children(target)
-        }
+        target_rows = paths.children(target)
+        existing = {str(row.get('file_name','')).casefold() for row in target_rows}
+        previous_ids = {valid_fid(row['fid']) for row in target_rows}
         results, candidates, seen = [], [], set()
         for entry in entries:
             index = len(results)
@@ -153,7 +154,7 @@ class FileOperations:
                     raise UsageError("重复选择同一对象")
                 seen.add(fid)
                 if any(obj.fid == fid for obj in target_chain):
-                    raise UsageError("不能移动到自身或子目录")
+                    raise UsageError(f"不能{label}到自身或子目录")
                 if str(actual["pdir_fid"]) == target:
                     raise UsageError("项目已经在目标目录中，未重复移动")
                 key = actual["file_name"].casefold()
@@ -166,8 +167,8 @@ class FileOperations:
         if not candidates:
             return results
         try:
-            self.report(f'正在批量移动 {len(candidates)} 项…')
-            self.files.move_many(
+            self.report(f'正在批量{label} {len(candidates)} 项…')
+            (self.files.copy_many if copying else self.files.move_many)(
                 [valid_fid(actual["fid"]) for _, actual in candidates], target
             )
         except Exception as error:
@@ -184,7 +185,9 @@ class FileOperations:
                 )
             return results
         self.reset()
-        self.report('正在核验移动结果…')
+        self.report(f'正在核验{label}结果…')
+        if copying:
+            return self._confirm_copies(candidates, target, results, previous_ids)
         # One fresh destination snapshot verifies the whole batch, rather than
         # one info request per successful member. Missing members need info to
         # distinguish an unchanged source from an unknown outcome.
@@ -223,6 +226,41 @@ class FileOperations:
                     state="unknown",
                     detail=describe_error(error, "移动结果核验") + "；未重发",
                 )
+        return results
+
+    def _confirm_copies(self, candidates, target, results, previous_ids):
+        try:
+            copied = {}
+            for row in self.paths.children(target):
+                copied.setdefault(row['file_name'], []).append(row)
+        except Exception as error:
+            for index, _ in candidates:
+                results[index].update(state='unknown', detail=describe_error(error,'复制结果核验')+'；未重发，请刷新核实')
+            return results
+        for index, actual in candidates:
+            try:
+                matches = copied.get(actual['file_name'], [])
+                if len(matches) != 1:
+                    raise RemoteError('未发现唯一复制结果')
+                after = matches[0]
+                if (valid_fid(after['fid']) == valid_fid(actual['fid'])
+                        or valid_fid(after['fid']) in previous_ids
+                        or is_directory(after) != is_directory(actual)
+                        or (not is_directory(actual) and after.get('size') != actual.get('size'))):
+                    raise RemoteError('副本身份与源对象不符')
+                # The source must remain in its original directory. Reuse each
+                # fresh parent listing across the batch; never scan descendants.
+                source = self.files.info(valid_fid(actual['fid']))
+                if any(source.get(key) != actual.get(key) for key in ('fid','pdir_fid','file_name','file_type','size')):
+                    raise RemoteError('复制期间源对象已变化')
+                if not self.paths._fid_matches(valid_fid(actual['pdir_fid']), valid_fid(actual['fid'])):
+                    raise RemoteError('原目录中未找到源对象')
+                for key in ('md5', 'sha1'):
+                    if actual.get(key) and after.get(key) and actual[key] != after[key]:
+                        raise RemoteError('副本内容摘要与源对象不符')
+                results[index].update(state='done', detail='已复制到目标目录，源项目保留')
+            except Exception as error:
+                results[index].update(state='unknown', detail=describe_error(error,'复制结果核验')+'；未重发，请刷新核实')
         return results
 
     def reset(self):

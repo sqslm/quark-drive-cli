@@ -41,6 +41,18 @@ class Drive:
                     for fid in body['filelist']:
                         self.records[fid]["pdir_fid"] = body["to_pdir_fid"]
                     data = {"finish": True}
+                elif path.endswith('file/copy'):
+                    def clone(fid,parent):
+                        children=[dict(row) for row in self.records.values() if row['pdir_fid'] == fid]
+                        new_fid='copy-'+fid
+                        suffix=2
+                        while new_fid in self.records:
+                            new_fid=f'copy-{fid}-{suffix}';suffix+=1
+                        self.records[new_fid]={**self.records[fid],'fid':new_fid,'pdir_fid':parent}
+                        for child in children:clone(child['fid'],new_fid)
+                    for fid in body['filelist']:
+                        clone(fid,body['to_pdir_fid'])
+                    data = {'finish':True}
                 elif path.endswith("file/delete"):
                     for fid in body["filelist"]:
                         self.records.pop(fid)

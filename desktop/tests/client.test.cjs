@@ -47,7 +47,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.19',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.20',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
@@ -64,8 +64,9 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
           }
           if(method === 'file.mkdir') { listeners.forEach(callback => callback({id,event:'file.progress',data:'正在创建目录…'}));listeners.forEach(callback => callback({id:'old-file-operation',event:'file.progress',data:'过期文件进度'}));if(window.testHoldMkdir) await new Promise(resolve => {window.releaseMkdir=resolve;});rows.push({fid:'new',name:params.name,directory:true,size:null,path:'',location:[]}); return {fid:'new'}; }
           if(method === 'file.rename') { const row = rows.find(row => row.fid === params.entries[0].fid); row.name = params.name; return [{ name:row.name,state:'done',detail:'操作完成'}]; }
-          if(method === 'file.cut') {cut={id:'cut-current',entries:params.entries,blocked:false};return cut;}
+          if(method === 'file.cut' || method === 'file.copy') {cut={id:method === 'file.copy' ? 'copy-current' : 'cut-current',entries:params.entries,blocked:false,mode:method === 'file.copy' ? 'copy' : 'cut'};return cut;}
           if(method === 'file.clearCut') {cut=null;return null;}
+          if(method === 'file.paste' && cut.mode === 'copy') {listeners.forEach(callback => callback({id,event:'file.progress',data:'正在批量复制 1 项…'}));if(window.testHoldCopy) await new Promise(resolve => {window.releaseCopy=resolve;});const results=cut.entries.map(entry => {rows.push({...entry,fid:'copy-'+entry.fid,parent:params.target});return {fid:entry.fid,name:entry.name,state:'done',detail:'已复制到目标目录，源项目保留'};});return {results,clipboard:cut};}
           if(method === 'file.paste') {const results=cut.entries.map(entry => {rows.find(row => row.fid === entry.fid).parent=params.target;return {fid:entry.fid,name:entry.name,state:'done',detail:'已移动到目标目录'};});cut=null;return {results,clipboard:null};}
           if(method === 'locate') return { ...params.entry, path: '/知否/' + params.entry.name, location: [['0','我的网盘']] };
           if(method === 'search.cancel') { cancelled = true; return true; }
@@ -241,6 +242,30 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await page.locator('.cut-bar').count(),0);
     await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'我的网盘',exact:true}).click();
     await page.locator('.file-row').filter({hasText:'知否 00003.txt'}).waitFor();
+    await page.locator('.file-row').filter({hasText:'知否 00003.txt'}).click({button:'right'});
+    const beforeCopy=await page.evaluate(() => window.testCalls.length);
+    await page.getByRole('menuitem',{name:/^复制\s*Ctrl\+C$/}).click();
+    await page.locator('.toast.success').getByText('已复制 1 项，请打开目标目录后粘贴',{exact:true}).waitFor();
+    assert.equal(await page.locator('.file-row.cut').count(),0);
+    assert.deepEqual(await page.evaluate(n => window.testCalls.slice(n).map(row => row.method),beforeCopy),['file.copy']);
+    await page.getByLabel('文件列表',{exact:true}).focus();await page.keyboard.press('Control+c');
+    assert.equal(await page.evaluate(() => window.testCalls.filter(row => row.method === 'file.copy').length),2);
+    await page.locator('.favorites').getByRole('button',{name:'新建测试',exact:true}).click();
+    await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'新建测试',exact:true}).waitFor();
+    await page.getByLabel('文件列表',{exact:true}).focus();await page.keyboard.press('Control+v');
+    const copyDialog=page.getByRole('dialog',{name:'粘贴（复制）',exact:true});
+    await copyDialog.getByText('确认后复制这些项目，保留源项目。同名冲突不覆盖。',{exact:true}).waitFor();
+    await page.evaluate(() => {window.testHoldCopy=true;});
+    await copyDialog.getByRole('button',{name:'确认',exact:true}).click();
+    await copyDialog.getByText('正在批量复制 1 项…',{exact:true}).waitFor();
+    assert.ok(await copyDialog.getByRole('button',{name:'处理中…',exact:true}).isDisabled());
+    await page.evaluate(() => {window.testHoldCopy=false;window.releaseCopy();});
+    await copyDialog.getByText('知否 00003.txt：已复制到目标目录，源项目保留',{exact:true}).waitFor();
+    await copyDialog.getByRole('button',{name:'关闭',exact:true}).click();
+    await page.locator('.file-row').getByRole('button',{name:'知否 00003.txt',exact:true}).waitFor();
+    await page.getByRole('button',{name:'取消复制',exact:true}).click();
+    await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'我的网盘',exact:true}).click();
+    await page.locator('.file-row').getByRole('button',{name:'知否 00003.txt',exact:true}).waitFor();
     await page.locator('.favorites').getByRole('button',{name:'新建测试',exact:true}).click();
     await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'新建测试',exact:true}).waitFor();
     await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'我的网盘',exact:true}).click();
@@ -259,6 +284,8 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('dialog',{name:'重命名'}).waitFor();
     await page.getByLabel('新名称').fill('编辑输入不剪切云端文件');
     await page.getByLabel('新名称').press('Control+x');
+    await page.getByLabel('新名称').fill('输入框复制');await page.getByLabel('新名称').press('Control+c');
+    assert.equal(await page.evaluate(() => window.testCalls.filter(row => row.method === 'file.copy').length),2);
     assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method==='file.cut').length),1);
     await page.getByRole('button',{name:'取消',exact:true}).click();
     await page.getByLabel('文件列表',{exact:true}).focus();

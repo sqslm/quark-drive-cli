@@ -163,39 +163,53 @@ class Files:
         return self.move_many([fid],target,poll_interval=poll_interval,max_polls=max_polls)
 
     def move_many(self, fids: list[str], target: str, *, poll_interval: float = 0.5, max_polls: int = 60) -> Any:
+        return self._relocate_many('move', fids, target, poll_interval=poll_interval, max_polls=max_polls)
+
+    def copy_many(self, fids: list[str], target: str, *, poll_interval: float = 0.5, max_polls: int = 60) -> Any:
+        return self._relocate_many('copy', fids, target, poll_interval=poll_interval, max_polls=max_polls)
+
+    def _relocate_many(self, operation: str, fids: list[str], target: str, *, poll_interval: float, max_polls: int) -> Any:
+        label = '复制' if operation == 'copy' else '移动'
         if not fids or any(not fid or fid == '0' for fid in fids) or not target or len(set(fids)) != len(fids):
             raise UsageError('源 FID 列表或目标目录 FID 无效')
         payload = self.client.post(
-            "file/move",
+            f"file/{operation}",
             body={"action_type": 1, "to_pdir_fid": target, "filelist": fids, "exclude_fids": []},
         )
-        data = _data(payload, "移动文件")
+        data = _data(payload, f"{label}文件")
         if not isinstance(data, dict):
-            raise RemoteError("移动响应格式无效")
+            raise RemoteError(f"{label}响应格式无效")
         if data.get("finish") is True:
             return data
         task_id = data.get("task_id")
         if not task_id:
-            raise RemoteError("移动响应缺少完成状态或 task_id")
+            raise RemoteError(f"{label}响应缺少完成状态或 task_id")
         gap = payload.get("metadata", {}).get("tq_gap") if isinstance(payload.get("metadata"), dict) else None
         delay = max(0.0, min(float(gap) / 1000, 5.0)) if isinstance(gap, (int, float)) else poll_interval
         for retry_index in range(max_polls):
             if delay and (retry_index or (isinstance(gap,(int,float)) and gap > 0)):
                 time.sleep(delay)
             task_payload = self.client.get("task", params={"task_id": task_id, "retry_index": retry_index})
-            task = _data(task_payload, "移动任务")
+            task = _data(task_payload, f"{label}任务")
             if not isinstance(task, dict):
-                raise RemoteError("移动任务响应格式无效")
+                raise RemoteError(f"{label}任务响应格式无效")
             state = task.get("status")
             if state in ('0','1','2','3','4'):
                 state = int(state)
+            if operation == 'copy':
+                if ('task_id' in task and str(task['task_id']) != str(task_id)
+                        or state is not None and (type(state) is not int or state not in (0,1,2,3,4))
+                        or 'finish' in task and type(task['finish']) is not bool
+                        or state is not None and 'finish' in task and task['finish'] != (state == 2)
+                        or state is None and task.get('finish') is not True):
+                    raise RemoteError('复制任务标识或完成状态无效；未重新提交')
             if state == 2 or task.get("finish") is True:
                 return task
             if state == 3:
-                raise RemoteError("夸克拒绝了移动操作")
+                raise RemoteError(f"夸克拒绝了{label}操作")
             if state == 4:
-                raise RemoteError("移动任务已暂停，请核实结果；未重新提交")
-        raise RemoteError("等待移动任务超时")
+                raise RemoteError(f"{label}任务已暂停，请核实结果；未重新提交")
+        raise RemoteError(f"等待{label}任务超时")
 
     def delete(self, fid: str) -> Any:
         if not fid or fid == "0":

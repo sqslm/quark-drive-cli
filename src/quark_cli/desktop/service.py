@@ -253,9 +253,9 @@ class DesktopService:
                         raise UsageError('常用文件夹已移除')
                     self.favorites.add(context, trail)
                 return trail
-        if method == 'file.cut':
+        if method in ('file.cut','file.copy'):
             if p.get('handle'):
-                raise UsageError('分享文件只读，不能剪切')
+                raise UsageError('分享文件只读，不能复制或剪切')
             with self.lock:
                 if self.busy or self.logging_in or self.managing:
                     raise UsageError('请先结束传输、登录或网盘操作')
@@ -263,12 +263,13 @@ class DesktopService:
                 ids = [valid_fid(row['fid']) for row in entries]
                 if not ids or '0' in ids or len(set(ids)) != len(ids):
                     raise UsageError('请选择有效且不重复的文件或目录')
-                self.cut = {'id':uuid.uuid4().hex,'entries':entries,'context':self.context(),'blocked':False}
+                self.cut = {'id':uuid.uuid4().hex,'entries':entries,'context':self.context(),'blocked':False,
+                            'mode':'copy' if method == 'file.copy' else 'cut'}
                 return self.cut_view()
         if method == 'file.clearCut':
             with self.lock:
                 if self.managing:
-                    raise UsageError('网盘操作正在执行，请等待结果后取消剪切')
+                    raise UsageError('网盘操作正在执行，请等待结果后取消复制或剪切')
                 if self.cut and self.cut['id'] == p.get('id'):
                     self.cut = None
                 return self.cut_view()
@@ -278,21 +279,23 @@ class DesktopService:
             with self.mutation():
                 clipboard = self.cut
                 if clipboard is None or clipboard['id'] != p.get('id') or clipboard['context'] != self.context():
-                    raise UsageError('剪切记录已失效或登录已变化，请重新剪切')
+                    raise UsageError('复制或剪切记录已失效或登录已变化，请重新选择')
                 if clipboard['blocked']:
                     raise UsageError('上次粘贴结果未确认，请先刷新核实，未重复提交')
                 # Reserve this intent before opening any metadata or write request.
                 clipboard['blocked'] = True
                 with self.backend._client(interactive=True) as client:
                     try:
-                        results = FileOperations(client,progress=lambda text:self.event(identifier,'file.progress',text)).paste(clipboard['entries'],p['target'])
+                        results = FileOperations(client,progress=lambda text:self.event(identifier,'file.progress',text)).paste(
+                            clipboard['entries'],p['target'],copying=clipboard['mode'] == 'copy')
                     except QuarkError:
                         # paste reports write outcomes; an exception here is
                         # target preflight, before any move was submitted.
                         clipboard['blocked'] = False
                         raise
                 done = {row['fid'] for row in results if row['state'] == 'done'}
-                clipboard['entries'] = [row for row in clipboard['entries'] if row['fid'] not in done]
+                if clipboard['mode'] == 'cut':
+                    clipboard['entries'] = [row for row in clipboard['entries'] if row['fid'] not in done]
                 clipboard['blocked'] = any(row['state'] == 'unknown' for row in results)
                 if not clipboard['entries']:
                     self.cut = None
@@ -588,7 +591,7 @@ class DesktopService:
         clipboard = self.cut
         if clipboard is None:
             return None
-        return {key:clipboard[key] for key in ('id','entries','blocked')}
+        return {key:clipboard[key] for key in ('id','entries','blocked','mode')}
 
     @staticmethod
     def entry(row):
@@ -748,7 +751,7 @@ METHODS = frozenset({"hello", "account", "browse", "search", "search.cancel", "l
     "file.info", "file.paths", "file.mkdir", "file.rename", "file.move", "file.delete",
     "upload", "tasks.cancel", "tasks.pause", "tasks.remove", "tasks.clear", "tasks.authorize",
     'share.list','share.link','share.create','share.revoke','share.save','recycle.list','recycle.restore','recycle.remove',
-    'file.cut','file.paste','file.clearCut',
+    'file.cut','file.copy','file.paste','file.clearCut',
     'favorites.list','favorites.add','favorites.remove','favorites.open',
     'logout','login.web.begin','login.web.finish','login.web.cancel'})
 

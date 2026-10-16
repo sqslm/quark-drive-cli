@@ -13,6 +13,89 @@ from tests.test_downloader_worker import item, COOKIE
 
 
 class CutTests(unittest.TestCase):
+    def test_copy_is_local_batch_paste_preserves_source_and_clipboard(self):
+        drive=Drive([item('a','A.txt',size=3),item('dir','Folder',directory=True),
+                     item('inside','Inside.txt','dir',size=4),item('target','Target',directory=True)])
+        service=self.service(drive);events=[];service.send=events.append
+        selected=[entry('a','A.txt',size=3),entry('dir','Folder',True)]
+        clipboard=self.call(service,'file.copy',{'entries':selected})
+        self.assertEqual(drive.requests,[])
+        self.assertEqual(clipboard['mode'],'copy')
+        self.assertNotIn('context',clipboard)
+        result=self.call(service,'file.paste',{'id':clipboard['id'],'target':'target'})
+        self.assertTrue(all(row['state'] == 'done' for row in result['results']))
+        self.assertEqual(result['clipboard']['id'],clipboard['id'])
+        self.assertEqual(drive.records['a']['pdir_fid'],'0')
+        self.assertEqual(drive.records['dir']['pdir_fid'],'0')
+        self.assertEqual(drive.records['copy-a']['pdir_fid'],'target')
+        self.assertEqual(drive.records['copy-inside']['pdir_fid'],'copy-dir')
+        self.assertEqual(drive.records['inside']['pdir_fid'],'dir')
+        self.assertEqual(len(drive.writes),1)
+        self.assertEqual(drive.writes[0][1],{'action_type':1,'to_pdir_fid':'target','filelist':['a','dir'],'exclude_fids':[]})
+        self.assertFalse(any(r.url.params.get('pdir_fid') == 'dir' for r in drive.requests))
+        self.assertLessEqual(len(drive.requests),11)
+        self.assertTrue(any(e['event'] == 'file.progress' and e['id'] == 'test' for e in events))
+        # Repeating into the same target refuses the name conflict without writing.
+        again=self.call(service,'file.paste',{'id':clipboard['id'],'target':'target'})
+        self.assertTrue(all(row['state'] == 'failed' for row in again['results']))
+        self.assertEqual(len(drive.writes),1)
+        drive.records['target2']=item('target2','Other target',directory=True)
+        another=self.call(service,'file.paste',{'id':clipboard['id'],'target':'target2'})
+        self.assertTrue(all(row['state'] == 'done' for row in another['results']))
+        self.assertEqual(drive.records['copy-a']['pdir_fid'],'target')
+        self.assertEqual(drive.records['copy-a-2']['pdir_fid'],'target2')
+        self.assertEqual(drive.records['a']['pdir_fid'],'0')
+        self.assertEqual(len(drive.writes),2)
+
+    def test_copy_rejects_stale_account_share_same_folder_and_descendant(self):
+        for case in ('account','share','id','same','descendant','stale'):
+            with self.subTest(case=case):
+                drive=Drive([item('dir','Folder',directory=True),item('sub','Sub','dir',directory=True),item('target','Target',directory=True)])
+                service=self.service(drive)
+                clipboard=self.call(service,'file.copy',{'entries':[entry('dir','Folder',True)]})
+                params={'id':clipboard['id'],'target':'target'}
+                if case == 'account':service.saved_cookie='sid=other'
+                elif case == 'share':params['handle']='share'
+                elif case == 'id':params['id']='stale'
+                elif case == 'same':params['target']='0'
+                elif case == 'descendant':params['target']='sub'
+                else:drive.records['dir']['file_name']='Changed'
+                if case in ('account','share','id'):
+                    with self.assertRaises(UsageError):self.call(service,'file.paste',params)
+                    self.assertEqual(drive.requests,[])
+                else:
+                    result=self.call(service,'file.paste',params)
+                    self.assertEqual(result['results'][0]['state'],'failed')
+                self.assertEqual(drive.writes,[])
+
+    def test_copy_partial_conflict_and_invalid_readback_are_not_replayed(self):
+        for kind in ('conflict','size','source-moved','same-fid','readback-failure','timeout'):
+            with self.subTest(kind=kind):
+                drive=Drive([item('a','A.txt',size=3),item('b','B.txt',size=4),item('target','Target',directory=True)])
+                if kind == 'conflict':drive.records['conflict']=item('conflict','b.TXT','target',size=4)
+                transport=drive.transport()
+                def handle(request):
+                    if kind == 'readback-failure' and drive.writes and request.method == 'GET':return httpx.Response(500)
+                    response=transport.handle_request(request)
+                    if request.url.path.endswith('file/copy'):
+                        if kind == 'size':drive.records['copy-a']['size']=99
+                        elif kind == 'source-moved':drive.records['a']['pdir_fid']='target'
+                        elif kind == 'same-fid':drive.records['copy-a']['fid']='a'
+                        elif kind == 'timeout':raise httpx.ReadTimeout('lost',request=request)
+                    return response
+                drive.transport=lambda:httpx.MockTransport(handle)
+                service=self.service(drive)
+                clipboard=self.call(service,'file.copy',{'entries':[entry('a','A.txt',size=3),entry('b','B.txt',size=4)]})
+                result=self.call(service,'file.paste',{'id':clipboard['id'],'target':'target'})
+                self.assertEqual(result['results'][0]['state'],'done' if kind == 'conflict' else 'unknown')
+                self.assertEqual(len(drive.writes),1)
+                if kind == 'conflict':self.assertEqual(drive.writes[0][1]['filelist'],['a'])
+                else:
+                    self.assertTrue(result['clipboard']['blocked'])
+                    before=len(drive.requests)
+                    with self.assertRaises(UsageError):self.call(service,'file.paste',{'id':clipboard['id'],'target':'target'})
+                    self.assertEqual(len(drive.requests),before)
+
     def test_fast_operations_and_normal_reads_share_durable_cooldown(self):
         drive = Drive([item("a","A.txt",size=3)])
         def reject(request):
