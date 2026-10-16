@@ -32,6 +32,7 @@ from .tasks import TaskStore, Upload
 from .sharing import Sharing
 from .recycle import Recycle
 from .favorites import Favorites
+from .text_editor import TextEditor
 from ..share_management import safe_operation_result
 
 
@@ -77,6 +78,7 @@ class DesktopService:
         self.managing = False
         self.cut = None
         self.favorites = Favorites(self.directory / "favorites.json")
+        self.editor = TextEditor()
         self.closed = False
         self.preferences_warning = ""
         self.preferences_writable = True
@@ -142,7 +144,7 @@ class DesktopService:
             cancel = self.login_cancel
         else:
             cancel = None
-        executor = self.images if method in ('image.read', 'text.read') else self.reads
+        executor = self.images if method in ('image.read', 'text.read', 'text.open') else self.reads
         executor.submit(self.execute, identifier, method, params, cancel)
 
     def execute(self, identifier, method, params, cancel=None):
@@ -382,6 +384,22 @@ class DesktopService:
             if p.get('handle') is not None:
                 raise UsageError('分享中的文本暂不支持直接预览，请在我的文件中查看')
             return self.backend.text_preview(self.entry(p['entry']))
+        if method == 'text.open':
+            if p.get('handle') is not None:
+                raise UsageError('分享中的文本不能编辑，请在我的文件中打开')
+            account = self.context()
+            with self.backend._client(interactive=True) as client:
+                result = self.editor.open(client, self.entry(p['entry']), account)
+            if self.context() != account:
+                self.editor.close(result['editor'])
+                raise UsageError('账号已变化，请重新打开文件')
+            return result
+        if method == 'text.close':
+            self.editor.close(p.get('editor'))
+            return True
+        if method == 'text.save':
+            with self.mutation(), self.backend._client(interactive=True) as client:
+                return self.editor.save(client, p.get('editor'), p.get('version'), p.get('text'), self.context())
         if method == "locate":
             return asdict(self.backend.locate(self.entry(p["entry"])))
         if method == "search":
@@ -579,6 +597,7 @@ class DesktopService:
                     self.managing = False
 
     def clear_account_context(self):
+        self.editor.clear()
         if hasattr(self.backend, 'images'):
             self.backend.images.clear()
         self.search_cancel.set()
@@ -758,13 +777,14 @@ class DesktopService:
             self.login_cancel.set()
         self.reads.shutdown(wait=True, cancel_futures=True)
         self.images.shutdown(wait=True, cancel_futures=True)
+        self.editor.clear()
         if hasattr(self.backend, 'images'):
             self.backend.images.clear()
         # Let queued jobs record their stopped state without opening a transfer.
         self.transfers.shutdown(wait=True)
 
 
-METHODS = frozenset({"hello", "account", "browse", "image.read", "text.read", "search", "search.cancel", "locate", "share.parse",
+METHODS = frozenset({"hello", "account", "browse", "image.read", "text.read", "text.open", "text.save", "text.close", "search", "search.cancel", "locate", "share.parse",
     "share.open", "share.browse", "preferences.save", "login", "login.cancel", "download", "download.stop", "tasks", "tasks.retry",
     "file.info", "file.paths", "file.mkdir", "file.rename", "file.move", "file.delete",
     "upload", "tasks.cancel", "tasks.pause", "tasks.remove", "tasks.clear", "tasks.authorize",

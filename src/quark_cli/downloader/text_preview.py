@@ -1,12 +1,13 @@
 """Small cloud text files, read in memory without executing their contents."""
 import codecs
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 
 from ..errors import RemoteError, UsageError, AuthenticationError, RateLimitError, AccessRestrictedError
 from ..files import Files
 from ..paths import valid_fid
 from ..transfer import download_address
-from .core import entry_of
+from .core import Entry, entry_of
 from .images import ImageReader
 
 MAX_TEXT_BYTES = 2 * 1024 * 1024
@@ -35,11 +36,24 @@ def decode_text(data):
     raise UsageError('无法识别文本编码，请下载后查看')
 
 
-def read_text(client, entry):
+@dataclass
+class TextDocument:
+    entry: Entry
+    parent: str
+    data: bytes
+    text: str
+    encoding: str
+
+    def public(self):
+        return {'text': self.text, 'encoding': self.encoding, 'size': len(self.data), 'modified_at': self.entry.modified_at}
+
+
+def read_document(client, entry):
     if not supported_text(entry):
         raise UsageError('该文件类型暂不支持文本预览')
     try:
-        actual = entry_of(Files(client).info(valid_fid(entry.fid)))
+        record = Files(client).info(valid_fid(entry.fid))
+        actual = entry_of(record)
         if (actual.fid, actual.name, actual.directory) != (entry.fid, entry.name, False):
             raise UsageError('选中文件已变化，请刷新目录')
         if actual.size is not None and actual.size > MAX_TEXT_BYTES:
@@ -65,4 +79,8 @@ def read_text(client, entry):
     except Exception:
         raise RemoteError('文本读取失败，请刷新重试或下载后查看') from None
     text, encoding = decode_text(data)
-    return {'text': text, 'encoding': encoding, 'size': len(data), 'modified_at': actual.modified_at}
+    return TextDocument(replace(actual, path=entry.path, location=entry.location), valid_fid(record.get('pdir_fid')), data, text, encoding)
+
+
+def read_text(client, entry):
+    return read_document(client, entry).public()

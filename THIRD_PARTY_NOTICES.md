@@ -39,3 +39,5 @@ The MIT-licensed [rclone](https://github.com/rclone/rclone) documentation and co
 ## Electron desktop client
 
 The desktop client uses Electron and Electron Forge (MIT), React/React DOM (MIT), TanStack Virtual (MIT), and TypeScript (Apache-2.0) as declared in `desktop/package-lock.json`. Electron redistributables retain the upstream `LICENSE` and `LICENSES.chromium.html`; webpack preserves bundled dependency license comments in `index.js.LICENSE.txt`. Build and browser testing also use webpack and Playwright. No source from third-party Quark clients is copied; the global search request shape was checked against the public Quark web bundle.
+
+Markdown rendering uses [react-markdown](https://github.com/remarkjs/react-markdown) 10.1.0 and [remark-gfm](https://github.com/remarkjs/remark-gfm) 4.0.1 (MIT). Their added dependencies use MIT/ISC licenses; complete license texts and package versions are in `desktop/assets/markdown-notices.txt`, also distributed as `resources/markdown-notices.txt`. Markdown is converted to React elements, with raw HTML skipped and external images/links displayed without loading or navigation.

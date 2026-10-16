@@ -24,6 +24,7 @@ const bridge: Bridge = {
   getClientSettings: () => ipcRenderer.invoke('quark:desktop.get'),
   setClientSettings: settings => ipcRenderer.invoke('quark:desktop.set',settings),
   quit: () => ipcRenderer.invoke('quark:quit'),
+  setEditorDirty:dirty => ipcRenderer.invoke('quark:editor.dirty',dirty),
   officialLogin: mode => ipcRenderer.invoke('quark:official-login',mode),
 };
 contextBridge.exposeInMainWorld('quark', bridge);

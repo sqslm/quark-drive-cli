@@ -87,6 +87,8 @@ function App() {
   const [rows, setRows] = useState<Entry[]>([]);
   const [preview,setPreview]=useState<{entries:Entry[];start:string;handle:string|null}|null>(null);
   const [textPreview,setTextPreview]=useState<Entry|null>(null);
+  const textEditorOpen=useRef(false);
+  textEditorOpen.current=!!textPreview;
   const [trail, setTrail] = useState<[string, string][]>([['0', '我的网盘']]);
   const [share, setShare] = useState<string | null>(null);
   const [sharePath, setSharePath] = useState('/');
@@ -271,7 +273,7 @@ function App() {
     const off = window.quark.onEvent((event: Event) => {
       if(event.event === 'appearance') acceptAppearance(event.data as Appearance);
       else if(event.event === 'desktop.quitting') {cancelDrop();setQuitting(true);}
-      else if(event.event === 'navigate' && event.data === 'tasks') {if(!dropSubmitting.current) cancelDrop();cancelSearch();setPage('tasks');}
+      else if(event.event === 'navigate' && event.data === 'tasks') {if(textEditorOpen.current) {notify('请先关闭文本编辑器，再查看传输任务');return;}if(!dropSubmitting.current) cancelDrop();cancelSearch();setPage('tasks');}
       else if(event.event === 'tasks.changed') acceptTasks(event.data as Task[]);
       else if(event.event === 'batch.started') setTransferring(true);
       else if(event.event === 'feedback') notify(event.data as string);
@@ -433,7 +435,7 @@ function App() {
     const alreadyRunning = transferring;
     if(!alreadyRunning && !await saveSettings()) return;
     setTransferring(true);
-    try {acceptTasks(await call('upload',{sources,parent}));setPage('tasks');notify(`已加入 ${sources.length} 个上传任务`,'success');}
+    try {acceptTasks(await call('upload',{sources,parent}));notify(`已加入 ${sources.length} 个上传任务`,'success');}
     catch(error) {if(!alreadyRunning) setTransferring(false);throw error;}
   }
   async function confirmDrop() {
@@ -575,7 +577,7 @@ function App() {
     </div></>}
     {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} cutId={fileDialog.cutId} copying={fileDialog.copying} onCut={setCut} parent={trail} close={() => setFileDialog(null)} done={() => { void (searchView ? runSearch() : browse()); }} onStatus={notify}/ >}
     {preview && <ImagePreview entries={preview.entries} start={preview.start} handle={preview.handle} close={() => setPreview(null)}/>}
-    {textPreview && <TextPreview entry={textPreview} close={() => setTextPreview(null)}/>}
+    {textPreview && <TextPreview entry={textPreview} close={() => setTextPreview(null)} onSaved={(fid,next) => {setRows(old => old.map(row => row.fid===fid ? next : row));setChecked(old => {if(!old.has(fid)) return old;const nextIds=new Set(old);nextIds.delete(fid);nextIds.add(next.fid);return nextIds;});}}/>}
     {sharingDialog && <SharingDialog mode={sharingDialog} entries={selected} handle={share} path={sharePath} close={() => setSharingDialog(null)} onStatus={notify}/>}
     {dropUpload && createPortal(<div className="modal-backdrop"><section className="modal file-modal" role="dialog" aria-modal="true" aria-label="确认拖拽上传"><h2>上传到当前目录</h2><p>目标：{dropUpload.target}</p>{dropUpload.items ? <><p>共 {dropUpload.items.length} 项 · {dropUpload.items.filter(item => item.directory).length} 个目录</p><ul className="drop-items">{dropUpload.items.slice(0,50).map(item => <li key={item.path}><FileIcon folder={item.directory}/><span title={item.path}>{item.name}</span><small>{item.directory ? '目录' : '文件'}</small></li>)}</ul>{dropUpload.items.length > 50 && <p className="note">另有 {dropUpload.items.length-50} 项，确认后全部加入队列。</p>}<p className="note">同名冲突不会自动覆盖。目录内容在正式上传时读取。</p></> : <p>正在读取拖入项目…</p>}<div className="dialog-actions"><button autoFocus disabled={dropBusy} onClick={cancelDrop}>取消</button><button className="primary" disabled={dropBusy || !dropUpload.items} onClick={() => void confirmDrop()}>{dropBusy ? '正在加入队列…' : '确认上传'}</button></div></section></div>,document.body)}
     {loginPicker && <div className="modal-backdrop"><section className="modal login-picker" role="dialog" aria-modal="true" aria-label={signedIn ? '切换账号' : '登录账号'}><h2>{signedIn ? '切换账号' : '登录夸克账号'}</h2><p>选择官方支持的登录方式</p><button disabled={transferring} onClick={() => void login('qr')}>扫码登录</button><button disabled={transferring} onClick={() => void login('mobile')}>手机验证码登录</button><button disabled={transferring} onClick={() => void login('wechat')}>微信登录</button><p className="note">手机和微信登录在独立的夸克官方页面完成。{signedIn && '取消登录会保留原账号。'}</p><button onClick={() => setLoginPicker(false)}>取消</button></section></div>}

@@ -18,6 +18,8 @@ let window: BrowserWindow;
 let backend: ChildProcessWithoutNullStreams;
 const pending = new Map<string, { method:string;resolve: (data: unknown) => void; reject: (error: Error) => void }>();
 let stopping = false;
+let editorDirty=false;
+let confirmingQuit=false;
 let quitAllowed=false;
 let backendClosed=false;
 let background:Background;
@@ -47,8 +49,15 @@ async function finishQuit(code:number|null) {
   if(code !== null && code !== 0) await dialog.showMessageBox(window,{type:'warning',title:'后端异常退出',message:'后端未正常退出，请在重启后核实未完成任务与检查点。',buttons:['退出客户端']});
   quitAllowed=true;background?.destroy();app.quit();
 }
-function requestQuit() {
-  if(stopping) return;
+async function requestQuit() {
+  if(stopping || confirmingQuit) return;
+  if(editorDirty) {
+    confirmingQuit=true;showWindow();
+    try {
+      const result=await dialog.showMessageBox(window,{type:'warning',title:'文本尚未保存',message:'编辑器有未保存的修改或保存正在进行。返回编辑可等待保存完成；放弃修改将退出客户端。',buttons:['返回编辑','放弃未保存修改并退出'],defaultId:0,cancelId:0});
+      if(result.response!==1) return;
+    } finally {confirmingQuit=false;}
+  }
   stopping=true;
   if(background) {background.quitting=true;background.update();}
   showWindow();send('desktop.quitting',true);
@@ -165,6 +174,7 @@ app.whenReady().then(async () => {
     return {settings:clientSettings,warning:clientSettingsWarning};
   });
   ipcMain.handle('quark:quit',event => {trusted(event);requestQuit();});
+  ipcMain.handle('quark:editor.dirty',(event,dirty) => {trusted(event);if(typeof dirty!=='boolean') throw new Error('编辑状态无效');editorDirty=dirty;});
   ipcMain.handle('quark:call', (event, message) => {
     trusted(event);
     if (!message || typeof message.id !== 'string' || message.id.length > 128 || pending.has(message.id) || !METHODS.includes(message.method)) throw new Error('无效操作');

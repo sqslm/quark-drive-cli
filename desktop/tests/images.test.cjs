@@ -5,7 +5,7 @@ const path=require('node:path');
 const vm=require('node:vm');
 const ts=require('typescript');
 const http=require('node:http');
-const {chromium}=require('@playwright/test');
+const {chromium,expect}=require('@playwright/test');
 
 const tick=() => new Promise(resolve => setImmediate(resolve));
 test('image queue bounds concurrency, prioritizes previews, drops abandoned work and isolates accounts',async () => {
@@ -45,9 +45,10 @@ test('cloud previews load visible images, zoom and retry; text refreshes safely 
       const rows=Array.from({length:1000},(_,n) => ({fid:String(n),name:`图片${String(n).padStart(4,'0')}.png`,directory:false,size:100,path:'',location:[],modified_at:100}));
       const textRows=['配置.json','说明.txt','README.md','空文件.txt','失败.txt','迟到.txt'].map((name,n) => ({...rows[0],fid:'t'+n,name}));
       const pixel='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+juyQAAAAASUVORK5CYII=';
-      window.imageCalls=[];window.imageActive=0;window.imageMax=0;window.failPreview=false;window.textVersion=1;window.textCalls=[];
-      window.quark={copyText:async text => {window.copiedPreview=text;},onEvent:() => () => {},getAppearance:async () => ({source:'light',dark:false,warning:''}),getClientSettings:async () => ({settings:{closeBehavior:'tray',notifications:false},warning:''}),call:async (method,params={}) => {
-        if(method==='hello') return {protocol:1,client_version:'0.5.22',signed_in:true,preferences,extension_groups:{}};
+      window.imageCalls=[];window.imageActive=0;window.imageMax=0;window.failPreview=false;window.textVersion=1;window.textCalls=[];window.saves=[];window.savedTexts={};window.editSession=0;
+      const listeners=[];window.navigateTasks=() => listeners.forEach(callback => callback({event:'navigate',data:'tasks'}));
+      window.quark={setEditorDirty:async dirty => {window.editorDirty=dirty;},copyText:async text => {window.copiedPreview=text;},onEvent:callback => {listeners.push(callback);return () => {};},getAppearance:async () => ({source:'light',dark:false,warning:''}),getClientSettings:async () => ({settings:{closeBehavior:'tray',notifications:false},warning:''}),call:async (method,params={}) => {
+        if(method==='hello') return {protocol:1,client_version:'0.5.23',signed_in:true,preferences,extension_groups:{}};
         if(method==='account') return {nickname:'图片测试',logged_in:true};
         if(method==='browse') return window.showTextRows ? textRows : rows;
         if(method==='tasks' || method==='favorites.list') return [];
@@ -57,12 +58,20 @@ test('cloud previews load visible images, zoom and retry; text refreshes safely 
           if(window.failPreview && !params.thumbnail) throw new Error('图片加载失败，请重试');
           return {src:pixel,width:1,height:1};
         }
-        if(method==='text.read') {
+        if(method==='text.open') {
           window.textCalls.push(params.entry.name);
           if(params.entry.name==='迟到.txt') await new Promise(resolve => {window.releaseText=resolve;});
           if(params.entry.name==='失败.txt' || window.failTextRefresh) throw new Error("Error invoking remote method 'quark:call': Error: 操作失败：文本读取失败");
-          const text=params.entry.name==='配置.json' ? JSON.stringify({version:window.textVersion}) : params.entry.name==='空文件.txt' ? '' : params.entry.name==='README.md' ? '# Markdown 标题\n正文' : '<img src=x onerror="window.injected=true"><script>window.injected=true</script>\n'+('长文本\n'.repeat(1000));
-          return {text,encoding:'UTF-8',size:text.length,modified_at:100};
+          const text=window.savedTexts[params.entry.name] ?? (params.entry.name==='配置.json' ? JSON.stringify({version:window.textVersion}) : params.entry.name==='空文件.txt' ? '' : params.entry.name==='README.md' ? '# Markdown 标题\n正文' : '<img src=x onerror="window.injected=true"><script>window.injected=true</script>\n'+('长文本\n'.repeat(1000)));
+          return {text,encoding:'UTF-8',size:text.length,modified_at:100,editor:'edit'+(++window.editSession),version:'v'+window.editSession,entry:params.entry};
+        }
+        if(method==='text.save') {
+          window.saves.push({...params});
+          if(window.holdSave) await new Promise(resolve => {window.releaseSave=resolve;});
+          if(window.failSave) throw new Error('云端内容已变化，已停止保存');
+          const row=textRows.find(row => row.name==='配置.json');
+          row.fid='saved'+window.saves.length;window.savedTexts[row.name]=params.text;
+          return {version:'saved'+window.saves.length,entry:{...row},blocked:false,warning:''};
         }
         return true;
       }};
@@ -75,34 +84,81 @@ test('cloud previews load visible images, zoom and retry; text refreshes safely 
     await page.evaluate(() => {window.showTextRows=true;});await page.getByRole('button',{name:'刷新',exact:true}).click();
     await page.getByRole('button',{name:'配置.json',exact:true}).click();
     const textDialog=page.getByRole('dialog',{name:'文本预览',exact:true});
-    await textDialog.getByLabel('文件内容').filter({hasText:'{"version":1}'}).waitFor();
+    const content=textDialog.getByLabel('文件内容');
+    await expect(content).toHaveValue('{"version":1}');
     await page.evaluate(() => {window.textVersion=2;});await textDialog.getByRole('button',{name:'刷新内容'}).click();
-    await textDialog.getByLabel('文件内容').filter({hasText:'{"version":2}'}).waitFor();
+    await expect(content).toHaveValue('{"version":2}');
     await textDialog.getByRole('button',{name:'复制内容'}).click();assert.equal(await page.evaluate(() => window.copiedPreview),'{"version":2}');
     await page.getByText('已复制文本内容',{exact:true}).waitFor();
     await page.evaluate(() => {window.failTextRefresh=true;});await textDialog.getByRole('button',{name:'刷新内容'}).click();
-    await textDialog.getByRole('alert').waitFor();assert.match(await textDialog.getByRole('alert').innerText(),/上次读取/);
+    await textDialog.getByRole('alert').waitFor();assert.match(await textDialog.getByRole('alert').innerText(),/保留/);
     assert.doesNotMatch(await textDialog.innerText(),/Error invoking remote/);
     await page.evaluate(() => {window.failTextRefresh=false;});await textDialog.getByRole('button',{name:'重新读取'}).click();
     await textDialog.getByRole('button',{name:'刷新内容'}).waitFor();await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
     await page.getByRole('button',{name:'说明.txt',exact:true}).click();await textDialog.getByLabel('文件内容').waitFor();
-    assert.ok((await textDialog.getByLabel('文件内容').innerText()).includes('<script>'));
+    assert.ok((await textDialog.getByLabel('文件内容').inputValue()).includes('<script>'));
     assert.equal(await textDialog.locator('img,script').count(),0);assert.equal(await page.evaluate(() => window.injected),undefined);
     await textDialog.getByRole('checkbox',{name:'自动换行'}).uncheck();assert.equal(await textDialog.locator('.text-content.wrap').count(),0);
     await textDialog.getByLabel('文件内容').focus();await page.keyboard.press('Tab');assert.equal(await page.evaluate(() => document.activeElement.getAttribute('aria-label')),'关闭文本预览');
     await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
     await page.getByRole('button',{name:'README.md',exact:true}).click({button:'right'});await page.getByRole('menuitem',{name:'预览文本'}).click();
-    await textDialog.getByLabel('文件内容').filter({hasText:'# Markdown 标题'}).waitFor();
+    await expect(content).toHaveValue('# Markdown 标题\n正文');
+    await textDialog.getByRole('button',{name:'渲染格式',exact:true}).click();
+    const markdown=textDialog.getByLabel('Markdown 渲染预览');
+    await markdown.getByRole('heading',{name:'Markdown 标题',exact:true}).waitFor();
+    await page.evaluate(() => {window.failSave=true;});
+    await content.fill('# 实时标题\n\n| 列一 | 列二 |\n| --- | --- |\n| A | B |\n\n```json\n{"ok":true}\n```\n\n![外部](https://example.com/image.png)\n\n<script>window.injected=true</script>\n\n[危险](javascript:alert(1))');
+    await markdown.getByRole('heading',{name:'实时标题',exact:true}).waitFor();
+    await markdown.getByRole('cell',{name:'A',exact:true}).waitFor();
+    assert.equal(await markdown.locator('pre code').innerText(),'{"ok":true}\n');
+    assert.equal(await markdown.locator('img,script,a').count(),0);
+    assert.equal(await page.evaluate(() => window.injected),undefined);
+    const sizes=await textDialog.locator('.text-workspace').evaluate(node => ({width:node.clientWidth,children:[...node.children].map(child => child.getBoundingClientRect().width)}));
+    assert.ok(sizes.children.every(width => width>sizes.width*.4 && width<sizes.width*.6));
     await page.screenshot({path:path.resolve(__dirname,'../out/text-preview-check.png')});
+    await textDialog.getByRole('button',{name:'原格式',exact:true}).click();assert.equal(await markdown.count(),0);
+    await page.waitForTimeout(1100);
+    await page.keyboard.press('Escape');await textDialog.getByRole('alertdialog',{name:'未保存的修改'}).waitFor();
+    await textDialog.getByRole('button',{name:'放弃修改',exact:true}).click();await textDialog.waitFor({state:'detached'});
+    await page.evaluate(() => {window.failSave=false;window.saves=[];});
+    await page.getByRole('button',{name:'配置.json',exact:true}).click();await expect(content).toHaveValue('{"version":2}');
+    await content.fill('first draft');await content.fill('latest draft');
+    await page.waitForFunction(() => window.saves.length===1 && !window.editorDirty);
+    assert.equal(await page.evaluate(() => window.saves[0].text),'latest draft');
+    await page.evaluate(() => {window.holdSave=true;});await content.fill('save in flight');await page.keyboard.press('Control+s');
+    await page.waitForFunction(() => !!window.releaseSave);await content.fill('typed during upload');
+    await textDialog.getByRole('button',{name:'关闭文本预览'}).click();await textDialog.getByLabel('文件内容').waitFor();
+    assert.equal(await page.evaluate(() => window.saves.length),2);
+    await page.evaluate(() => {window.holdSave=false;window.releaseSave();});
+    await page.waitForFunction(() => window.saves.length===3 && !window.editorDirty);
+    assert.equal(await page.evaluate(() => window.saves.at(-1).text),'typed during upload');
+    assert.equal(await page.evaluate(() => window.saves[2].version),'saved2','next edit uses newly acknowledged version');
+    await page.evaluate(() => {window.failSave=true;});await content.fill('retained after conflict');await page.keyboard.press('Control+s');
+    await textDialog.getByRole('alert').filter({hasText:'云端内容已变化'}).waitFor();
+    await expect(content).toHaveValue('retained after conflict');
+    await page.waitForTimeout(1300);assert.equal(await page.evaluate(() => window.saves.length),4,'conflicts stop automatic retry');
+    await page.evaluate(() => window.navigateTasks());await page.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
+    await textDialog.getByRole('button',{name:'重新读取',exact:true}).click();await textDialog.getByRole('alertdialog').waitFor();
+    await page.keyboard.press('Control+s');assert.equal(await page.evaluate(() => window.saves.length),4,'discard confirmation cannot submit a save');
+    await textDialog.getByRole('button',{name:'继续编辑',exact:true}).click();await expect(content).toHaveValue('retained after conflict');
+    await textDialog.getByRole('button',{name:'复制内容'}).click();assert.equal(await page.evaluate(() => window.copiedPreview),'retained after conflict');
+    await page.keyboard.press('Escape');await textDialog.getByRole('button',{name:'放弃修改',exact:true}).click();
+    await textDialog.waitFor({state:'detached'});await page.waitForFunction(() => !window.editorDirty);
+    await page.evaluate(() => {window.failSave=false;});
+    await page.getByRole('button',{name:'配置.json',exact:true}).click();await expect(content).toHaveValue('typed during upload');
+    await content.fill('manual save');await page.keyboard.press('Control+s');await page.waitForFunction(() => window.saves.length===5 && !window.editorDirty);
+    await content.dispatchEvent('compositionstart');await content.fill('尚未完成的中文输入');
+    await page.waitForTimeout(1200);assert.equal(await page.evaluate(() => window.saves.length),5,'IME composition must not save partial input');
+    await content.dispatchEvent('compositionend');await page.waitForFunction(() => window.saves.length===6 && !window.editorDirty);
     await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
-    await page.getByRole('button',{name:'空文件.txt',exact:true}).click();await textDialog.getByText('文件内容为空',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'空文件.txt',exact:true}).click();await expect(content).toHaveValue('');
     await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
     await page.getByRole('button',{name:'失败.txt',exact:true}).click();await textDialog.getByRole('alert').waitFor();
     assert.doesNotMatch(await textDialog.innerText(),/Error invoking remote/);await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
     await page.getByRole('button',{name:'迟到.txt',exact:true}).click();await page.waitForFunction(() => !!window.releaseText);
     await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
     await page.getByRole('button',{name:'配置.json',exact:true}).click();await page.evaluate(() => window.releaseText());
-    await textDialog.getByLabel('文件内容').filter({hasText:'{"version":2}'}).waitFor();
+    await expect(content).toHaveValue('尚未完成的中文输入');
     await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
     await page.evaluate(() => {window.showTextRows=false;});await page.getByRole('button',{name:'刷新',exact:true}).click();
     await page.getByRole('button',{name:'图片0000.png',exact:true}).waitFor();

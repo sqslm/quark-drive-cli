@@ -122,8 +122,25 @@ async function runtime(closeBehavior='tray') {
   const window=windows[0],tray=electron.instances[0];
   const send=(event,data) => child.stdout.write(JSON.stringify({id:null,event,data})+'\n');
   const call=(method,params={}) => ipc.get('quark:call')({sender:window.webContents,senderFrame:window.webContents.mainFrame},{id:'test-request',method,params});
-  return {app,window,tray,child,send,call,cleanup(){child.stdout.end();child.stderr.end();if(!app.quitted) {app.quit();child.emit('close',0);}}};
+  return {app,window,tray,child,send,call,electron,ipc,cleanup(){child.stdout.end();child.stderr.end();if(!app.quitted) {app.quit();child.emit('close',0);}}};
 }
+
+test('dirty editor requires a native decision before quitting and rejects invalid IPC callers',async () => {
+  const r=await runtime('quit');try {
+    const sender={sender:r.window.webContents,senderFrame:r.window.webContents.mainFrame};
+    const dirty=r.ipc.get('quark:editor.dirty');
+    assert.throws(() => dirty(sender,'yes'),/状态无效/);
+    assert.throws(() => dirty({sender:{}},true),/来源/);
+    dirty(sender,true);
+    let asks=0,answer=0;
+    r.electron.dialog.showMessageBox=async () => {asks++;return {response:answer};};
+    r.window.close();await tick();
+    assert.equal(asks,1);assert.equal(r.child.ended,undefined);assert.equal(r.window.destroyed,undefined);
+    answer=1;r.window.close();await tick();
+    assert.equal(asks,2);assert.equal(r.child.ended,true);
+    r.child.emit('close',0);await tick();assert.equal(r.app.quitted,true);
+  } finally {r.cleanup();}
+});
 
 test('closing to tray keeps backend alive and a second instance restores the same window',async () => {
   const r=await runtime();try {

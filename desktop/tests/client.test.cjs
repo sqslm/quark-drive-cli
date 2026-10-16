@@ -47,7 +47,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.22',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.23',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
@@ -443,26 +443,28 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('radio',{name:'暗色',exact:true}).check();
     await page.locator('.toast.success').getByText('外观已保存',{exact:true}).waitFor();
     assert.equal(await page.locator('html').getAttribute('data-theme'),'dark');
-    assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(27, 31, 39)');
-    assert.equal(await page.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(32, 37, 48)');
-    await page.waitForFunction(() => getComputedStyle(document.querySelector('.login-button')).backgroundColor === 'rgb(37, 43, 54)');
+    assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(24, 24, 24)');
+    assert.equal(await page.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(25, 28, 30)');
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('.login-button')).backgroundColor === 'rgb(38, 38, 38)');
+    assert.equal(await page.locator('aside').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(25, 28, 30)');
+    assert.equal(await page.getByRole('button',{name:'保存设置',exact:true}).evaluate(element => getComputedStyle(element).color),'rgb(25, 25, 25)');
     await page.screenshot({path:path.resolve(__dirname,'../test-results/dark-settings.png')});
     await page.getByRole('button',{name:'我的文件',exact:true}).click();
     await page.locator('.file-row').filter({hasText:'知否 00003.txt'}).click({button:'right'});
-    assert.equal(await page.getByRole('menu',{name:'文件操作'}).evaluate(element => getComputedStyle(element).backgroundColor),'rgb(37, 43, 54)');
+    assert.equal(await page.getByRole('menu',{name:'文件操作'}).evaluate(element => getComputedStyle(element).backgroundColor),'rgb(38, 38, 38)');
     await page.screenshot({path:path.resolve(__dirname,'../test-results/dark-files.png')});
     await page.getByRole('menuitem',{name:'详细信息',exact:true}).click();
     await page.getByText('3.25 GB',{exact:true}).waitFor();
-    assert.equal(await page.getByRole('dialog',{name:'文件属性'}).evaluate(element => getComputedStyle(element).backgroundColor),'rgb(37, 43, 54)');
+    assert.equal(await page.getByRole('dialog',{name:'文件属性'}).evaluate(element => getComputedStyle(element).backgroundColor),'rgb(38, 38, 38)');
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     await page.getByRole('button',{name:'设置',exact:true}).click();
     await page.emulateMedia({colorScheme:'light'});
-    assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(27, 31, 39)');
+    assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(24, 24, 24)');
     await page.getByRole('radio',{name:'跟随系统',exact:true}).check();
     assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(255, 255, 255)');
     await page.emulateMedia({colorScheme:'dark'});
     await page.waitForFunction(() => document.documentElement.dataset.colorScheme === 'dark');
-    assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(27, 31, 39)');
+    assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(24, 24, 24)');
     await page.getByRole('radio',{name:'浅色',exact:true}).check();
     assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(255, 255, 255)');
     await page.setViewportSize({width:860,height:600});
@@ -516,6 +518,9 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button', {name:'我的文件',exact:true}).click();
     await page.getByRole('button',{name:'上传',exact:true}).click();
     await page.getByRole('button', {name:'上传文件',exact:true}).click();
+    await page.locator('.toast.success').getByText('已加入 1 个上传任务',{exact:true}).waitFor();
+    assert.ok(await page.getByRole('heading',{name:'我的文件',exact:true}).isVisible());
+    await page.getByRole('button',{name:/^传输任务/}).click();
     await page.getByRole('heading', {name:'传输任务'}).waitFor();
     await page.getByText('测试.txt',{exact:true}).waitFor();
     const uploaded = await page.evaluate(() => window.testCalls.find(call => call.method === 'upload'));
@@ -577,6 +582,9 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button',{name:'我的文件',exact:true}).click();
     const savesBeforeAppend=await page.evaluate(() => window.testCalls.filter(call => call.method === 'preferences.save').length);
     await drop(['追加.txt']);await dropDialog.getByRole('button',{name:'确认上传',exact:true}).click();
+    await dropDialog.waitFor({state:'detached'});
+    assert.ok(await page.getByRole('heading',{name:'我的文件',exact:true}).isVisible());
+    await page.getByRole('button',{name:/^传输任务/}).click();
     await page.getByText('追加.txt',{exact:true}).waitFor();
     assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'preferences.save').length),savesBeforeAppend);
     await page.getByRole('button',{name:'暂停全部',exact:true}).click();
@@ -584,6 +592,10 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.locator('.file-row').getByRole('button',{name:'新建测试',exact:true}).click();
     await drop(['子目录上传.txt']);await dropDialog.getByText('目标：我的网盘 / 新建测试',{exact:true}).waitFor();
     await dropDialog.getByRole('button',{name:'确认上传',exact:true}).click();
+    await dropDialog.waitFor({state:'detached'});
+    assert.ok(await page.getByRole('heading',{name:'我的文件',exact:true}).isVisible());
+    await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'新建测试',exact:true}).waitFor();
+    await page.getByRole('button',{name:/^传输任务/}).click();
     await page.getByText('子目录上传.txt',{exact:true}).waitFor();
     assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'upload').at(-1).params.parent),'new');
     await page.getByRole('button',{name:'暂停全部',exact:true}).click();
@@ -829,6 +841,10 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     assert.deepEqual(await page.evaluate(() => window.quark.call('tasks.pause',{ids:[]})),[]);
     assert.deepEqual(await page.evaluate(() => window.quark.call('tasks.remove',{ids:[]})),[]);
     await assert.rejects(page.evaluate(() => window.quark.call('text.read',{entry:{fid:'text',name:'test.txt',directory:false,size:4,path:'',location:[],modified_at:null}})),/QUARK_COOKIE|Cookie|登录/);
+    await assert.rejects(page.evaluate(() => window.quark.call('text.open',{entry:{fid:'text',name:'test.txt',directory:false,size:4,path:'',location:[],modified_at:null}})),/QUARK_COOKIE|Cookie|登录/);
+    await assert.rejects(page.evaluate(() => window.quark.call('text.save',{editor:'test',version:'v1',text:'hello'})),/QUARK_COOKIE|Cookie|登录/);
+    await assert.rejects(page.evaluate(() => window.quark.setEditorDirty('invalid')),/编辑状态/);
+    await page.evaluate(() => window.quark.setEditorDirty(false));
     await page.locator('.titlebar').getByText('v'+hello.client_version,{exact:true}).waitFor();
     await assert.rejects(page.evaluate(() => window.quark.readDroppedFiles([new File(['payload'],'网页生成.txt')])),/本地文件/);
     const localDropFile=path.join(directory,'本地拖拽.txt'),localDropFolder=path.join(directory,'本地目录');
@@ -886,13 +902,13 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     assert.equal(initialAppearance.source,'system');
     assert.equal(initialAppearance.dark,await app.evaluate(({nativeTheme}) => nativeTheme.shouldUseDarkColors));
     await page.waitForFunction(dark => document.documentElement.dataset.colorScheme === (dark ? 'dark' : 'light'),initialAppearance.dark);
-    assert.equal(await page.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),initialAppearance.dark ? 'rgb(32, 37, 48)' : 'rgb(246, 248, 252)');
+    assert.equal(await page.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),initialAppearance.dark ? 'rgb(25, 28, 30)' : 'rgb(246, 248, 252)');
     await assert.rejects(page.evaluate(() => window.quark.setAppearance('invalid')),/外观选项无效/);
     const dark=await page.evaluate(() => window.quark.setAppearance('dark'));
     assert.equal(dark.warning,'');assert.equal(dark.dark,true);
     assert.equal(await app.evaluate(({nativeTheme}) => nativeTheme.themeSource),'dark');
     await page.waitForFunction(() => document.documentElement.dataset.theme === 'dark' && document.documentElement.dataset.colorScheme === 'dark');
-    assert.equal(await page.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(32, 37, 48)');
+    assert.equal(await page.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(25, 28, 30)');
     const savedAppearance=JSON.parse(await readFile(path.join(await app.evaluate(({app}) => app.getPath('userData')),'appearance.json'),'utf8'));
     assert.equal(savedAppearance.source,'dark');
     await page.evaluate(() => window.quark.setAppearance('light'));
@@ -935,7 +951,7 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     assert.deepEqual((await restarted.evaluate(() => window.quark.getClientSettings())).settings,{closeBehavior:'quit',notifications:false});
     assert.equal(await app.evaluate(({nativeTheme}) => nativeTheme.themeSource),'dark');
     await restarted.waitForFunction(() => document.documentElement.dataset.colorScheme === 'dark');
-    assert.equal(await restarted.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(32, 37, 48)');
+    assert.equal(await restarted.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(25, 28, 30)');
     await app.close();
     await writeFile(path.join(userData,'appearance.json'),'{broken','utf8');
     app=await _electron.launch(launchOptions);
@@ -970,6 +986,49 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
   } finally { await app.close(); await rm(directory, { recursive:true, force:true }); }
 });
 
+
+test('packaged Markdown loads lazy assets and saves through the real isolated preload',async () => {
+  const directory=await mkdtemp(path.join(tmpdir(),'quark-editor-ui-'));
+  const executable=path.resolve(__dirname,'..',process.env.QUARK_DESKTOP_OUT || 'out','Quark Drive Client-win32-x64/QuarkDriveClient.exe');
+  const app=await _electron.launch({executablePath:executable,args:['--user-data-dir='+path.join(directory,'electron')],env:{...process.env,QUARK_CONFIG_DIR:directory,QUARK_COOKIE:'',QUARK_COOKIE_FILE:''}});
+  let page;
+  try {
+    page=await app.firstWindow();await page.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
+    await app.evaluate(({ipcMain,app,dialog},output) => {
+      const entry={fid:'markdown',name:'README.md',directory:false,size:10,path:'/README.md',location:[['0','我的网盘']],modified_at:100};
+      globalThis.editorRequests=[];globalThis.editorPrompts=[];
+      dialog.showMessageBox=async (_window,options) => {globalThis.editorPrompts.push(options.title);return {response:0};};
+      ipcMain.removeHandler('quark:call');
+      ipcMain.handle('quark:call',(_event,{method,params}) => {
+        if(method==='hello') return {protocol:1,signed_in:true,preferences:{output_dir:output,connections:4,limit_rate:null},client_version:app.getVersion()};
+        if(method==='account') return {nickname:'文本测试',logged_in:true};
+        if(method==='browse') return [{...entry}];
+        if(method==='text.open') return {text:'# 原文',encoding:'UTF-8',editor:'opened',version:'one',entry:{...entry}};
+        if(method==='text.save') {globalThis.editorRequests.push(params);entry.fid='edited';return {version:'two',entry:{...entry},warning:'',blocked:false};}
+        return [];
+      });
+    },directory);
+    const errors=[];page.on('pageerror',error => errors.push(error.message));
+    await page.reload();await page.getByRole('button',{name:'README.md',exact:true}).click();
+    const editor=page.getByRole('dialog',{name:'文本预览',exact:true});
+    await editor.getByLabel('文件内容').waitFor();
+    await editor.getByRole('button',{name:'渲染格式',exact:true}).click();
+    await editor.getByLabel('Markdown 渲染预览').getByRole('heading',{name:'原文',exact:true}).waitFor();
+    await editor.getByLabel('文件内容').fill('# 即时更新\n\n**加粗内容**');
+    await editor.getByLabel('Markdown 渲染预览').getByRole('heading',{name:'即时更新',exact:true}).waitFor();
+    await page.evaluate(() => window.quark.quit());
+    await page.waitForTimeout(100);
+    assert.deepEqual(await app.evaluate(() => globalThis.editorPrompts),['文本尚未保存']);
+    await page.keyboard.press('Control+s');
+    await editor.getByRole('status').filter({hasText:'已同步到云端'}).waitFor();
+    assert.deepEqual(await app.evaluate(() => globalThis.editorRequests),[{editor:'opened',version:'one',text:'# 即时更新\n\n**加粗内容**'}]);
+    await page.evaluate(() => window.quark.setAppearance('dark'));
+    await page.screenshot({path:path.resolve(__dirname,'../out/editor-packaged-check.png')});
+    assert.deepEqual(errors,[]);
+    await page.keyboard.press('Escape');await editor.waitFor({state:'detached'});
+    await page.getByRole('button',{name:'README.md',exact:true}).waitFor();
+  } finally {if(page) await page.evaluate(() => window.quark.setEditorDirty(false)).catch(() => {});await app.close();await rm(directory,{recursive:true,force:true});}
+});
 
 test('native file drops on rows and empty space upload into the directory currently displayed', async () => {
   const directory=await mkdtemp(path.join(tmpdir(),'quark-native-drop-'));
@@ -1015,14 +1074,17 @@ test('native file drops on rows and empty space upload into the directory curren
     await dialog.getByText('共 2 项 · 1 个目录',{exact:true}).waitFor();
     assert.equal(await app.evaluate(() => globalThis.dropCalls.filter(row => row.method === 'upload').length),0);
     await dialog.getByRole('button',{name:'确认上传',exact:true}).click();
-    await page.getByRole('heading',{name:'传输任务',exact:true}).waitFor();
+    await dialog.waitFor({state:'detached'});
+    assert.ok(await page.getByRole('heading',{name:'我的文件',exact:true}).isVisible());
     assert.deepEqual(await app.evaluate(() => globalThis.dropCalls.find(row => row.method === 'upload').params),{sources:[localFile,localFolder],parent:'0'});
     await page.getByRole('button',{name:'我的文件',exact:true}).click();await child.click();
     await page.getByText('暂无文件',{exact:true}).waitFor();
     await nativeDrop(page.locator('.file-list'),[localFile]);
     await dialog.getByText('目标：我的网盘 / 当前列表里的子目录',{exact:true}).waitFor();
     await dialog.getByRole('button',{name:'确认上传',exact:true}).click();
-    await page.getByRole('heading',{name:'传输任务',exact:true}).waitFor();
+    await dialog.waitFor({state:'detached'});
+    assert.ok(await page.getByRole('heading',{name:'我的文件',exact:true}).isVisible());
+    await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'当前列表里的子目录',exact:true}).waitFor();
     const uploads=await app.evaluate(() => globalThis.dropCalls.filter(row => row.method === 'upload').map(row => row.params));
     assert.deepEqual(uploads,[{sources:[localFile,localFolder],parent:'0'},{sources:[localFile],parent:'folder'}]);
     await session.detach();

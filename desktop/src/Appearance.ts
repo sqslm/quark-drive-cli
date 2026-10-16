@@ -23,5 +23,5 @@ export async function saveAppearance(source:AppearanceSource) {
   finally {await unlink(temporary).catch(() => {});}
 }
 export function appearanceColors(dark:boolean) {
-  return dark ? {background:'#1b1f27',title:'#202530',symbol:'#e3e9f3'} : {background:'#ffffff',title:'#f6f8fc',symbol:'#35435c'};
+  return dark ? {background:'#181818',title:'#191c1e',symbol:'#ececec'} : {background:'#ffffff',title:'#f6f8fc',symbol:'#35435c'};
 }
