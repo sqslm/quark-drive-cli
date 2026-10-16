@@ -6,6 +6,8 @@ import { Entry, Event, Preferences, Task, Cut, Favorite, Appearance, AppearanceS
 import logo from '../assets/app-icon.png';
 import './style.css';
 import './theme.css';
+import { images, isImage } from './Images';
+import { ImagePreview, ImageThumbnail } from './ImagePreview';
 import { FileDialog, FileAction } from './FileDialog';
 import { TasksPanel } from './TasksPanel';
 import { CatalogPanel } from './CatalogPanel';
@@ -82,6 +84,7 @@ function App() {
   }
   const [nickname, setNickname] = useState('未登录');
   const [rows, setRows] = useState<Entry[]>([]);
+  const [preview,setPreview]=useState<{entries:Entry[];start:string;handle:string|null}|null>(null);
   const [trail, setTrail] = useState<[string, string][]>([['0', '我的网盘']]);
   const [share, setShare] = useState<string | null>(null);
   const [sharePath, setSharePath] = useState('/');
@@ -129,6 +132,7 @@ function App() {
   const codeRevision = useRef(0);
   const scroll = useRef<HTMLDivElement>(null);
   const directoryKey = share ? `${share}:${sharePath}` : trail.at(-1)![0];
+  useEffect(() => {setPreview(null);},[page,directoryKey,accountRevision,loading]);
   useLayoutEffect(() => {scroll.current?.scrollTo({top:0});},[directoryKey]);
   const menu = useRef<HTMLDivElement>(null);
   useEffect(() => {if(context) menu.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();},[context]);
@@ -195,6 +199,7 @@ function App() {
   }
   async function openRow(row: Entry) {
     if(loading) return;
+    if(isImage(row)) {setContext(null);setPreview({entries:filtered.filter(isImage),start:row.fid,handle:share});return;}
     if (share) {
       if (!row.directory) return;
       const generation = ++view.current; cancelSearch(); setLoading(true);
@@ -322,7 +327,7 @@ function App() {
   const selected = filtered.filter(row => checked.has(row.fid));
   const cutIds = useMemo(() => new Set(cut?.mode === 'cut' ? cut.entries.map(row => row.fid) : []),[cut]);
   const canModify = signedIn && !share && !transferring && !searching && !loading && !loggingIn;
-  const dropBlocked=!signedIn ? '请先登录后上传' : share ? '分享文件为只读，请进入我的文件上传' : searchView ? '请先返回网盘目录，再拖入文件上传' : loading || searching ? '请等待目录读取或搜索完成' : loggingIn || fileDialog || sharingDialog || loginPicker || dropUpload ? '请先结束当前对话框' : '';
+  const dropBlocked=!signedIn ? '请先登录后上传' : share ? '分享文件为只读，请进入我的文件上传' : searchView ? '请先返回网盘目录，再拖入文件上传' : loading || searching ? '请等待目录读取或搜索完成' : loggingIn || fileDialog || sharingDialog || loginPicker || dropUpload || preview ? '请先结束当前对话框' : '';
   const canDrop=page === 'drive' && !dropBlocked && !quitting;
   function fileDrag(event:React.DragEvent) {return event.dataTransfer.types.includes('Files');}
   function dragEnter(event:React.DragEvent) {
@@ -398,6 +403,7 @@ function App() {
     scroll.current?.focus();
   }
   function shortcut(event:React.KeyboardEvent) {
+    if(preview) return;
     if(event.key === 'Escape' && dropUpload && !dropBusy) {cancelDrop();event.preventDefault();return;}
     if(event.key === 'Escape' && accountMenu) {setAccountMenu(false);event.preventDefault();return;}
     if(event.key === 'Escape' && loginPicker) {setLoginPicker(false);event.preventDefault();return;}
@@ -444,6 +450,7 @@ function App() {
     });
   }
   function clearAccountView() {
+    images.clear();setPreview(null);
     cancelDrop();
     cancelSearch();++view.current;++profileGeneration.current;setContext(null);setFileDialog(null);setSharingDialog(null);
     setFavorites([]);setCut(null);setRows([]);setChecked(new Set());setShare(null);setShareText('');setPasscode('');
@@ -511,7 +518,7 @@ function App() {
           {!loading && !filtered.length && <div className="empty">{!signedIn ? <><p>登录后浏览和管理网盘文件</p><button className="primary" onClick={() => setLoginPicker(true)}>登录账号</button></> : searching ? '正在搜索，结果将陆续显示…' : rows.length ? '没有符合筛选条件的项目' : '暂无文件'}</div>}
           <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>{virtualizer.getVirtualItems().map(item => { const row = filtered[item.index]; return <div className={'file-row' + (checked.has(row.fid) ? ' selected' : '') + (cutIds.has(row.fid) && !share ? ' cut' : '')} key={row.fid} style={{ transform: `translateY(${item.start}px)` }} onDoubleClick={() => void openRow(row)} onContextMenu={event => contextAt(event,row)}>
             <input type="checkbox" aria-label={`选择 ${row.name}`} checked={checked.has(row.fid)} onChange={() => toggle(row.fid)} />
-            <div className="file-title"><button className="file-name" title={row.name} onClick={() => void openRow(row)}><FileIcon folder={row.directory} /><span>{row.name}</span></button><div className="row-actions"><button title="更多操作" aria-label={`更多操作 ${row.name}`} onClick={event => contextAt(event,row)}>⋯</button></div></div>
+            <div className="file-title"><button className="file-name" title={row.name} onClick={() => void openRow(row)}>{isImage(row) && signedIn ? <ImageThumbnail entry={row} handle={share} active={!loading && !loggingIn && !preview && item.end >= (scroll.current?.scrollTop || 0) && item.start < (scroll.current?.scrollTop || 0)+(scroll.current?.clientHeight || 0)}/> : <FileIcon folder={row.directory} />}<span>{row.name}</span></button><div className="row-actions"><button title="更多操作" aria-label={`更多操作 ${row.name}`} onClick={event => contextAt(event,row)}>⋯</button></div></div>
             <span>{row.directory ? '—' : units(row.size)}</span><span>{row.directory ? '目录' : '文件'}</span><span className="modified-time" title={row.modified_at == null ? '服务器未提供有效修改时间' : '本地时间'}>{modificationTime(row.modified_at)}</span><span title={row.path}>{row.path || (searchView ? '待定位' : '—')}</span></div>; })}</div></div>
           {loading && <div className="list-loading" role="status">正在读取目录…</div>}
           {dragging && <div className={'drop-overlay'+(canDrop ? '' : ' blocked')} role="status"><strong>{canDrop ? '松开鼠标，准备上传' : dropBlocked}</strong>{canDrop && <p>目标：{trail.map(([,name]) => name).join(' / ')}</p>}<small>文件和目录均可，确认后加入上传队列</small></div>}</div>
@@ -544,6 +551,7 @@ function App() {
       }
     }}>
       {context.row && <>
+        {isImage(context.row) && <button role="menuitem" disabled={loading || selected.length !== 1} onClick={() => void openRow(context.row!)}>预览图片</button>}
         {context.row.directory && <button role="menuitem" disabled={loading || searching || selected.length !== 1} onClick={() => {const row=context.row!;setContext(null);void openRow(row);}}>打开目录</button>}
         <button role="menuitem" disabled={!canDownload} onClick={() => void downloadSelected()}>下载{selected.length > 1 ? `（${selected.length}）` : ''}</button>
         {!share && <button role="menuitem" disabled={!canModify || selected.length !== 1} onClick={() => {setContext(null);setSharingDialog('create');}}>分享</button>}
@@ -562,6 +570,7 @@ function App() {
       {!context.row && <><button role="menuitem" disabled={loading || searching} onClick={() => {setContext(null);void (share ? openShare() : browse());}}>刷新</button>{!share && <><button role="menuitem" disabled={!canModify} onClick={() => fileAction('mkdir',[])}>新建目录</button><button role="menuitem" disabled={!canPaste} onClick={paste}>粘贴<kbd>Ctrl+V</kbd></button></>}</>}
     </div></>}
     {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} cutId={fileDialog.cutId} copying={fileDialog.copying} onCut={setCut} parent={trail} close={() => setFileDialog(null)} done={() => { void (searchView ? runSearch() : browse()); }} onStatus={notify}/ >}
+    {preview && <ImagePreview entries={preview.entries} start={preview.start} handle={preview.handle} close={() => setPreview(null)}/>}
     {sharingDialog && <SharingDialog mode={sharingDialog} entries={selected} handle={share} path={sharePath} close={() => setSharingDialog(null)} onStatus={notify}/>}
     {dropUpload && createPortal(<div className="modal-backdrop"><section className="modal file-modal" role="dialog" aria-modal="true" aria-label="确认拖拽上传"><h2>上传到当前目录</h2><p>目标：{dropUpload.target}</p>{dropUpload.items ? <><p>共 {dropUpload.items.length} 项 · {dropUpload.items.filter(item => item.directory).length} 个目录</p><ul className="drop-items">{dropUpload.items.slice(0,50).map(item => <li key={item.path}><FileIcon folder={item.directory}/><span title={item.path}>{item.name}</span><small>{item.directory ? '目录' : '文件'}</small></li>)}</ul>{dropUpload.items.length > 50 && <p className="note">另有 {dropUpload.items.length-50} 项，确认后全部加入队列。</p>}<p className="note">同名冲突不会自动覆盖。目录内容在正式上传时读取。</p></> : <p>正在读取拖入项目…</p>}<div className="dialog-actions"><button autoFocus disabled={dropBusy} onClick={cancelDrop}>取消</button><button className="primary" disabled={dropBusy || !dropUpload.items} onClick={() => void confirmDrop()}>{dropBusy ? '正在加入队列…' : '确认上传'}</button></div></section></div>,document.body)}
     {loginPicker && <div className="modal-backdrop"><section className="modal login-picker" role="dialog" aria-modal="true" aria-label={signedIn ? '切换账号' : '登录账号'}><h2>{signedIn ? '切换账号' : '登录夸克账号'}</h2><p>选择官方支持的登录方式</p><button disabled={transferring} onClick={() => void login('qr')}>扫码登录</button><button disabled={transferring} onClick={() => void login('mobile')}>手机验证码登录</button><button disabled={transferring} onClick={() => void login('wechat')}>微信登录</button><p className="note">手机和微信登录在独立的夸克官方页面完成。{signedIn && '取消登录会保留原账号。'}</p><button onClick={() => setLoginPicker(false)}>取消</button></section></div>}

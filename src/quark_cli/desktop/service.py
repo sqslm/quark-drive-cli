@@ -55,6 +55,7 @@ class DesktopService:
         self.web_login = None
         self.backend = backend or DriveBackend(self.cookie)
         self.reads = ThreadPoolExecutor(2, thread_name_prefix="quark-read")
+        self.images = ThreadPoolExecutor(2, thread_name_prefix="quark-image")
         self.transfers = ThreadPoolExecutor(1, thread_name_prefix="quark-transfer")
         self.lock = threading.RLock()
         self.writes = threading.Lock()
@@ -141,7 +142,8 @@ class DesktopService:
             cancel = self.login_cancel
         else:
             cancel = None
-        self.reads.submit(self.execute, identifier, method, params, cancel)
+        executor = self.images if method == 'image.read' else self.reads
+        executor.submit(self.execute, identifier, method, params, cancel)
 
     def execute(self, identifier, method, params, cancel=None):
         try:
@@ -369,6 +371,13 @@ class DesktopService:
             return {"nickname": self.backend.account_nickname(),'logged_in':True}
         if method == "browse":
             return [asdict(row) for row in self.backend.listing(str(p.get("fid", "0")))]
+        if method == 'image.read':
+            handle = p.get('handle')
+            source = self.sources.get(handle) if isinstance(handle, str) else None
+            if handle is not None and source is None:
+                raise UsageError('分享已关闭，请重新打开')
+            return self.backend.image(self.entry(p['entry']), thumbnail=p.get('thumbnail') is True,
+                                      source=source, refresh=p.get('refresh') is True)
         if method == "locate":
             return asdict(self.backend.locate(self.entry(p["entry"])))
         if method == "search":
@@ -566,6 +575,8 @@ class DesktopService:
                     self.managing = False
 
     def clear_account_context(self):
+        if hasattr(self.backend, 'images'):
+            self.backend.images.clear()
         self.search_cancel.set()
         self.cut = None
         self.sources.clear()
@@ -742,11 +753,14 @@ class DesktopService:
             self.search_cancel.set()
             self.login_cancel.set()
         self.reads.shutdown(wait=True, cancel_futures=True)
+        self.images.shutdown(wait=True, cancel_futures=True)
+        if hasattr(self.backend, 'images'):
+            self.backend.images.clear()
         # Let queued jobs record their stopped state without opening a transfer.
         self.transfers.shutdown(wait=True)
 
 
-METHODS = frozenset({"hello", "account", "browse", "search", "search.cancel", "locate", "share.parse",
+METHODS = frozenset({"hello", "account", "browse", "image.read", "search", "search.cancel", "locate", "share.parse",
     "share.open", "share.browse", "preferences.save", "login", "login.cancel", "download", "download.stop", "tasks", "tasks.retry",
     "file.info", "file.paths", "file.mkdir", "file.rename", "file.move", "file.delete",
     "upload", "tasks.cancel", "tasks.pause", "tasks.remove", "tasks.clear", "tasks.authorize",

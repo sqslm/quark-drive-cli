@@ -11,7 +11,7 @@ export type Appearance = {source:AppearanceSource;dark:boolean;warning:string};
 export type ClientSettings = {closeBehavior:'tray'|'quit';notifications:boolean};
 export type ClientSettingsResult = {settings:ClientSettings;warning:string};
 export type LocalUploadItem = {path:string;name:string;directory:boolean};
-export const METHODS = ['hello','account','browse','locate','search','search.cancel','share.parse','share.open','share.browse',
+export const METHODS = ['hello','account','browse','image.read','locate','search','search.cancel','share.parse','share.open','share.browse',
   'preferences.save','login','login.cancel','download','download.stop','tasks','tasks.retry',
   'file.info','file.paths','file.mkdir','file.rename','file.move','file.delete','upload','tasks.cancel','tasks.pause','tasks.remove','tasks.clear','tasks.authorize',
   'share.list','share.link','share.create','share.revoke','share.save','recycle.list','recycle.restore','recycle.remove',

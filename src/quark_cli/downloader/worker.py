@@ -248,9 +248,11 @@ class DriveBackend:
         from ..request_guard import RequestGuard
         self._operation_guard = RequestGuard.memory() if isinstance(transport, httpx.MockTransport) else RequestGuard.durable(pacing=0.1)
         self._path_cache: dict[str, tuple] = {}
+        from .images import ImageReader
+        self.images = ImageReader()
 
-    def _client(self, *, interactive=False) -> QuarkClient:
-        return QuarkClient(self._cookie(), transport=self._transport,
+    def _client(self, *, interactive=False, cookie=None) -> QuarkClient:
+        return QuarkClient(cookie or self._cookie(), transport=self._transport,
                            guard=self._operation_guard if interactive else self._guard)
 
     def account_nickname(self) -> str:
@@ -293,8 +295,10 @@ class DriveBackend:
             return replace(entry, path=path, location=chain if entry.directory else chain[:-1])
 
     def listing(self, fid: str) -> list[Entry]:
-        with self._client(interactive=True) as client:
+        cookie = self._cookie()
+        with self._client(interactive=True, cookie=cookie) as client:
             payload = Files(client).list_all(fid, size=100)
+            self.images.remember(self.images.scope(cookie), payload['data']['list'])
         return entries(payload["data"]["list"])
 
     def share_listing(self, source: ShareSource, path: str) -> list[Entry]:
@@ -305,10 +309,23 @@ class DriveBackend:
         absolute path inside the share, which is what the download request needs
         as the source folder.
         """
-        with self._client(interactive=True) as client:
-            payload = ShareSaver(client).inspect(source.url, path=path, passcode=source.passcode)
+        cookie = self._cookie()
+        with self._client(interactive=True, cookie=cookie) as client:
+            selection = ShareSaver(client)._source(source.url, path, source.passcode)
+            self.images.remember(self.images.scope(cookie, source), selection.items,
+                                 (selection.pwd_id, selection.stoken))
         parent = path.rstrip("/") if path not in ("", "/") else ""
-        return [replace(row, path=f"{parent}/{row.name}") for row in entries(payload["items"])]
+        return [replace(row, path=f"{parent}/{row.name}") for row in entries(selection.items)]
+
+    def image(self, entry: Entry, *, thumbnail=False, source=None, refresh=False):
+        cookie = self._cookie()
+        scope = self.images.scope(cookie, source)
+        if refresh:
+            with self.images.lock:
+                self.images.records.pop((scope, entry.fid), None)
+        with QuarkClient(cookie, transport=self._transport, guard=self._operation_guard,
+                         timeout=httpx.Timeout(8, connect=3)) as client:
+            return self.images.read(client, scope, entry, thumbnail=thumbnail, source=source)
 
     def search(self, fid: str, query: str) -> list[Entry]:
         """Find matches by name under ``fid``, each with its verified location.
