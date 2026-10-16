@@ -28,7 +28,7 @@ test('image queue bounds concurrency, prioritizes previews, drops abandoned work
   request('new-account');assert.equal(calls.length,6,'errors can retry');calls[5].resolve({src:'new',width:1,height:1});await tick();queue.clear();
 });
 
-test('visible image rows load lazily; preview zooms, navigates, retries, closes and keeps layout stable',async () => {
+test('cloud previews load visible images, zoom and retry; text refreshes safely and ignores late reads',async () => {
   const root=path.resolve(__dirname,'../.webpack/x64/renderer');
   const server=http.createServer(async (request,response) => {
     const filename=path.resolve(root,'.'+(request.url==='/' ? '/index.html' : request.url.split('?')[0]));
@@ -43,18 +43,26 @@ test('visible image rows load lazily; preview zooms, navigates, retries, closes 
     await page.addInitScript(() => {
       const preferences={output_dir:'C:\\Downloads',connections:4,limit_rate:null,width:1180,height:780};
       const rows=Array.from({length:1000},(_,n) => ({fid:String(n),name:`图片${String(n).padStart(4,'0')}.png`,directory:false,size:100,path:'',location:[],modified_at:100}));
+      const textRows=['配置.json','说明.txt','README.md','空文件.txt','失败.txt','迟到.txt'].map((name,n) => ({...rows[0],fid:'t'+n,name}));
       const pixel='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+juyQAAAAASUVORK5CYII=';
-      window.imageCalls=[];window.imageActive=0;window.imageMax=0;window.failPreview=false;
-      window.quark={onEvent:() => () => {},getAppearance:async () => ({source:'light',dark:false,warning:''}),getClientSettings:async () => ({settings:{closeBehavior:'tray',notifications:false},warning:''}),call:async (method,params={}) => {
-        if(method==='hello') return {protocol:1,client_version:'0.5.21',signed_in:true,preferences,extension_groups:{}};
+      window.imageCalls=[];window.imageActive=0;window.imageMax=0;window.failPreview=false;window.textVersion=1;window.textCalls=[];
+      window.quark={copyText:async text => {window.copiedPreview=text;},onEvent:() => () => {},getAppearance:async () => ({source:'light',dark:false,warning:''}),getClientSettings:async () => ({settings:{closeBehavior:'tray',notifications:false},warning:''}),call:async (method,params={}) => {
+        if(method==='hello') return {protocol:1,client_version:'0.5.22',signed_in:true,preferences,extension_groups:{}};
         if(method==='account') return {nickname:'图片测试',logged_in:true};
-        if(method==='browse') return rows;
+        if(method==='browse') return window.showTextRows ? textRows : rows;
         if(method==='tasks' || method==='favorites.list') return [];
         if(method==='image.read') {
           window.imageCalls.push(params);++window.imageActive;window.imageMax=Math.max(window.imageMax,window.imageActive);
           await new Promise(resolve => setTimeout(resolve,35));--window.imageActive;
           if(window.failPreview && !params.thumbnail) throw new Error('图片加载失败，请重试');
           return {src:pixel,width:1,height:1};
+        }
+        if(method==='text.read') {
+          window.textCalls.push(params.entry.name);
+          if(params.entry.name==='迟到.txt') await new Promise(resolve => {window.releaseText=resolve;});
+          if(params.entry.name==='失败.txt' || window.failTextRefresh) throw new Error("Error invoking remote method 'quark:call': Error: 操作失败：文本读取失败");
+          const text=params.entry.name==='配置.json' ? JSON.stringify({version:window.textVersion}) : params.entry.name==='空文件.txt' ? '' : params.entry.name==='README.md' ? '# Markdown 标题\n正文' : '<img src=x onerror="window.injected=true"><script>window.injected=true</script>\n'+('长文本\n'.repeat(1000));
+          return {text,encoding:'UTF-8',size:text.length,modified_at:100};
         }
         return true;
       }};
@@ -64,6 +72,40 @@ test('visible image rows load lazily; preview zooms, navigates, retries, closes 
     assert.ok(await page.locator('.file-row').count()<50);
     assert.ok(await page.evaluate(() => window.imageCalls.length)<25,'does not fetch 1000 images');
     assert.equal(await page.evaluate(() => window.imageMax),2);
+    await page.evaluate(() => {window.showTextRows=true;});await page.getByRole('button',{name:'刷新',exact:true}).click();
+    await page.getByRole('button',{name:'配置.json',exact:true}).click();
+    const textDialog=page.getByRole('dialog',{name:'文本预览',exact:true});
+    await textDialog.getByLabel('文件内容').filter({hasText:'{"version":1}'}).waitFor();
+    await page.evaluate(() => {window.textVersion=2;});await textDialog.getByRole('button',{name:'刷新内容'}).click();
+    await textDialog.getByLabel('文件内容').filter({hasText:'{"version":2}'}).waitFor();
+    await textDialog.getByRole('button',{name:'复制内容'}).click();assert.equal(await page.evaluate(() => window.copiedPreview),'{"version":2}');
+    await page.getByText('已复制文本内容',{exact:true}).waitFor();
+    await page.evaluate(() => {window.failTextRefresh=true;});await textDialog.getByRole('button',{name:'刷新内容'}).click();
+    await textDialog.getByRole('alert').waitFor();assert.match(await textDialog.getByRole('alert').innerText(),/上次读取/);
+    assert.doesNotMatch(await textDialog.innerText(),/Error invoking remote/);
+    await page.evaluate(() => {window.failTextRefresh=false;});await textDialog.getByRole('button',{name:'重新读取'}).click();
+    await textDialog.getByRole('button',{name:'刷新内容'}).waitFor();await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
+    await page.getByRole('button',{name:'说明.txt',exact:true}).click();await textDialog.getByLabel('文件内容').waitFor();
+    assert.ok((await textDialog.getByLabel('文件内容').innerText()).includes('<script>'));
+    assert.equal(await textDialog.locator('img,script').count(),0);assert.equal(await page.evaluate(() => window.injected),undefined);
+    await textDialog.getByRole('checkbox',{name:'自动换行'}).uncheck();assert.equal(await textDialog.locator('.text-content.wrap').count(),0);
+    await textDialog.getByLabel('文件内容').focus();await page.keyboard.press('Tab');assert.equal(await page.evaluate(() => document.activeElement.getAttribute('aria-label')),'关闭文本预览');
+    await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
+    await page.getByRole('button',{name:'README.md',exact:true}).click({button:'right'});await page.getByRole('menuitem',{name:'预览文本'}).click();
+    await textDialog.getByLabel('文件内容').filter({hasText:'# Markdown 标题'}).waitFor();
+    await page.screenshot({path:path.resolve(__dirname,'../out/text-preview-check.png')});
+    await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
+    await page.getByRole('button',{name:'空文件.txt',exact:true}).click();await textDialog.getByText('文件内容为空',{exact:true}).waitFor();
+    await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
+    await page.getByRole('button',{name:'失败.txt',exact:true}).click();await textDialog.getByRole('alert').waitFor();
+    assert.doesNotMatch(await textDialog.innerText(),/Error invoking remote/);await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
+    await page.getByRole('button',{name:'迟到.txt',exact:true}).click();await page.waitForFunction(() => !!window.releaseText);
+    await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
+    await page.getByRole('button',{name:'配置.json',exact:true}).click();await page.evaluate(() => window.releaseText());
+    await textDialog.getByLabel('文件内容').filter({hasText:'{"version":2}'}).waitFor();
+    await page.keyboard.press('Escape');await textDialog.waitFor({state:'detached'});
+    await page.evaluate(() => {window.showTextRows=false;});await page.getByRole('button',{name:'刷新',exact:true}).click();
+    await page.getByRole('button',{name:'图片0000.png',exact:true}).waitFor();
     const rowHeight=await page.locator('.file-row').first().evaluate(node => node.getBoundingClientRect().height);
     assert.equal(rowHeight,46);
     await page.getByRole('button',{name:'图片0000.png',exact:true}).click();

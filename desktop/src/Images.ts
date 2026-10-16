@@ -3,6 +3,8 @@ import { Entry } from './types';
 export type ImageData = {src:string;width:number;height:number};
 type Job = {key:string;params:Record<string,unknown>;preview:boolean;listeners:Set<{resolve:(data:ImageData)=>void;reject:(error:Error)=>void}>;running:boolean;generation:number};
 export const isImage = (entry:Entry) => !entry.directory && /\.(jpe?g|png|webp)$/i.test(entry.name);
+export const previewError = (error:unknown) => (error instanceof Error ? error.message : '预览读取失败')
+  .replace(/^Error invoking remote method 'quark:call': Error:\s*/, '').replace(/^操作失败[：:]\s*/, '');
 
 // Only mounted, visible rows hold a lease. Navigation releases queued work;
 // already issued requests finish without delivering data to abandoned views.

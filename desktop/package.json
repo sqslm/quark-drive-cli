@@ -1,7 +1,7 @@
 {
   "name": "quark-drive-client",
   "productName": "Quark Drive Client",
-  "version": "0.5.21",
+  "version": "0.5.22",
   "description": "夸克网盘第三方桌面客户端",
   "private": true,
   "main": ".webpack/main/index.cjs",

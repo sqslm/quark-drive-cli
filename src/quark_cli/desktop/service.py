@@ -142,7 +142,7 @@ class DesktopService:
             cancel = self.login_cancel
         else:
             cancel = None
-        executor = self.images if method == 'image.read' else self.reads
+        executor = self.images if method in ('image.read', 'text.read') else self.reads
         executor.submit(self.execute, identifier, method, params, cancel)
 
     def execute(self, identifier, method, params, cancel=None):
@@ -378,6 +378,10 @@ class DesktopService:
                 raise UsageError('分享已关闭，请重新打开')
             return self.backend.image(self.entry(p['entry']), thumbnail=p.get('thumbnail') is True,
                                       source=source, refresh=p.get('refresh') is True)
+        if method == 'text.read':
+            if p.get('handle') is not None:
+                raise UsageError('分享中的文本暂不支持直接预览，请在我的文件中查看')
+            return self.backend.text_preview(self.entry(p['entry']))
         if method == "locate":
             return asdict(self.backend.locate(self.entry(p["entry"])))
         if method == "search":
@@ -760,7 +764,7 @@ class DesktopService:
         self.transfers.shutdown(wait=True)
 
 
-METHODS = frozenset({"hello", "account", "browse", "image.read", "search", "search.cancel", "locate", "share.parse",
+METHODS = frozenset({"hello", "account", "browse", "image.read", "text.read", "search", "search.cancel", "locate", "share.parse",
     "share.open", "share.browse", "preferences.save", "login", "login.cancel", "download", "download.stop", "tasks", "tasks.retry",
     "file.info", "file.paths", "file.mkdir", "file.rename", "file.move", "file.delete",
     "upload", "tasks.cancel", "tasks.pause", "tasks.remove", "tasks.clear", "tasks.authorize",

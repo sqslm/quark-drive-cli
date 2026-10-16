@@ -9,11 +9,13 @@ import time
 import warnings
 from collections import OrderedDict
 from pathlib import PurePosixPath
+from urllib.parse import urlsplit
 
 import httpx
 
 from ..errors import RemoteError, UsageError, AuthenticationError, RateLimitError, AccessRestrictedError
 from ..files import Files
+from ..client import API_HOST
 from ..paths import valid_fid
 from ..shares import ShareSaver
 from ..transfer import Transfer
@@ -73,7 +75,14 @@ class ImageReader:
                 or entry.size is not None and actual.size != entry.size
                 or entry.modified_at is not None and actual.modified_at != entry.modified_at):
             raise RemoteError('图片信息已变化，请刷新目录')
-        url = record.get('thumbnail' if thumbnail else 'big_thumbnail')
+        url = record.get('preview_url') or record.get('thumbnail' if thumbnail else 'big_thumbnail')
+        # Listing fields can be bare API routes, not signed image addresses.
+        # They return 401 even for a valid desktop session; resolve the official
+        # preview URL instead of treating that response as an invalid image.
+        if isinstance(url, str):
+            parsed = urlsplit(url)
+            if parsed.hostname == API_HOST and parsed.path in ('/1/clouddrive/file/thumbnail', '/1/clouddrive/file/quick'):
+                url = None
         if not isinstance(url, str) or not url:
             if selection is not None:
                 token = record.get('share_fid_token')
@@ -90,6 +99,11 @@ class ImageReader:
             data = payload.get('data')
             item = next((row for row in data if isinstance(row, dict) and str(row.get('fid')) == fid), None) if isinstance(data, list) else None
             url = item.get('preview_url') if item else None
+            if isinstance(url, str) and url:
+                with self.lock:
+                    stored = self.records.get((scope, fid))
+                    if stored and entry_of(stored[0]) == actual:
+                        stored[0]['preview_url'] = url
         if not isinstance(url, str) or not url:
             raise RemoteError('服务端尚未提供图片预览，可稍后重试或下载原图')
         try:
@@ -116,14 +130,16 @@ class ImageReader:
         client.transfer_client().timeout = httpx.Timeout(8, connect=3)
         with Transfer(client)._download_stream(url, {'Accept-Encoding': 'identity'}) as response:
             if response.status_code != 200:
-                raise RemoteError('图片地址不可用')
+                raise RemoteError('预览地址不可用')
             length = response.headers.get('content-length')
             if length is not None and int(length) > limit:
-                raise RemoteError('图片超过大小限制')
+                raise UsageError('文件超过预览大小限制，请下载后查看')
             data = bytearray()
             for chunk in response.iter_bytes(64 * 1024):
-                if len(data) + len(chunk) > limit or time.monotonic() > deadline:
-                    raise RemoteError('图片超过预览限制')
+                if len(data) + len(chunk) > limit:
+                    raise UsageError('文件超过预览大小限制，请下载后查看')
+                if time.monotonic() > deadline:
+                    raise RemoteError('预览读取超时')
                 data.extend(chunk)
             return bytes(data)
 

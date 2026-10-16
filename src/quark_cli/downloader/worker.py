@@ -327,6 +327,12 @@ class DriveBackend:
                          timeout=httpx.Timeout(8, connect=3)) as client:
             return self.images.read(client, scope, entry, thumbnail=thumbnail, source=source)
 
+    def text_preview(self, entry: Entry):
+        from .text_preview import read_text
+        with QuarkClient(self._cookie(), transport=self._transport, guard=self._operation_guard,
+                         timeout=httpx.Timeout(8, connect=3)) as client:
+            return read_text(client, entry)
+
     def search(self, fid: str, query: str) -> list[Entry]:
         """Find matches by name under ``fid``, each with its verified location.
 

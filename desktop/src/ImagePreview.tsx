@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Entry } from './types';
-import { ImageData, imageKey, images } from './Images';
+import { ImageData, imageKey, images, previewError } from './Images';
 
 function useImage(entry:Entry,handle:string|null,thumbnail:boolean,active=true) {
   const key=imageKey(entry,handle,thumbnail);
@@ -12,7 +12,7 @@ function useImage(entry:Entry,handle:string|null,thumbnail:boolean,active=true) 
     if(!active) return;
     setState({key});
     return images.request(key,{entry,handle,thumbnail,refresh:attempt>0},!thumbnail,
-      data => setState({key,data}),error => setState({key,error:error.message}));
+      data => setState({key,data}),error => setState({key,error:previewError(error)}));
   },[key,attempt,active]);
   return {...(state.key === key ? state : {}),retry:() => setRetryRequest(old => ({key,attempt:(old.key === key ? old.attempt : 0)+1}))};
 }

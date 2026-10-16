@@ -47,7 +47,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.21',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.22',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
@@ -828,6 +828,7 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     assert.equal(hello.client_version,await app.evaluate(({app}) => app.getVersion()));
     assert.deepEqual(await page.evaluate(() => window.quark.call('tasks.pause',{ids:[]})),[]);
     assert.deepEqual(await page.evaluate(() => window.quark.call('tasks.remove',{ids:[]})),[]);
+    await assert.rejects(page.evaluate(() => window.quark.call('text.read',{entry:{fid:'text',name:'test.txt',directory:false,size:4,path:'',location:[],modified_at:null}})),/QUARK_COOKIE|Cookie|登录/);
     await page.locator('.titlebar').getByText('v'+hello.client_version,{exact:true}).waitFor();
     await assert.rejects(page.evaluate(() => window.quark.readDroppedFiles([new File(['payload'],'网页生成.txt')])),/本地文件/);
     const localDropFile=path.join(directory,'本地拖拽.txt'),localDropFolder=path.join(directory,'本地目录');

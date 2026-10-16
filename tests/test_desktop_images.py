@@ -54,6 +54,21 @@ class ImageFixture:
 
 
 class ImageTests(unittest.TestCase):
+    def test_real_listing_api_thumbnail_addresses_resolve_to_authorized_preview(self):
+        fixture = ImageFixture()
+        fixture.record.update(thumbnail='https://drive-pc.quark.cn/1/clouddrive/file/thumbnail?fid=photo',
+                              big_thumbnail='https://drive-pc.quark.cn/1/clouddrive/file/quick?fid=photo')
+        original = fixture.transport()
+        def handle(request):
+            if request.url.path.endswith(('/file/thumbnail', '/file/quick')):
+                return httpx.Response(401, json={'code':31001,'status':401})
+            return original.handle_request(request)
+        backend = DriveBackend(lambda:COOKIE, transport=httpx.MockTransport(handle))
+        entry = backend.listing('0')[0]
+        self.assertEqual(backend.image(entry, thumbnail=True)['width'], 80)
+        self.assertEqual(backend.image(entry)['width'], 300)
+        self.assertEqual(sum(request.url.path.endswith('advanced_preview') for request in fixture.calls), 1)
+
     def test_listing_thumbnail_reuses_metadata_and_does_not_expose_addresses(self):
         fixture = ImageFixture()
         backend = DriveBackend(lambda: COOKIE, transport=fixture.transport())
