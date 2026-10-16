@@ -6,6 +6,11 @@ const { tmpdir } = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 
+async function openSettings(page) {
+  await page.getByRole('button',{name:'账号操作',exact:true}).click();
+  await page.getByRole('menuitem',{name:'设置',exact:true}).click();
+}
+
 test('renderer virtualizes files, streams searches, cancels, preserves manual codes and queues selected files', async () => {
   const root = path.resolve(__dirname, '../.webpack/x64/renderer');
   const server = http.createServer(async (request, response) => {
@@ -47,7 +52,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.24',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.25',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'account.capacity') {
             const data={...(window.testCapacity || {used_bytes:50*1073741824,total_bytes:100*1073741824})};
@@ -121,6 +126,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
       window.testEmit=event => listeners.forEach(listener => listener(event));
       window.testGetTasks=() => tasks.map(task => ({...task}));
       window.testSetRecycle=next => {recycle=next;};
+      window.testSetFavorites=next => {favorites=next;};
       window.testSetTasks=next => {tasks=next;listeners.forEach(listener => listener({id:null,event:'tasks.changed',data:tasks}));};
     });
     await page.goto(`http://127.0.0.1:${server.address().port}/main_window/index.html`);
@@ -131,6 +137,13 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
       const data=await dragData(names);await page.locator('.file-list').dispatchEvent('drop',{dataTransfer:data});await data.dispose();
     }
     await page.getByText('显示 10000 项', { exact: true }).waitFor();
+    assert.equal(await page.getByRole('navigation',{name:'主导航'}).getByRole('button',{name:'设置',exact:true}).count(),0);
+    assert.equal(await page.locator('aside .login-button').count(),0);
+    assert.equal(await page.getByRole('menu',{name:'账号菜单',exact:true}).count(),0);
+    await page.getByRole('button',{name:'账号操作',exact:true}).click();
+    for(const name of ['设置','切换账号','退出账号']) assert.ok(await page.getByRole('menuitem',{name,exact:true}).isEnabled());
+    await page.locator('.menu-dismiss').click({position:{x:650,y:100}});
+    assert.equal(await page.getByRole('button',{name:'账号操作',exact:true}).getAttribute('aria-expanded'),'false');
     const capacity=page.getByRole('region',{name:'网盘空间',exact:true});
     await capacity.getByText('50.0%',{exact:true}).waitFor();
     assert.equal(await capacity.getByRole('progressbar').getAttribute('aria-valuenow'),'50');
@@ -294,8 +307,28 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button',{name:'取消复制',exact:true}).click();
     await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'我的网盘',exact:true}).click();
     await page.locator('.file-row').getByRole('button',{name:'知否 00003.txt',exact:true}).waitFor();
+    await page.evaluate(() => window.testSetFavorites([{fid:'new',name:'新建测试'},...Array.from({length:30},(_,index) => ({fid:'favorite-'+index,name:'常用目录 '+index}))]));
     await page.locator('.favorites').getByRole('button',{name:'新建测试',exact:true}).click();
     await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'新建测试',exact:true}).waitFor();
+    await page.locator('.favorites').getByRole('button',{name:'常用目录 29',exact:true}).waitFor({state:'attached'});
+    for(const viewport of [{width:1180,height:780},{width:860,height:600}]) {
+      await page.setViewportSize(viewport);
+      const accountBefore=await page.getByRole('button',{name:'账号操作',exact:true}).boundingBox();
+      const region=await page.locator('.favorites-list').boundingBox();assert.ok(region.height >= 60);
+      await page.locator('.favorites').getByRole('button',{name:'常用目录 29',exact:true}).scrollIntoViewIfNeeded();
+      assert.deepEqual(await page.getByRole('button',{name:'账号操作',exact:true}).boundingBox(),accountBefore);
+      assert.ok(accountBefore.y+accountBefore.height <= viewport.height);
+      assert.equal(await page.locator('aside').evaluate(element => element.scrollHeight > element.clientHeight),false);
+      const last=await page.locator('.favorites').getByRole('button',{name:'常用目录 29',exact:true}).boundingBox();
+      assert.ok(last.y >= region.y && last.y+last.height <= region.y+region.height+1);
+      await page.getByRole('button',{name:'账号操作',exact:true}).click();
+      const popup=await page.getByRole('menu',{name:'账号菜单',exact:true}).boundingBox();
+      assert.ok(popup.y >= 35 && popup.y+popup.height < accountBefore.y);
+      await page.screenshot({path:path.resolve(__dirname,`../test-results/sidebar-${viewport.width}.png`)});
+      await page.keyboard.press('Escape');
+    }
+    await page.setViewportSize({width:1180,height:780});
+    await page.evaluate(() => window.testSetFavorites([{fid:'new',name:'新建测试'}]));
     await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'我的网盘',exact:true}).click();
     await page.getByRole('button',{name:'移除常用 新建测试',exact:true}).click();
     await page.locator('.favorites').getByText('右键目录可添加',{exact:true}).waitFor();
@@ -420,7 +453,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'recycle.remove').length),2);
 
     await page.getByRole('button',{name:'我的文件',exact:true}).click();
-    await page.getByRole('button',{name:'设置',exact:true}).click();
+    await openSettings(page);
     assert.equal(await page.locator('.brand-logo').evaluate(image => image.complete && image.naturalWidth > 0),true);
     const threadSlider=page.getByRole('slider',{name:'拖动调整线程数',exact:true});
     await threadSlider.focus();await threadSlider.press('End');
@@ -473,7 +506,9 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await page.locator('html').getAttribute('data-theme'),'dark');
     assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(24, 24, 24)');
     assert.equal(await page.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(25, 28, 30)');
-    await page.waitForFunction(() => getComputedStyle(document.querySelector('.login-button')).backgroundColor === 'rgb(38, 38, 38)');
+    await page.getByRole('button',{name:'账号操作',exact:true}).click();
+    assert.equal(await page.getByRole('menu',{name:'账号菜单',exact:true}).evaluate(element => getComputedStyle(element).backgroundColor),'rgb(38, 38, 38)');
+    await page.keyboard.press('Escape');
     assert.equal(await page.locator('aside').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(25, 28, 30)');
     assert.equal(await page.getByRole('button',{name:'保存设置',exact:true}).evaluate(element => getComputedStyle(element).color),'rgb(25, 25, 25)');
     await page.screenshot({path:path.resolve(__dirname,'../test-results/dark-settings.png')});
@@ -485,7 +520,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByText('3.25 GB',{exact:true}).waitFor();
     assert.equal(await page.getByRole('dialog',{name:'文件属性'}).evaluate(element => getComputedStyle(element).backgroundColor),'rgb(38, 38, 38)');
     await page.getByRole('button',{name:'关闭',exact:true}).click();
-    await page.getByRole('button',{name:'设置',exact:true}).click();
+    await openSettings(page);
     await page.emulateMedia({colorScheme:'light'});
     assert.equal(await page.locator('html').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(24, 24, 24)');
     await page.getByRole('radio',{name:'跟随系统',exact:true}).check();
@@ -532,7 +567,10 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('heading', { name:'传输任务' }).waitFor();
     const downloaded = await page.evaluate(() => window.testCalls.find(call => call.method === 'download').params.entries);
     assert.equal(downloaded.length, 1); assert.equal(downloaded[0].fid, '0');
-    await page.getByRole('button',{name:'设置',exact:true}).click();
+    await page.getByRole('button',{name:'账号操作',exact:true}).click();
+    assert.ok(await page.getByRole('menuitem',{name:'切换账号',exact:true}).isDisabled());
+    assert.ok(await page.getByRole('menuitem',{name:'退出账号',exact:true}).isDisabled());
+    await page.getByRole('menuitem',{name:'设置',exact:true}).click();
     assert.ok(await page.getByRole('button',{name:'保存设置',exact:true}).isDisabled());
     assert.ok(await page.getByRole('slider',{name:'拖动调整线程数',exact:true}).isDisabled());
     assert.ok(await page.getByRole('slider',{name:'拖动调整总限速',exact:true}).isDisabled());
@@ -541,7 +579,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('button',{name:/^传输任务/}).click();
     assert.ok(await page.getByText('正在传输',{exact:true}).isVisible());
     await page.screenshot({path:path.resolve(__dirname,'../test-results/dark-transfers.png')});
-    await page.getByRole('button',{name:'设置',exact:true}).click();
+    await openSettings(page);
     await page.getByRole('radio',{name:'浅色',exact:true}).check();
     await page.getByRole('button', {name:'我的文件',exact:true}).click();
     await page.getByRole('button',{name:'上传',exact:true}).click();
@@ -845,7 +883,8 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.evaluate(() => {window.testHoldCapacity=true;window.testCapacity={used_bytes:99,total_bytes:100};});
     await capacity.getByRole('button',{name:'刷新网盘空间'}).click();await page.waitForFunction(() => window.capacityReleases.length===1);
     await page.evaluate(() => {window.testCapacity={used_bytes:20,total_bytes:100};});
-    await page.getByRole('button',{name:'切换账号',exact:true}).click();
+    await page.getByRole('button',{name:'账号操作',exact:true}).click();
+    await page.getByRole('menuitem',{name:'切换账号',exact:true}).click();
     await page.getByRole('button',{name:'微信登录',exact:true}).click();
     await page.locator('.account-name[title="新账号"]').waitFor();
     await page.waitForFunction(() => window.capacityReleases.length===2);
@@ -863,12 +902,13 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     const beforeSignedOutDrop=await page.evaluate(() => window.testDropReads || 0);
     await drop(['未登录不能上传.txt']);await page.locator('.toast.warning').getByText('请先登录后上传',{exact:true}).waitFor();
     assert.equal(await page.evaluate(() => window.testDropReads || 0),beforeSignedOutDrop);
-    await page.getByRole('button',{name:'登录账号',exact:true}).first().click();
+    await page.getByRole('button',{name:'账号操作',exact:true}).click();
+    await page.getByRole('menuitem',{name:'登录账号',exact:true}).click();
     await page.getByRole('button',{name:'扫码登录',exact:true}).click();
     await page.locator('.toast.error').getByText('登录服务暂时不可用',{exact:true}).waitFor();
     await page.locator('.account-name[title="未登录"]').waitFor();
     assert.deepEqual(errors, []);
-    await page.getByRole('button',{name:'设置',exact:true}).click();
+    await openSettings(page);
     await page.getByRole('button',{name:'退出客户端',exact:true}).click();
     await page.getByRole('alertdialog',{name:'正在安全退出',exact:true}).waitFor();
     assert.equal(await page.locator('.app').evaluate(element => element.inert),true);
@@ -939,7 +979,7 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     assert.equal(await app.evaluate(({BrowserWindow}) => BrowserWindow.getAllWindows()[0].isVisible()),true);
     await app.evaluate(() => global.testTrayMenu.getMenuItemById('transfers').click());
     await page.getByRole('heading',{name:'传输任务',exact:true}).waitFor();
-    await page.getByRole('button',{name:'设置',exact:true}).click();
+    await openSettings(page);
     await page.getByLabel('关闭窗口行为',{exact:true}).selectOption('quit');
     await page.getByLabel('传输完成通知',{exact:true}).uncheck();
     await page.locator('.toast.success').getByText('后台运行设置已保存',{exact:true}).waitFor();

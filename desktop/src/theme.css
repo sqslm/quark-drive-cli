@@ -74,7 +74,7 @@ aside{padding-top:28px}.brand{padding-bottom:30px;letter-spacing:.2px}.brand sma
 .nav{justify-content:flex-start;gap:12px;padding:12px 16px;border-radius:8px;color:var(--favorite-text)}
 .nav span{margin-left:auto}.nav.active{font-weight:600}.ui-icon{flex-shrink:0}
 .favorites{border-top:1px solid var(--line);padding-top:18px;margin-top:24px}
-.account-area{border-top:1px solid var(--line);padding-top:14px}.account-area .account{margin-bottom:10px}
+.account-area{border-top:1px solid var(--line);padding-top:14px}.account-area .account{margin-bottom:0}
 .connection{display:flex;align-items:center;gap:7px}.connection::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--secondary)}
 .icon-button{display:grid;place-items:center;width:32px;height:32px;padding:6px;color:var(--secondary)}
 .upload-picker summary{background:var(--surface);border-color:var(--control-border);border-radius:7px}
@@ -132,4 +132,6 @@ aside{padding-top:28px}.brand{padding-bottom:30px;letter-spacing:.2px}.brand sma
 
 .capacity-meter{padding:0 4px 14px;color:var(--secondary);font-size:11px}.capacity-heading{display:flex;align-items:center;gap:7px;margin-bottom:8px}.capacity-heading>span:first-child{flex:1}.capacity-heading button{padding:0;border:0;width:20px;height:20px;background:transparent;color:var(--secondary);font-size:17px}.capacity-track{height:5px;border-radius:4px;background:var(--control-border);overflow:hidden}.capacity-track>span{display:block;height:100%;background:var(--secondary);border-radius:inherit}.capacity-track.full>span{background:var(--warning-text)}.capacity-meter p{font-variant-numeric:tabular-nums;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:6px;color:var(--text)}.capacity-meter small{margin-top:4px;line-height:1.4;color:var(--muted)}
 
-aside{overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--scrollbar) transparent}.account-area{flex-shrink:0}
+aside{overflow:hidden}aside>.brand,aside>nav{flex-shrink:0}
+
+@media(max-height:700px){aside{padding-top:16px;padding-bottom:12px}.brand{padding-bottom:16px}.nav{padding-top:9px;padding-bottom:9px}.favorites{margin-top:12px;padding-top:12px}.account-area{padding-top:10px}.capacity-meter{padding-bottom:8px}}
