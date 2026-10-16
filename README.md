@@ -753,3 +753,15 @@ MD/Markdown 提供「原格式 / 渲染格式」切换；渲染格式同时显�
 常用文件夹占用导航和底部空间用量之间的全部剩余高度；标题固定，目录列表独立滚动，容量与头像固定在下方。小窗口压缩侧栏间距，避免账号入口移出可视区域。菜单在头像上方打开，点击外侧或按 Esc 收起，不新增后台请求。
 
 验证：TypeScript 检查和 14 项桌面检查通过，包含真实控件的登录/切换/退出、菜单收起、忙碌状态、暗色菜单，以及 31 个常用文件夹在 1180×780 和 860×600 下滚动且头像固定。实际启动 v0.5.25 沙箱窗口并验证内置后端；ZIP CRC、应用/后端/许可文件哈希核对通过，后端与已有 dist 构建一致。ZIP SHA-256：`ed037c01a724ccd5c089613f34fe2c522b1ccb6a558a56ea6da07ff21a7d164a`。本版完成后暂停，等待手动复测。
+
+
+### Windows 安装包（0.5.25）
+
+可在 Windows x64 电脑上按当前用户安装，无需另装 Python。把下列三个文件一起复制到目标电脑的同一目录，再运行 Setup.exe：
+
+- 安装器：[QuarkDriveClient-0.5.25-Setup.exe](desktop/out/v0.5.25-installer/make/squirrel.windows/x64/QuarkDriveClient-0.5.25-Setup.exe)
+- 安装内容包：[QuarkDriveClient-0.5.25-full.nupkg](desktop/out/v0.5.25-installer/make/squirrel.windows/x64/QuarkDriveClient-0.5.25-full.nupkg)
+- 版本清单：[RELEASES](desktop/out/v0.5.25-installer/make/squirrel.windows/x64/RELEASES)
+- 校验值：[SHA256SUMS.txt](desktop/out/v0.5.25-installer/make/squirrel.windows/x64/SHA256SUMS.txt)
+
+安装器按 Electron Forge 的 Squirrel.Windows 格式生成，需要三个文件放在一起。包内发布者/作者信息使用通用项目名称；打包文件清单中没有 Cookie、任务记录或桌面设置。登录凭证和客户端数据由应用在各自电脑的用户配置目录运行时保存。安装器未使用代码签名证书，Windows 可能显示“未知发布者”提示。首次使用仍需联网登录夸克。

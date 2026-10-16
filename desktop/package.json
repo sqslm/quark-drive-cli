@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@tanstack/react-virtual": "3.14.18",
+    "electron-squirrel-startup": "1.0.1",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "react-markdown": "10.1.0",
@@ -24,6 +25,7 @@
   },
   "devDependencies": {
     "@electron-forge/cli": "8.0.1",
+    "@electron-forge/maker-squirrel": "8.0.1",
     "@electron-forge/maker-zip": "8.0.1",
     "@electron-forge/plugin-webpack": "8.0.1",
     "@playwright/test": "1.64.0",
