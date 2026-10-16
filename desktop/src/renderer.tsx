@@ -11,6 +11,7 @@ import { ImagePreview, ImageThumbnail } from './ImagePreview';
 import { TextPreview, isText } from './TextPreview';
 import { FileDialog, FileAction } from './FileDialog';
 import { TasksPanel } from './TasksPanel';
+import { CapacityMeter } from './CapacityMeter';
 import { CatalogPanel } from './CatalogPanel';
 import { SharingDialog } from './SharingDialog';
 import { FeedbackProvider, useFeedback, Tone } from './Feedback';
@@ -488,7 +489,7 @@ function App() {
       <nav aria-label="主导航">{[['drive','我的文件'],['share','分享链接'],['shares','我的分享'],['recycle','回收站'],['tasks','传输任务'],['settings','设置']].map(([key,label]) =>
         <button key={key} className={page === key ? 'nav active' : 'nav'} aria-current={page === key ? 'page' : undefined} onClick={() => { cancelSearch(); setPage(key); if(key === 'drive' && share) void browse([['0','我的网盘']]); }}><NavigationIcon name={key}/>{label}{key === 'tasks' && tasks.length > 0 && <span>{tasks.length}</span>}</button>)}</nav>
       <section className="favorites" aria-label="常用文件夹"><h2>常用文件夹</h2>{!favorites.length && <p>右键目录可添加</p>}{favorites.map(row => <div key={row.fid}><button title={row.name} disabled={loading || loggingIn} onClick={() => void openFavorite(row.fid)}>{row.name}</button><button aria-label={`移除常用 ${row.name}`} disabled={favoriteBusy || loggingIn} onClick={() => void removeFavorite(row.fid)}>×</button></div>)}</section>
-      <div className="account-area"><button className="account" aria-label="账号操作" aria-expanded={accountMenu} disabled={transferring || loggingIn} onClick={() => setAccountMenu(old => !old)}><span className="avatar">{nickname.slice(0,1)}</span><span className="account-name" title={nickname}>{nickname}<small>{signedIn ? '夸克网盘账号' : '点击登录账号'}</small></span><span>⌃</span></button>
+      <div className="account-area"><CapacityMeter key={accountRevision} enabled={signedIn}/><button className="account" aria-label="账号操作" aria-expanded={accountMenu} disabled={transferring || loggingIn} onClick={() => setAccountMenu(old => !old)}><span className="avatar">{nickname.slice(0,1)}</span><span className="account-name" title={nickname}>{nickname}<small>{signedIn ? '夸克网盘账号' : '点击登录账号'}</small></span><span>⌃</span></button>
         {accountMenu && <div className="account-popup" role="menu" aria-label="账号菜单"><button role="menuitem" onClick={() => {setAccountMenu(false);setLoginPicker(true);}}>{signedIn ? '切换账号' : '登录账号'}</button>{signedIn && <button role="menuitem" title="退出本客户端并移除共享的本地扫码凭证" onClick={() => void exitAccount()}>退出账号</button>}</div>}
       </div>
       <button className="login-button" disabled={transferring || loggingIn} onClick={() => setLoginPicker(true)}>{signedIn ? '切换账号' : '登录账号'}</button>

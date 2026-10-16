@@ -426,6 +426,21 @@ def get_account_nickname(cookie: str, *, transport: httpx.BaseTransport | None =
     return nickname.strip()
 
 
+def get_account_capacity(cookie: str, *, transport: httpx.BaseTransport | None = None,
+                         guard: RequestGuard | None = None) -> dict[str, int]:
+    """Read only the official member endpoint's used and total byte counters."""
+    headers = {**DEFAULT_HEADERS, 'cookie': _validate_cookie(cookie)}
+    with httpx.Client(headers=headers, transport=transport, timeout=10.0, follow_redirects=False) as session:
+        response = _get_without_redirects(session, DRIVE_MEMBER_URL,
+            params={**DEFAULT_PARAMS, 'fetch_subscribe':'true', '_ch':'home', 'fetch_identity':'true'},
+            allowed_host='drive.quark.cn', operation='网盘容量', guard=guard or default_guard(transport,None))
+        data = _json_response(response).get('data')
+    if not isinstance(data, dict) or any(type(data.get(key)) is not int or data[key]<0
+                                        for key in ('use_capacity','total_capacity')):
+        raise RemoteError('夸克未返回有效的空间用量')
+    return {'used_bytes':data['use_capacity'], 'total_bytes':data['total_capacity']}
+
+
 def _cookie_from_jar(session: httpx.Client) -> str:
     selected: dict[str, tuple[int, int, str]] = {}
     for index, cookie in enumerate(session.cookies.jar):

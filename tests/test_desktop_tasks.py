@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from quark_cli.desktop.service import DesktopService
+from quark_cli.desktop.tasks import TIMING_FIELDS, TaskStore
 from quark_cli.downloader.preferences import Preferences, save_preferences
 from quark_cli.transfer import DownloadStopped
 from quark_cli.transfer_progress import ProgressEvent
@@ -77,6 +78,73 @@ class QueueTests(unittest.TestCase):
         while self.service.busy and time.monotonic() < deadline:
             threading.Event().wait(0.01)
         self.assertFalse(self.service.busy)
+
+    def test_record_times_and_cumulative_duration_exclude_waiting_and_pause(self):
+        wall, steady = [1792140000.0], [10.0]
+        with patch('quark_cli.desktop.service.time.time',side_effect=lambda:wall[0]), \
+             patch('quark_cli.desktop.service.time.monotonic',side_effect=lambda:steady[0]):
+            self.queue('dated');self.assertTrue(self.backend.entered.wait(1))
+            self.queue('pending')
+            first, pending = self.service.tasks
+            created=first['created_at']
+            self.assertEqual(first['started_at'],created)
+            self.assertIsNone(pending['started_at'])
+            self.service.dispatch('cancel','tasks.cancel',{'ids':[pending['id']]},None)
+            cancelled_at=pending['finished_at']
+            wall[0]+=90;steady[0]+=4
+            self.assertEqual(self.service.public_task(first)['elapsed_seconds'],4)
+            self.service.dispatch('pause','tasks.pause',{'ids':[first['id']]},None)
+            self.backend.release.set();self.service.transfers.submit(lambda:None).result(timeout=3)
+            self.assertEqual((first['state'],first['elapsed_seconds']),('stopped',4))
+            self.assertEqual(pending['finished_at'],cancelled_at)
+            self.assertIsNone(pending['started_at'])
+            self.assertEqual(pending['elapsed_seconds'],0)
+            wall[0]+=3600;steady[0]+=3600
+            self.backend.entered.clear();self.backend.release.clear()
+            self.service.dispatch('retry','tasks.retry',{'ids':[first['id']]},None)
+            self.assertTrue(self.backend.entered.wait(1))
+            self.assertIsNone(first['finished_at'])
+            self.assertEqual(first['started_at'],created)
+            wall[0]-=120;steady[0]+=6  # Clock adjustment must not corrupt duration.
+            self.backend.release.set();self.service.transfers.submit(lambda:None).result(timeout=3)
+            self.assertEqual((first['state'],first['elapsed_seconds']),('done',10))
+            self.assertEqual(first['finished_at'],int(wall[0]*1000))
+            self.assertEqual(first['created_at'],created)
+        loaded=TaskStore(self.service.task_store.path).load()[0]
+        self.assertEqual({key:loaded[key] for key in TIMING_FIELDS},{key:first[key] for key in TIMING_FIELDS})
+        self.assertNotIn('_run_started',self.service.task_store.path.read_text('utf-8'))
+
+    def test_legacy_records_load_without_inventing_dates_and_migrate_on_save(self):
+        with patch.object(self.service,'start_tasks'):self.queue('legacy')
+        self.service.tasks[0]['state']='done';self.service.persist_tasks()
+        path=self.service.task_store.path
+        document=json.loads(path.read_text('utf-8'))
+        document['version']=1
+        for row in document['tasks']:
+            for key in TIMING_FIELDS:row.pop(key)
+        path.write_text(json.dumps(document),encoding='utf-8')
+        store=TaskStore(path);rows=store.load()
+        self.assertTrue(store.writable)
+        self.assertTrue(all(rows[0][key] is None for key in TIMING_FIELDS))
+        self.assertTrue(store.save(rows))
+        saved=json.loads(path.read_text('utf-8'))
+        self.assertEqual(saved['version'],2)
+        self.assertEqual(saved['tasks'][0]['id'],document['tasks'][0]['id'])
+        self.assertTrue(all(saved['tasks'][0][key] is None for key in TIMING_FIELDS))
+
+    def test_invalid_record_times_preserve_the_original_store(self):
+        with patch.object(self.service,'start_tasks'):self.queue('invalid')
+        self.service.persist_tasks();path=self.service.task_store.path
+        document=json.loads(path.read_text('utf-8'))
+        for value in (-1,True,'yesterday',float('nan'),float('inf')):
+            with self.subTest(value=value):
+                document['tasks'][0]['finished_at']=value
+                original=json.dumps(document);path.write_text(original,encoding='utf-8')
+                store=TaskStore(path)
+                self.assertEqual(store.load(),[])
+                self.assertFalse(store.writable)
+                self.assertFalse(store.save([]))
+                self.assertEqual(path.read_text('utf-8'),original)
 
     def test_clear_ids_removes_only_selected_finished_records_and_persists(self):
         with patch.object(self.service,'start_tasks'):
@@ -157,6 +225,9 @@ class QueueTests(unittest.TestCase):
         reports=[message['data'] for message in self.messages if message.get('event') == 'task' and message['data'].get('progress')]
         self.assertEqual((reports[0]['direction'],reports[0]['progress']['transferred']),('upload',5))
         self.assertEqual((reports[-1]['state'],reports[-1]['progress']['confirmed'],reports[-1]['progress']['total']),('done',10,10))
+        self.assertLessEqual(reports[-1]['created_at'],reports[-1]['started_at'])
+        self.assertLessEqual(reports[-1]['started_at'],reports[-1]['finished_at'])
+        self.assertGreaterEqual(reports[-1]['elapsed_seconds'],0)
 
     def test_append_during_download_remains_sequential_and_durable(self):
         self.queue("a")
@@ -405,6 +476,10 @@ class QueueTests(unittest.TestCase):
         )
         self.addCleanup(other.shutdown)
         self.assertEqual(other.tasks[0]["state"], "stopped")
+        self.assertIsNotNone(other.tasks[0]['created_at'])
+        self.assertIsNotNone(other.tasks[0]['started_at'])
+        self.assertIsNone(other.tasks[0]['finished_at'])
+        self.assertIsNone(other.tasks[0]['elapsed_seconds'])
         self.assertEqual(other.backend.requests, [])
 
     def test_corrupt_record_keeps_session_queue_without_overwriting_original(self):

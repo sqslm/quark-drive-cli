@@ -2,6 +2,7 @@ export type Entry = { fid: string; name: string; directory: boolean; size: numbe
 export type Preferences = { output_dir: string; connections: number; limit_rate: number | null; width: number; height: number };
 export type TaskProgress = {name:string;phase:string;transferred:number;confirmed:number;total:number|null;rate:number;connections:number;recursive:boolean};
 export type Task = { id: string; name: string; state: string; detail: string; target: string; valid: boolean; revision?: number;
+  created_at?:number|null; started_at?:number|null; finished_at?:number|null; elapsed_seconds?:number|null;
   direction?: 'upload' | 'download'; local_dir?: string; needs_authorization?: boolean; share_url?: string; progress?:TaskProgress|null; scheduled?:boolean; pausing?:boolean; removing?:boolean };
 export type Event = { id: string | null; event: string; data: unknown };
 export type Cut = {id:string;entries:Entry[];blocked:boolean;mode:'copy'|'cut'};
@@ -11,7 +12,7 @@ export type Appearance = {source:AppearanceSource;dark:boolean;warning:string};
 export type ClientSettings = {closeBehavior:'tray'|'quit';notifications:boolean};
 export type ClientSettingsResult = {settings:ClientSettings;warning:string};
 export type LocalUploadItem = {path:string;name:string;directory:boolean};
-export const METHODS = ['hello','account','browse','image.read','text.read','text.open','text.save','text.close','locate','search','search.cancel','share.parse','share.open','share.browse',
+export const METHODS = ['hello','account','account.capacity','browse','image.read','text.read','text.open','text.save','text.close','locate','search','search.cancel','share.parse','share.open','share.browse',
   'preferences.save','login','login.cancel','download','download.stop','tasks','tasks.retry',
   'file.info','file.paths','file.mkdir','file.rename','file.move','file.delete','upload','tasks.cancel','tasks.pause','tasks.remove','tasks.clear','tasks.authorize',
   'share.list','share.link','share.create','share.revoke','share.save','recycle.list','recycle.restore','recycle.remove',

@@ -6,6 +6,7 @@ import hashlib
 import json
 import sys
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -28,7 +29,7 @@ from ..downloader.share_input import parse_share_input
 from ..downloader.search import SearchCancelled
 from ..downloader.worker import Download, DriveBackend, Search
 from .file_operations import FileOperations
-from .tasks import TaskStore, Upload
+from .tasks import TIMING_FIELDS, TaskStore, Upload
 from .sharing import Sharing
 from .recycle import Recycle
 from .favorites import Favorites
@@ -371,6 +372,9 @@ class DesktopService:
             except AuthenticationError:
                 return {'nickname':'未登录','logged_in':False}
             return {"nickname": self.backend.account_nickname(),'logged_in':True}
+        if method == 'account.capacity':
+            self.cookie()
+            return self.backend.account_capacity()
         if method == "browse":
             return [asdict(row) for row in self.backend.listing(str(p.get("fid", "0")))]
         if method == 'image.read':
@@ -480,6 +484,7 @@ class DesktopService:
                             operations.available(parent, source.name)
                     tasks.append({"id":uuid.uuid4().hex,"name":source.name,"state":"waiting","detail":"",
                         "target":target + "/" + source.name,"request":request,"valid":True,"revision":0,
+                        "created_at":int(time.time()*1000),"started_at":None,"finished_at":None,"elapsed_seconds":0,
                         "context":context,"direction":"upload","_cancel":threading.Event(),"share_url":""})
             with self.lock:
                 if self.logging_in or self.managing or (self.busy and self.stop.is_set()) or context != self.context():
@@ -497,6 +502,7 @@ class DesktopService:
                         task["_cancel"].set()
                         if task["id"] != self.active_id:
                             task["state"] = "cancelled"
+                            task['finished_at'] = int(time.time()*1000)
                             task["revision"] += 1
                             self.task_event(task)
                 self.persist_tasks()
@@ -508,6 +514,7 @@ class DesktopService:
                         task.setdefault('_pause',threading.Event()).set()
                         if task['id'] != self.active_id:
                             task['state']='stopped';task['revision']+=1
+                            task['finished_at'] = int(time.time()*1000)
                             self.task_event(task)
                 self.persist_tasks()
                 return [self.public_task(task) for task in self.tasks]
@@ -560,6 +567,7 @@ class DesktopService:
                         source, str(p.get("path", "/")), preferences.connections, preferences.limit_rate)
                     tasks.append({"id": uuid.uuid4().hex, "name": entry.name, "state": "waiting", "detail": "",
                         "target": str(plan.target), "request": request, "valid": True, "revision": 0,
+                        "created_at":int(time.time()*1000),"started_at":None,"finished_at":None,"elapsed_seconds":0,
                         "context": self.context(), "direction": "download", "_cancel": threading.Event(),
                         "share_url": f"https://pan.quark.cn/s/{parse_share_url(source.url).pwd_id}" if source else ""})
                 self.tasks.extend(tasks)
@@ -595,6 +603,7 @@ class DesktopService:
             finally:
                 with self.lock:
                     self.managing = False
+                self.event(None,'capacity.changed',None)
 
     def clear_account_context(self):
         self.editor.clear()
@@ -651,6 +660,9 @@ class DesktopService:
     @staticmethod
     def public_task(task):
         output = {key: task[key] for key in ("id", "name", "state", "detail", "target", "valid", "revision", "direction")}
+        output.update({key:task.get(key) for key in TIMING_FIELDS})
+        if output['elapsed_seconds'] is not None and task.get('_run_started') is not None:
+            output['elapsed_seconds'] += max(0,time.monotonic()-task['_run_started'])
         progress = task.get("progress")
         output["progress"] = {**progress, "rate": progress["rate"] if task["state"] == "running" else 0} if progress else None
         output['scheduled']=bool(task.get('_queued'))
@@ -684,6 +696,7 @@ class DesktopService:
         submitted=[]
         for task in tasks:
             task["state"] = "waiting"
+            task['finished_at'] = None
             task.pop("progress", None)
             task["_cancel"].clear()
             task.setdefault('_pause',threading.Event()).clear()
@@ -705,12 +718,17 @@ class DesktopService:
             with self.lock:
                 if task["_cancel"].is_set() or self.stop.is_set() or task['_pause'].is_set():
                     task["state"] = "cancelled" if task["_cancel"].is_set() else "stopped"
+                    if task.get('finished_at') is None:
+                        task['finished_at'] = int(time.time()*1000)
                     task["revision"] += 1
                     self.persist_tasks()
                     self.task_event(task)
                     return
                 self.active_id = task["id"]
                 task["state"] = "running"
+                if task.get('started_at') is None and task.get('created_at') is not None:
+                    task['started_at'] = int(time.time()*1000)
+                task['_run_started'] = time.monotonic()
                 task["revision"] += 1
                 self.persist_tasks()
                 self.task_event(task)
@@ -750,6 +768,10 @@ class DesktopService:
             except Exception as error:
                 task["state"], task["detail"] = "failed", describe_error(error, "传输")
             with self.lock:
+                task['finished_at'] = int(time.time()*1000)
+                run_started = task.pop('_run_started')
+                if task.get('elapsed_seconds') is not None:
+                    task['elapsed_seconds'] += max(0,time.monotonic()-run_started)
                 task["revision"] += 1
                 self.persist_tasks()
                 self.task_event(task)
@@ -784,7 +806,7 @@ class DesktopService:
         self.transfers.shutdown(wait=True)
 
 
-METHODS = frozenset({"hello", "account", "browse", "image.read", "text.read", "text.open", "text.save", "text.close", "search", "search.cancel", "locate", "share.parse",
+METHODS = frozenset({"hello", "account", "account.capacity", "browse", "image.read", "text.read", "text.open", "text.save", "text.close", "search", "search.cancel", "locate", "share.parse",
     "share.open", "share.browse", "preferences.save", "login", "login.cancel", "download", "download.stop", "tasks", "tasks.retry",
     "file.info", "file.paths", "file.mkdir", "file.rename", "file.move", "file.delete",
     "upload", "tasks.cancel", "tasks.pause", "tasks.remove", "tasks.clear", "tasks.authorize",

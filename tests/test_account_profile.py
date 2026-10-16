@@ -7,12 +7,58 @@ from unittest.mock import patch
 
 import httpx
 
-from quark_cli.auth import get_account_nickname
+from quark_cli.auth import get_account_capacity, get_account_nickname
+from quark_cli.desktop.service import DesktopService
+from quark_cli.downloader.worker import DriveBackend
 from quark_cli.downloader.worker import AccountProfile, Browse, Listing, LoadAccountProfile, Worker
-from quark_cli.errors import RemoteError
+from quark_cli.errors import AuthenticationError, RateLimitError, RemoteError
 
 
 class AccountProfileTests(unittest.TestCase):
+    def test_capacity_uses_fixed_official_host_and_returns_only_byte_counters(self):
+        requests=[]
+        def handle(request):
+            requests.append(request)
+            return httpx.Response(200,json={'data':{'use_capacity':123,'total_capacity':1000,'token':'private'}})
+        result=get_account_capacity('sid=offline',transport=httpx.MockTransport(handle))
+        self.assertEqual(result,{'used_bytes':123,'total_bytes':1000})
+        self.assertEqual(len(requests),1)
+        self.assertEqual(requests[0].url.host,'drive.quark.cn')
+        self.assertEqual(requests[0].url.path,'/1/clouddrive/member')
+        self.assertEqual(requests[0].url.params['fetch_identity'],'true')
+        self.assertNotIn('private',str(result))
+
+    def test_capacity_requires_real_counts_without_replacing_missing_values_with_zero(self):
+        for value in (None,True,-1,'100',0.5):
+            with self.subTest(value=value),self.assertRaises(RemoteError):
+                get_account_capacity('sid=offline',transport=httpx.MockTransport(lambda _:httpx.Response(200,json={'data':{'use_capacity':value,'total_capacity':100}})))
+        for used,total in ((0,0),(200,100)):
+            result=get_account_capacity('sid=offline',transport=httpx.MockTransport(lambda _:httpx.Response(200,json={'data':{'use_capacity':used,'total_capacity':total}})))
+            self.assertEqual(result,{'used_bytes':used,'total_bytes':total})
+
+    def test_capacity_rejects_redirects_and_preserves_cooldown(self):
+        requests=[]
+        def redirect(request):
+            requests.append(request)
+            return httpx.Response(302,headers={'location':'https://evil.invalid/member'})
+        with self.assertRaises(RemoteError):get_account_capacity('sid=offline',transport=httpx.MockTransport(redirect))
+        self.assertEqual(len(requests),1)
+        with self.assertRaises(RateLimitError):
+            get_account_capacity('sid=offline',transport=httpx.MockTransport(lambda _:httpx.Response(429,headers={'retry-after':'5'})))
+
+    def test_capacity_ipc_login_gate_and_mutation_refresh_event(self):
+        backend=DriveBackend(lambda:'sid=offline',transport=httpx.MockTransport(lambda _:httpx.Response(200,json={'data':{'use_capacity':1,'total_capacity':10}})))
+        messages=[]
+        with tempfile.TemporaryDirectory() as directory:
+            service=DesktopService(messages.append,backend=backend,directory=directory);service.saved_cookie='sid=offline'
+            try:
+                self.assertEqual(service.dispatch('cap','account.capacity',{},None),{'used_bytes':1,'total_bytes':10})
+                with service.mutation():pass
+                self.assertEqual(messages[-1]['event'],'capacity.changed')
+                service.logged_out=True
+                with self.assertRaises(AuthenticationError):service.dispatch('cap','account.capacity',{},None)
+            finally:service.shutdown()
+
     def test_fixed_account_host_returns_only_the_nickname_and_saves_no_credentials(self):
         requests = []
 

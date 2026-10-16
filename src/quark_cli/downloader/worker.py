@@ -28,7 +28,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from ..auth import get_account_nickname
+from ..auth import get_account_capacity, get_account_nickname
 from ..client import QuarkClient, default_guard
 from ..errors import RemoteError, UsageError
 from ..files import Files
@@ -257,6 +257,9 @@ class DriveBackend:
 
     def account_nickname(self) -> str:
         return get_account_nickname(self._cookie(), transport=self._transport, guard=self._guard)
+
+    def account_capacity(self) -> dict[str, int]:
+        return get_account_capacity(self._cookie(),transport=self._transport,guard=self._operation_guard)
 
     def verify_login(self, cookie: str) -> str:
         with QuarkClient(cookie, transport=self._transport, guard=self._guard,

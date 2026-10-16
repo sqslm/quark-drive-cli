@@ -47,8 +47,14 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.23',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.24',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
+          if(method === 'account.capacity') {
+            const data={...(window.testCapacity || {used_bytes:50*1073741824,total_bytes:100*1073741824})};
+            if(window.testHoldCapacity) await new Promise(resolve => {window.capacityReleases ||= [];window.capacityReleases.push(resolve);});
+            if(window.testCapacityFailure) throw new Error('capacity unavailable');
+            return data;
+          }
           if(method === 'logout') {loggedIn=false;cut=null;tasks=tasks.map(row => ({...row,valid:false}));return {logged_in:false,nickname:'未登录'};}
           if(method === 'favorites.list') return favorites.map(row => ({...row}));
           if(method === 'favorites.add') {const [fid,name]=params.trail.at(-1);favorites=[...favorites.filter(row => row.fid !== fid),{fid,name}];return favorites;}
@@ -125,6 +131,28 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
       const data=await dragData(names);await page.locator('.file-list').dispatchEvent('drop',{dataTransfer:data});await data.dispose();
     }
     await page.getByText('显示 10000 项', { exact: true }).waitFor();
+    const capacity=page.getByRole('region',{name:'网盘空间',exact:true});
+    await capacity.getByText('50.0%',{exact:true}).waitFor();
+    assert.equal(await capacity.getByRole('progressbar').getAttribute('aria-valuenow'),'50');
+    await page.evaluate(() => {window.testCapacityFailure=true;});await capacity.getByRole('button',{name:'刷新网盘空间'}).click();
+    await capacity.getByText('更新失败，显示上次用量',{exact:true}).waitFor();
+    await capacity.getByText('50.0%',{exact:true}).waitFor();
+    await page.evaluate(() => {window.testCapacityFailure=false;window.testCapacity={used_bytes:125*1073741824,total_bytes:100*1073741824};});
+    await capacity.getByRole('button',{name:'刷新网盘空间'}).click();await capacity.getByText('125.0%',{exact:true}).waitFor();
+    assert.equal(await capacity.getByRole('progressbar').getAttribute('aria-valuenow'),'100');
+    await capacity.getByText('已超过当前容量',{exact:true}).waitFor();
+    await page.evaluate(() => {window.testCapacity={used_bytes:0,total_bytes:0};});await capacity.getByRole('button',{name:'刷新网盘空间'}).click();
+    await capacity.getByText('总容量为零，占比未知',{exact:true}).waitFor();
+    assert.equal(await capacity.getByRole('progressbar').getAttribute('aria-valuenow'),null);
+    await page.evaluate(() => {window.testHoldCapacity=true;window.testCapacity={used_bytes:1099511627776,total_bytes:2199023255552};});
+    const capacityBefore=await page.evaluate(() => window.testCalls.filter(call => call.method==='account.capacity').length);
+    await capacity.getByRole('button',{name:'刷新网盘空间'}).click();await page.waitForFunction(() => window.capacityReleases?.length===1);
+    await page.evaluate(() => {for(let i=0;i<8;i++) window.testEmit({event:'capacity.changed',data:null});});
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method==='account.capacity').length),capacityBefore+1);
+    await page.evaluate(() => {window.testHoldCapacity=false;window.capacityReleases.shift()();});
+    await capacity.getByText('1.00 TB / 2.00 TB',{exact:true}).waitFor();
+    await page.waitForFunction(() => !document.querySelector('[aria-label="刷新网盘空间"]').disabled);
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method==='account.capacity').length),capacityBefore+2);
     assert.ok(await page.locator('.file-row').count() < 60);
     const listBefore=await page.locator('.file-scroll').evaluate(element => ({height:element.scrollHeight,rowY:element.querySelector('.file-row').getBoundingClientRect().y}));
     await page.evaluate(() => {window.testHoldBrowse=true;});
@@ -645,13 +673,13 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.evaluate(() => window.testSetTasks([
       {id:'df',name:'下载失败.txt',direction:'download',state:'failed'},
       {id:'ds',name:'下载暂停.txt',direction:'download',state:'stopped'},
-      {id:'dd',name:'下载成功.txt',direction:'download',state:'done'},
+      {id:'dd',name:'下载成功.txt',direction:'download',state:'done',created_at:Date.UTC(2025,11,31,15,50),started_at:Date.UTC(2025,11,31,15,58),finished_at:Date.UTC(2025,11,31,16,2),elapsed_seconds:121},
       {id:'dc',name:'下载取消.txt',direction:'download',state:'cancelled'},
       {id:'legacy',name:'旧账号下载.txt',state:'failed',valid:false},
       {id:'uw',name:'上传等待.txt',direction:'upload',state:'waiting'},
       {id:'uf',name:'上传失败.txt',direction:'upload',state:'failed'},
       {id:'us',name:'上传暂停.txt',direction:'upload',state:'stopped'},
-      {id:'ud',name:'上传成功.txt',direction:'upload',state:'done'},
+      {id:'ud',name:'上传成功.txt',direction:'upload',state:'done',target:'/资料/上传成功.txt',created_at:Date.UTC(2026,9,16,6,10),started_at:Date.UTC(2026,9,16,6,12),finished_at:Date.UTC(2026,9,16,7,42),elapsed_seconds:3661},
       {id:'uc',name:'上传取消.txt',direction:'upload',state:'cancelled'},
     ].map(task => ({valid:true,revision:1,detail:'',target:'C:/Downloads/'+task.name,...task}))));
     await page.getByRole('button',{name:/^传输任务/}).click();
@@ -665,6 +693,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await page.getByText('下载成功.txt',{exact:true}).count(),0);
     assert.equal(await page.locator('.task-row').first().locator('.task-controls button').count(),3);
     assert.ok(await page.locator('.task-row').filter({hasText:'旧账号下载.txt'}).getByRole('button',{name:'开始',exact:true}).isDisabled());
+    await page.locator('.task-row').filter({hasText:'旧账号下载.txt'}).getByText('失败时间：未记录',{exact:true}).waitFor();
     await page.getByRole('button',{name:'开始全部',exact:true}).click();
     assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.retry').at(-1).params.ids),['df','ds','uw','uf','us']);
     await page.getByRole('button',{name:'暂停全部',exact:true}).click();
@@ -677,15 +706,22 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await page.getByText('上传等待.txt',{exact:true}).count(),0);
     await completion.getByRole('button',{name:/^已完成/}).click();
     assert.equal(await page.locator('.task-row').count(),2);
+    const uploadedRecord=page.locator('.task-row').filter({hasText:'上传成功.txt'});
+    await uploadedRecord.getByText('完成时间：2026-10-16 15:42',{exact:true}).waitFor();
+    await uploadedRecord.getByText('累计耗时：1 小时 1 分 1 秒',{exact:true}).waitFor();
+    await uploadedRecord.getByText('上传到：/资料/上传成功.txt',{exact:true}).waitFor();
+    assert.match(await uploadedRecord.locator('.task-record-line').getAttribute('title'),/加入：2026-10-16 14:10\n首次开始：2026-10-16 14:12/);
     await page.locator('.task-row').filter({hasText:'上传成功.txt'}).getByRole('button',{name:'打开文件夹',exact:true}).click();
     await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-groups-light.png')});
     await page.evaluate(() => window.quark.setAppearance('dark'));
     await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-groups-dark.png')});
     await page.setViewportSize({width:860,height:600});
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true);
+    assert.equal(await uploadedRecord.evaluate(row => row.querySelector('.task-record-target').getBoundingClientRect().bottom <= row.getBoundingClientRect().bottom),true);
     await page.setViewportSize({width:1180,height:780});
     await directions.getByRole('button',{name:/^下载/}).click();
     await page.getByText('下载成功.txt',{exact:true}).waitFor();
+    await page.locator('.task-row').filter({hasText:'下载成功.txt'}).getByText('完成时间：2026-01-01 00:02',{exact:true}).waitFor();
     await page.getByRole('button',{name:'清理已完成记录',exact:true}).click();
     assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.clear').at(-1).params.ids),['dd']);
     await page.getByText('暂无已完成的下载任务',{exact:true}).waitFor();
@@ -747,6 +783,9 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true);
     const phaseFits=await activeProgress.evaluate(row => row.querySelector('.progress-phase').getBoundingClientRect().bottom <= row.getBoundingClientRect().bottom);
     assert.equal(phaseFits,true);
+    const recordBounds=await activeProgress.evaluate(row => ({row:row.getBoundingClientRect().toJSON(),target:row.querySelector('.task-record-target').getBoundingClientRect().toJSON()}));
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-progress-narrow.png')});
+    assert.ok(recordBounds.target.bottom<=recordBounds.row.bottom,JSON.stringify(recordBounds));
     await page.setViewportSize({width:1180,height:780});
     await page.evaluate(() => {const task=window.testGetTasks().find(task => task.id === 'pd');window.testEmit({id:null,event:'task',data:{...task,state:'stopped',revision:2}});});
     await activeProgress.locator('.task-state').getByText('已暂停',{exact:true}).waitFor();
@@ -803,13 +842,22 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.locator('.account-name[title="测试账号"]').waitFor();
     await page.locator('.toast').getByText('登录已取消，原账号保持不变',{exact:true}).waitFor();
     await page.evaluate(() => {window.testWebCancel=false;});
+    await page.evaluate(() => {window.testHoldCapacity=true;window.testCapacity={used_bytes:99,total_bytes:100};});
+    await capacity.getByRole('button',{name:'刷新网盘空间'}).click();await page.waitForFunction(() => window.capacityReleases.length===1);
+    await page.evaluate(() => {window.testCapacity={used_bytes:20,total_bytes:100};});
     await page.getByRole('button',{name:'切换账号',exact:true}).click();
     await page.getByRole('button',{name:'微信登录',exact:true}).click();
     await page.locator('.account-name[title="新账号"]').waitFor();
+    await page.waitForFunction(() => window.capacityReleases.length===2);
+    await page.evaluate(() => {window.testHoldCapacity=false;window.capacityReleases.shift()();});
+    assert.equal(await capacity.getByRole('progressbar').count(),0,'old account response must not populate the new account');
+    await page.evaluate(() => window.capacityReleases.shift()());await capacity.getByText('20.0%',{exact:true}).waitFor();
     assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method==='officialLogin').map(row => row.params.mode)),['mobile','wechat']);
     await page.getByRole('button',{name:'账号操作',exact:true}).click();
     await page.getByRole('menuitem',{name:'退出账号',exact:true}).click();
     await page.getByText('登录后浏览和管理网盘文件',{exact:true}).waitFor();
+    await capacity.getByText('登录后查看用量',{exact:true}).waitFor();
+    assert.equal(await capacity.getByRole('progressbar').count(),0);
     assert.equal(await page.locator('.file-row').count(),0);
     assert.ok(await page.getByRole('button',{name:'新建目录',exact:true}).isDisabled());
     const beforeSignedOutDrop=await page.evaluate(() => window.testDropReads || 0);
@@ -842,6 +890,7 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     assert.deepEqual(await page.evaluate(() => window.quark.call('tasks.remove',{ids:[]})),[]);
     await assert.rejects(page.evaluate(() => window.quark.call('text.read',{entry:{fid:'text',name:'test.txt',directory:false,size:4,path:'',location:[],modified_at:null}})),/QUARK_COOKIE|Cookie|登录/);
     await assert.rejects(page.evaluate(() => window.quark.call('text.open',{entry:{fid:'text',name:'test.txt',directory:false,size:4,path:'',location:[],modified_at:null}})),/QUARK_COOKIE|Cookie|登录/);
+    await assert.rejects(page.evaluate(() => window.quark.call('account.capacity')),/QUARK_COOKIE|Cookie|登录/);
     await assert.rejects(page.evaluate(() => window.quark.call('text.save',{editor:'test',version:'v1',text:'hello'})),/QUARK_COOKIE|Cookie|登录/);
     await assert.rejects(page.evaluate(() => window.quark.setEditorDirty('invalid')),/编辑状态/);
     await page.evaluate(() => window.quark.setEditorDirty(false));
@@ -1028,6 +1077,34 @@ test('packaged Markdown loads lazy assets and saves through the real isolated pr
     await page.keyboard.press('Escape');await editor.waitFor({state:'detached'});
     await page.getByRole('button',{name:'README.md',exact:true}).waitFor();
   } finally {if(page) await page.evaluate(() => window.quark.setEditorDirty(false)).catch(() => {});await app.close();await rm(directory,{recursive:true,force:true});}
+});
+
+test('bundled backend restores transfer dates and shows unknown legacy times without inventing them',async () => {
+  const directory=await mkdtemp(path.join(tmpdir(),'quark-task-dates-'));
+  const executable=path.resolve(__dirname,'..',process.env.QUARK_DESKTOP_OUT || 'out','Quark Drive Client-win32-x64/QuarkDriveClient.exe');
+  const timing={created_at:Date.UTC(2026,9,16,6,10),started_at:Date.UTC(2026,9,16,6,12),finished_at:Date.UTC(2026,9,16,7,42),elapsed_seconds:90};
+  const old={id:'legacy',name:'旧记录.txt',state:'done',detail:'已下载',target:'C:\\Downloads\\旧记录.txt',revision:1,context:'other',direction:'download',request:{fid:'old',target:'C:\\Downloads\\旧记录.txt',recursive:false,overwrite:false,name:'旧记录.txt'},share_url:'',created_at:null,started_at:null,finished_at:null,elapsed_seconds:null};
+  const uploaded={...old,id:'dated',name:'有日期.txt',detail:'已上传',direction:'upload',target:'/资料/有日期.txt',request:{source:'C:\\Uploads\\有日期.txt',parent:'0',recursive:false,name:'有日期.txt',limit_rate:null},...timing};
+  await mkdir(path.join(directory,'downloader'));
+  await writeFile(path.join(directory,'downloader/tasks.json'),JSON.stringify({version:2,tasks:[old,uploaded]}),'utf8');
+  const app=await _electron.launch({executablePath:executable,args:['--user-data-dir='+path.join(directory,'electron')],env:{...process.env,QUARK_CONFIG_DIR:directory,QUARK_COOKIE:'',QUARK_COOKIE_FILE:'',QUARK_DESKTOP_PYTHON:'Z:\\no-python.exe'}});
+  try {
+    const page=await app.firstWindow();await page.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
+    const records=await page.evaluate(() => window.quark.call('tasks'));
+    for(const key of Object.keys(timing)) assert.equal(records[1][key],timing[key]);
+    assert.equal(records[0].finished_at,null);
+    const session=await page.context().newCDPSession(page);await session.send('Emulation.setTimezoneOverride',{timezoneId:'Asia/Singapore'});
+    await page.getByRole('button',{name:/^传输任务/}).click();
+    await page.getByText('完成时间：2026-10-16 15:42',{exact:true}).waitFor();
+    await page.getByText('累计耗时：1 分 30 秒',{exact:true}).waitFor();
+    await page.getByText('上传到：/资料/有日期.txt',{exact:true}).waitFor();
+    await page.evaluate(() => window.quark.setAppearance('dark'));
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/task-dates-packaged.png')});
+    await page.getByRole('group',{name:'传输方向'}).getByRole('button',{name:/^下载/}).click();
+    await page.getByText('完成时间：未记录',{exact:true}).waitFor();
+    await page.getByText('累计耗时：未记录',{exact:true}).waitFor();
+    await session.detach();
+  } finally {await app.close();await rm(directory,{recursive:true,force:true});}
 });
 
 test('native file drops on rows and empty space upload into the directory currently displayed', async () => {

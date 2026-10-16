@@ -1,5 +1,6 @@
 """Private task records; transfer checkpoints remain owned by the transfer engine."""
 
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -7,6 +8,8 @@ from ..errors import LocalIOError
 from ..state import read_json, write_json
 from ..shares import parse_share_url
 from ..downloader.worker import Download
+
+TIMING_FIELDS = ('created_at', 'started_at', 'finished_at', 'elapsed_seconds')
 
 
 @dataclass(frozen=True)
@@ -30,7 +33,7 @@ class TaskStore:
             if (
                 set(document) != {"version", "tasks"}
                 or type(document["version"]) is not int
-                or document["version"] != 1
+                or document["version"] not in (1, 2)
                 or not isinstance(document["tasks"], list)
             ):
                 raise LocalIOError("任务记录格式或版本无效")
@@ -47,6 +50,8 @@ class TaskStore:
                 "request",
                 "share_url",
             }
+            if document['version'] == 2:
+                fields.update(TIMING_FIELDS)
             for record in document["tasks"]:
                 if (
                     not isinstance(record, dict)
@@ -98,11 +103,19 @@ class TaskStore:
                     raise LocalIOError("任务方向无效")
                 if request.name != record["name"]:
                     raise LocalIOError("任务名称与请求不一致")
+                timing = {key:record.get(key) for key in TIMING_FIELDS}
+                if any(value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0)
+                       for value in timing.values()):
+                    raise LocalIOError('任务时间字段无效')
+                if record['state'] == 'running':
+                    # A process interruption has no reliable end or active duration.
+                    timing['finished_at'] = timing['elapsed_seconds'] = None
                 if record["share_url"]:
                     parse_share_url(record["share_url"])
                 rows.append(
                     {
                         **record,
+                        **timing,
                         "request": request,
                         "state": "stopped"
                         if record["state"] == "running"
@@ -138,12 +151,13 @@ class TaskStore:
                 )
             }
             request = asdict(task["request"])
+            record.update({key:task.get(key) for key in TIMING_FIELDS})
             # No passcode, share token or URL query is serialized from ShareSource.
             request.pop("share_source", None)
             record["request"] = request
             records.append(record)
         try:
-            write_json(self.path, {"version": 1, "tasks": records})
+            write_json(self.path, {"version": 2, "tasks": records})
             return True
         except LocalIOError:
             self.writable = False

@@ -12,6 +12,32 @@ function remainingTime(seconds:number) {
   if(value >= 60) return `约 ${Math.floor(value/60)} 分 ${value%60} 秒`;
   return `约 ${value} 秒`;
 }
+function recordDate(value:number|null|undefined) {
+  if(value == null || !Number.isFinite(value) || value < 0) return '未记录';
+  const date=new Date(value);
+  if(!Number.isFinite(date.getTime())) return '未记录';
+  const pad=(n:number) => String(n).padStart(2,'0');
+  return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+function elapsedTime(value:number|null|undefined) {
+  if(value == null || !Number.isFinite(value) || value < 0) return '未记录';
+  const seconds=Math.floor(value);
+  if(seconds===0) return value>0 ? '不足 1 秒' : '0 秒';
+  const parts=[];
+  if(seconds>=3600) parts.push(`${Math.floor(seconds/3600)} 小时`);
+  if(seconds%3600>=60) parts.push(`${Math.floor(seconds%3600/60)} 分`);
+  if(seconds%60) parts.push(`${seconds%60} 秒`);
+  return parts.join(' ');
+}
+function TaskRecordInfo({task}:{task:Task}) {
+  const label=task.state === 'done' ? '完成' : task.state === 'failed' ? '失败' : task.state === 'stopped' ? '暂停' : task.state === 'cancelled' ? '取消' : task.state === 'running' ? '开始' : '加入';
+  const value=task.state === 'running' ? task.started_at : task.state === 'waiting' ? task.created_at : task.finished_at;
+  const detail=`加入：${recordDate(task.created_at)}\n首次开始：${recordDate(task.started_at)}\n本次结束：${recordDate(task.finished_at)}\n累计耗时不含排队和暂停；时间按本机时区显示`;
+  return <div className="task-record-info" aria-label="传输记录信息">
+    <div className="task-record-line" title={detail}><span>{label}时间：{recordDate(value)}</span><span>累计耗时：{elapsedTime(task.elapsed_seconds)}</span></div>
+    <p className="task-record-target" title={task.target}>{task.direction === 'upload' ? '上传到' : '下载到'}：{task.target}</p>
+  </div>;
+}
 function TransferProgress({task}:{task:Task}) {
   const progress=task.progress;
   if(!progress) return <p title={task.target}>{task.pausing || task.removing ? '正在安全停止…' : task.state === 'running' ? '正在准备传输…' : task.state === 'waiting' ? '等待进入传输队列' : task.detail || task.target}</p>;
@@ -65,7 +91,7 @@ export function TasksPanel({ tasks,busy,onTasks,onStart,onEnd,onStatus }: {
   const visible=useMemo(() => tasks.filter(task => (task.direction === 'upload' ? 'upload' : 'download') === direction && (task.state === 'done') === completed),[tasks,direction,completed]);
   const completedInDirection=useMemo(() => tasks.filter(task => (task.direction === 'upload' ? 'upload' : 'download') === direction && task.state === 'done'),[tasks,direction]);
   const scroll = useRef<HTMLDivElement>(null);
-  const virtual = useVirtualizer({ count:visible.length,getScrollElement:() => scroll.current,estimateSize:() => 142,overscan:6 });
+  const virtual = useVirtualizer({ count:visible.length,getScrollElement:() => scroll.current,estimateSize:() => 192,overscan:6 });
   function selectDirection(next:'download'|'upload') {setDirection(next);if(scroll.current) scroll.current.scrollTop=0;}
   function selectCompleted(next:boolean) {setCompleted(next);if(scroll.current) scroll.current.scrollTop=0;}
   const eligible = (task:Task) => task.valid && !task.pausing && !task.removing && ['failed','stopped','waiting'].includes(task.state) && !(task.state === 'waiting' && task.scheduled);
@@ -98,7 +124,7 @@ export function TasksPanel({ tasks,busy,onTasks,onStart,onEnd,onStatus }: {
       <button disabled={commandBusy || busy || !completedInDirection.length} onClick={() => void command(async () => {onTasks(await window.quark.call('tasks.clear',{ids:completedInDirection.map(task => task.id)}));onStatus(`已清理${direction === 'upload' ? '上传' : '下载'}已完成记录`,'success');})}>清理已完成记录</button></div>
     <div className="task-list" ref={scroll}>{!visible.length && <div className="empty">{!tasks.length ? '尚无传输任务，请在文件页下载或上传' : `暂无${completed ? '已完成' : '未完成'}的${direction === 'upload' ? '上传' : '下载'}任务`}</div>}
       <div style={{height:virtual.getTotalSize(),position:'relative'}}>{virtual.getVirtualItems().map(item => { const task = visible[item.index]; return <div className="task-row virtual-task" key={task.id} style={{transform:`translateY(${item.start}px)`}}>
-        <span className="task-direction">{task.direction === 'upload' ? '上传' : '下载'}</span><div><strong title={task.name}>{task.name}</strong><TransferProgress task={task}/></div><span className={'task-state ' + task.state}>{states[task.state] || task.state}</span>
+        <span className="task-direction">{task.direction === 'upload' ? '上传' : '下载'}</span><div><strong title={task.name}>{task.name}</strong><TransferProgress task={task}/><TaskRecordInfo task={task}/></div><span className={'task-state ' + task.state}>{states[task.state] || task.state}</span>
         <div className="task-controls">
           <button className="task-icon-button" title={task.needs_authorization ? '重新授权并开始' : task.pausing ? '正在暂停' : task.state === 'running' || (task.state === 'waiting' && task.scheduled) ? '暂停' : '开始'} aria-label={task.needs_authorization ? '重新授权并开始' : task.pausing ? '正在暂停' : task.state === 'running' || (task.state === 'waiting' && task.scheduled) ? '暂停' : '开始'} disabled={commandBusy || task.pausing || task.removing || (!eligible(task) && !task.needs_authorization && task.state !== 'running' && !(task.state === 'waiting' && task.scheduled))} onClick={() => {
             if(task.needs_authorization) {setCode('');setAuthorization(task);}
