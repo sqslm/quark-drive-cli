@@ -28,6 +28,7 @@ from potplayer_fixture import (
     SEGMENT_LIMIT,
     VIDEO_BYTES,
     DriveFixture,
+    consuming_clock,
     record,
     virtual_slice,
 )
@@ -36,12 +37,21 @@ from potplayer_fixture import (
 class _ServerCase(unittest.TestCase):
     """Starts one bridge instance on an ephemeral port and tears it down."""
 
+    simulate_buffer_consumption = True
+
     def setUp(self):
         self.directory = Path(tempfile.mkdtemp(prefix="quark-potplayer-"))
         self.previous_config = os.environ.get("QUARK_CONFIG_DIR")
         os.environ["QUARK_CONFIG_DIR"] = str(self.directory)
         self.fixture = DriveFixture()
         self.service = Service(**self.service_kwargs())
+        if self.simulate_buffer_consumption:
+            # Protocol tests consume responses immediately, without a native
+            # player. Simulate that consumption explicitly. Buffering tests
+            # disable this and drive the real monitor's clock themselves.
+            consuming = mock.patch.object(self.service.monitor, 'buffer_state', side_effect=consuming_clock(self.service))
+            consuming.start()
+            self.addCleanup(consuming.stop)
         self.server = self.service.build_server()
         self.thread = threading.Thread(
             target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
@@ -540,9 +550,9 @@ class FakeLogin:
         auth.save_cookie(COOKIE, plugin_state.plugin_directory() / "login-cookie")
 
 
-# Four full 4 MiB segments plus a short tail: enough to force several
-# requests without moving a real 16 MiB object through memory.
-VIRTUAL_SIZE = 4 * SEGMENT_LIMIT + 1000
+# Five full 4 MiB segments plus a short tail; the 20% budget permits a full
+# segment. The generated body does not allocate the whole video in memory.
+VIRTUAL_SIZE = 5 * SEGMENT_LIMIT + 1000
 
 
 class SegmentCase(_ServerCase):

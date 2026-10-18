@@ -16,6 +16,28 @@ _PATTERN = bytes(range(256)) * 16
 SEGMENT_LIMIT = 4 * 1024 * 1024
 
 
+def consuming_clock(service):
+    """Protocol clients consume bytes immediately; native monitor stays real.
+
+    Buffer policy tests instead drive real monitor samples and never use this
+    stand-in. It changes only the proxy's read-ahead view, not saved progress.
+    """
+    actual_state = service.monitor.buffer_state
+
+    def state(session_id):
+        current = actual_state(session_id)
+        if current is not None and current['state'] == 'stopped':
+            return current
+        media = service.sessions.get(session_id)
+        if media is None:
+            return None
+        with media.buffer_budget.lock:
+            head = max([media.buffer_budget.head, *(end for _, end in media.buffer_budget.ranges)])
+        return {'state': 'playing', 'position_ms': head, 'duration_ms': media.size}
+
+    return state
+
+
 def virtual_slice(start: int, length: int) -> bytes:
     """The virtual object's bytes at ``[start, start + length)`` without materializing it."""
     if length <= 0:

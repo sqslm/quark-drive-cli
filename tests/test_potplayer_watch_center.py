@@ -343,16 +343,16 @@ class RecentRemoveCase(_Case):
 
     def test_a_new_explicit_play_records_again(self):
         url = self.play("v2")
-        self.assertEqual(self.client.get(self.base + url).status_code, 200)
+        self.assertEqual(self.client.get(self.base + url, headers={"Range": "bytes=0-9"}).status_code, 206)
         self.assertEqual(self.api("POST", "/v1/recent/remove", body={"fid": "v2"}).status_code, 200)
         fresh = self.play("v2")
         self.assertNotEqual(fresh, url)
-        self.assertEqual(self.client.get(self.base + fresh).status_code, 200)
+        self.assertEqual(self.client.get(self.base + fresh, headers={"Range": "bytes=0-9"}).status_code, 206)
         self.assertEqual([row["fid"] for row in self.api("GET", "/v1/recent").json()["items"]], ["v2"])
 
     def test_unrelated_stream_keeps_recording_after_a_remove(self):
         url = self.play("v9")
-        self.assertEqual(self.client.get(self.base + url).status_code, 200)
+        self.assertEqual(self.client.get(self.base + url, headers={"Range": "bytes=0-9"}).status_code, 206)
         self.assertEqual(self.api("POST", "/v1/recent/remove", body={"fid": "v2"}).status_code, 200)
         self.assertEqual([row["fid"] for row in self.api("GET", "/v1/recent").json()["items"]], ["v9"])
 

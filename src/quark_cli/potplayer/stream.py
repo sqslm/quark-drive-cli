@@ -95,6 +95,7 @@ class PlaySession:
     parent_name: str = ''
     context: dict[str, str] = field(default_factory=dict)
     buffer_budget: BufferBudget = field(default_factory=BufferBudget)
+    account_id: str = ''
 
 
 @dataclass(frozen=True)

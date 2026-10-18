@@ -265,8 +265,8 @@
 - 播放期间组件按绑定核对当前播放器进度，并把位置写入 `library.json` 中该最近观看条目的进度字段（`position_ms`、`duration_ms`、`progress_at`）。显式标记为已看的视频既不续播也不再写入真实进度，直到标记被清除。`/v1/recent`、`/v1/continue`、`/v1/series` 会把这些字段转为只读视图；其中 `progress_at` 只在 `/v1/series` 的 `latest`/`next` 单集视图里出现（用于分组页排序与判断），`/v1/recent`、`/v1/continue` 与 `/v1/watch-center` 都不暴露它。
 - 读取频率约每 2 秒一次，落盘约每 10 秒一次，并在暂停、切换集数与关闭时各写一次。保存位置不足 15 秒时不续播；剩余时长不足 `min(30 秒, 时长 2%)` 时不回跳（从 0 开始）也不计为已看完；保存时的文件大小或时长与当前明显不符时不套用旧进度。
 - 首次读到播放器位置已超过约 5 秒（例如用户手动拖过）时，尊重播放器当前位置，组件**不**把它强行拉回保存点。
-- 绑定标识为播放器窗口进程 PID 与完整逻辑 fid 地址（`https://quark.invalid/{video,play}/<fid>`）；不使用文件名、窗口标题或下载字节比例推断归属。同一 fid 被多个实例同时打开时暂停该 fid 的进度写入，实例减少后恢复。
-- 续播依赖 Windows 原生进程读取能力；缺少该能力时组件仍可作为数据源正常播放，只是不记录/恢复进度。此限制只影响本机进度功能，不影响其它平台上的 CLI。
+- 绑定标识为播放器窗口进程 PID 与完整逻辑 fid 地址（`https://quark.invalid/{video,play}/<fid>`）；带 `?account=<account_id>` 时必须与创建该播放会话的账号完全一致，精彩标记地址同样校验账号。不使用文件名、窗口标题或下载字节比例推断归属。同一 fid 被多个实例同时打开时暂停该 fid 的进度写入，实例减少后恢复。
+- 续播和缓存消费量估算依赖 Windows 原生进程读取能力；缺少该能力时不记录/恢复进度，先按网络原速提供最多 20% 数据，之后等待可信播放进度，避免无上限预下载。此限制不影响其它平台上的 CLI。
 
 ### `GET /v1/diagnostics`
 
@@ -283,7 +283,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.12.1", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.12.2", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -388,7 +388,7 @@
 - 冷却期间的列表/数据/登录接口返回 `429 rate_limited` 或 `403 access_restricted` 并带 `Retry-After`；`/v1/health`、`/v1/favorites`、`/v1/recent`、`/v1/continue`、`/v1/auth/logout` 等本地接口仍可用。
 - 冷却错误**不会**清除插件凭证、不会打开扫码登录、不会清空收藏/最近记录；`401` 凭证失效的语义不变。
 - 若冷却状态无法写入本机，服务会以 `500 local_io_error` 停止后续自动请求；另一个进程或重启无法得知未写入的冷却，需先修复本机存储并用官方夸克客户端确认账号。
-- 此节奏不改变 4 MiB 串行分段、64 KiB 转发或内嵌字幕/音轨的原生处理，预缓冲另依据播放时钟限制前取，未知时钟采用保守字节预算。以上数值是本工具的保守默认值，不代表夸克官方安全阈值，不能保证账号不被限制。`Retry-After` 定义见 [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#field.retry-after)（`429` 源自 RFC 6585 §4）。
+- 此节奏不改变 4 MiB 串行分段、64 KiB 转发或内嵌字幕/音轨的原生处理，预缓冲按总大小 20% 暂停、剩余 10% 恢复；媒体字节不设下载速率上限，未知时钟也不按时间补充预算。以上数值是本工具的保守默认值，不代表夸克官方安全阈值，不能保证账号不被限制。`Retry-After` 定义见 [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#field.retry-after)（`429` 源自 RFC 6585 §4）。
 
 ## 错误格式
 
@@ -431,5 +431,5 @@
 - `GET /v1/files` 增加 `up`（真实父 FID）、`path`（祖先到当前目录的 fid/name/parent 数组）。缺失元数据通过 file/info 补齐并写入当前账号的 `directories.json`；无法补齐时保留目录列表，增加 `navigation_error`，原生入口显示重试提示。`parent=0` 不读取父链。
 - 标记 `parent` 筛选同时匹配实际视频父目录或 `series_fid`，因此可管理一部剧的多个清晰度版本。全局分组使用 series_fid，分类独立于剧名。
 - 原生有效播放采样超过 90% 后写入既有 `marks`，FID/size 隔离、存储代次屏障和手动操作校验不变；下次采样触发，不等待原先 10 秒进度周期。
-- Content-Length、Range、Content-Range 不变，仍按最大 4 MiB 范围顺序读取；发送前依据播放时钟限制前取（平均码率约 30 秒，4–32 MiB）。未知时钟为会话共享 8 MiB 初始预算加约 1 MiB/s，拖动允许有限探测；不同 Range 共用预算。no-store 与无视频磁盘缓存策略不变。
+- Content-Length、Range、Content-Range 不变，仍按最大 4 MiB 范围顺序读取；媒体字节不设下载速率上限。前方预缓存按视频总大小计算，达到 20% 后暂停，剩余降到 10% 或以下恢复，补到 20% 再暂停；依据可信播放时钟估算已消费字节。未知时钟先按网络原速提供最多 20%，等待有效播放进度后再补充，不设按秒增长预算。连续、并发 Range 和索引读取共用上限，重叠范围不重复计数；拖动后按新位置核算，未使用的预留额度在断连时释放。no-store 与无视频磁盘缓存策略不变。
 - 安装默认 `<PotPlayer>/Plugin/QuarkPotPlayer`；独立 `Uninstall.exe` 不含组件压缩包。根管理窗口增加“安装管理”，日常管理不依赖下载的安装包。

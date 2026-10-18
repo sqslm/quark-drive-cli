@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from urllib.parse import quote
 
@@ -27,7 +28,7 @@ from quark_cli.potplayer import plugin_state
 from quark_cli.potplayer.library_state import Library
 from quark_cli.potplayer.service import Service
 
-from potplayer_fixture import COOKIE, VIDEO_BYTES, DriveFixture
+from potplayer_fixture import COOKIE, VIDEO_BYTES, DriveFixture, consuming_clock
 
 UINT32_MAX = 0xFFFFFFFF
 
@@ -117,6 +118,9 @@ class _ServerCase(unittest.TestCase):
             status_launcher=self._launch,
             monitor_start=False,
         )
+        consuming = mock.patch.object(self.service.monitor, 'buffer_state', side_effect=consuming_clock(self.service))
+        consuming.start()
+        self.addCleanup(consuming.stop)
         self.server = self.service.build_server()
         self.thread = threading.Thread(
             target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
@@ -199,7 +203,7 @@ class DiagnosticsRouteCase(_ServerCase):
         self.assertEqual(snapshot["playback"], [])
         report = self.api("GET", "/v1/diagnostics/report").json()
         self.assertEqual(report["schema_version"], 1)
-        self.assertEqual(report["release"], "0.12.1")
+        self.assertEqual(report["release"], "0.12.2")
         # No account/API request was made by either projection.
         self.assertEqual(self.fixture.requests, [])
 

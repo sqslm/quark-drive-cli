@@ -986,7 +986,7 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
     def test_versions_report_the_current_release(self):
         # 本任务只把 UrlList 升到 0.8.0；PlayParse/SubtitleSearch 的版本由各自的
         # 任务维护，这里只要求仍是语义化版本串。
-        self.assertIn('return "0.12.1";', self.raw_body(self.url_raw, "string GetVersion()"))
+        self.assertIn('return "0.12.2";', self.raw_body(self.url_raw, "string GetVersion()"))
         self.assertRegex(
             self.raw_body(self.play_raw, "string GetVersion()"), r'return "\d+\.\d+\.\d+";'
         )
@@ -1562,8 +1562,8 @@ class LibraryRouteShapeTests(BridgeCase):
 
     def test_a_successful_media_read_records_one_recent_entry(self):
         play = self.post_json("/v1/play", {"fid": "fav-vid"})
-        streamed = self.client.get(self.base + play["url"])
-        self.assertEqual(streamed.status_code, 200)
+        streamed = self.client.get(self.base + play["url"], headers={"Range": "bytes=0-9"})
+        self.assertEqual(streamed.status_code, 206)
         payload = self.get_json("/v1/recent")
         self.assertEqual([item["fid"] for item in payload["items"]], ["fav-vid"])
         entry = payload["items"][0]
@@ -1606,7 +1606,7 @@ class LibraryRouteShapeTests(BridgeCase):
 
     def test_recent_clear_is_idempotent(self):
         play = self.post_json("/v1/play", {"fid": "fav-vid"})
-        self.assertEqual(self.client.get(self.base + play["url"]).status_code, 200)
+        self.assertEqual(self.client.get(self.base + play["url"], headers={"Range": "bytes=0-9"}).status_code, 206)
         for _ in range(2):
             cleared = self.post_json("/v1/recent/clear", {"client": "potplayer"})
             self.assertNotIn("error", cleared)

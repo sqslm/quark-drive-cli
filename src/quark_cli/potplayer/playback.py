@@ -210,7 +210,8 @@ def _ms(value: Any) -> int:
     return 0
 
 
-def _identity_matches(value: Any, fid: str, stream_url: str | None, bookmark_id: str | None = None) -> bool:
+def _identity_matches(value: Any, fid: str, stream_url: str | None, bookmark_id: str | None = None,
+                      account_id: str = '') -> bool:
     """True only for the exact logical URL of ``fid`` or the exact registered URL.
 
     The player reports the address the extension handed it: one of the logical
@@ -220,9 +221,10 @@ def _identity_matches(value: Any, fid: str, stream_url: str | None, bookmark_id:
     """
     if not isinstance(value, str) or not value:
         return False
-    if value == LOGICAL_PREFIXES[0] + fid or value == LOGICAL_PREFIXES[1] + fid:
-        return True
-    if bookmark_id is not None and value == "https://quark.invalid/mark/" + bookmark_id:
+    logical = [prefix + fid for prefix in LOGICAL_PREFIXES]
+    if bookmark_id is not None:
+        logical.append('https://quark.invalid/mark/' + bookmark_id)
+    if value in logical or (account_id and value in [url + '?account=' + account_id for url in logical]):
         return True
     return stream_url is not None and value == stream_url
 
@@ -634,7 +636,7 @@ class PlaybackMonitor:
                         flushes.append(record)
                     self._bindings.pop(player_pid, None)
                     continue
-                if not _identity_matches(getattr(sample, "file_name", None), binding.session.fid, binding.url, binding.session.bookmark_id):
+                if not _identity_matches(getattr(sample, "file_name", None), binding.session.fid, binding.url, binding.session.bookmark_id, binding.session.account_id):
                     # A binding that never matched may simply still be
                     # transitioning to the expected file; only a previously
                     # matched video that really switched away is dropped.
@@ -751,7 +753,7 @@ class PlaybackMonitor:
             self._set(task.player_pid, task.generation, STATE_MISSING, MSG_MISSING)
             return False
         identity = getattr(sample, "file_name", None)
-        if not _identity_matches(identity, fid, url, binding.session.bookmark_id):
+        if not _identity_matches(identity, fid, url, binding.session.bookmark_id, binding.session.account_id):
             self._set(task.player_pid, task.generation, STATE_MISMATCH, MSG_MISMATCH)
             return False
         with self._lock:
@@ -803,7 +805,7 @@ class PlaybackMonitor:
         if sample is None or getattr(sample, "player_pid", None) != task.player_pid:
             self._set(task.player_pid, task.generation, STATE_MISSING, MSG_MISSING)
             return None
-        if not _identity_matches(getattr(sample, "file_name", None), fid, url, binding.session.bookmark_id):
+        if not _identity_matches(getattr(sample, "file_name", None), fid, url, binding.session.bookmark_id, binding.session.account_id):
             self._set(task.player_pid, task.generation, STATE_MISMATCH, MSG_MISMATCH)
             return None
         with self._lock:
@@ -868,7 +870,7 @@ class PlaybackMonitor:
             self._set(task.player_pid, task.generation, STATE_MISSING, MSG_MISSING)
             return False
         identity = getattr(sample, "file_name", None)
-        if not _identity_matches(identity, fid, url, binding.session.bookmark_id):
+        if not _identity_matches(identity, fid, url, binding.session.bookmark_id, binding.session.account_id):
             self._set(task.player_pid, task.generation, STATE_MISMATCH, MSG_MISMATCH)
             return False
         duration = _ms(getattr(sample, "duration_ms", 0))
@@ -905,7 +907,7 @@ class PlaybackMonitor:
         if not (
             verify is not None
             and getattr(verify, "player_pid", None) == task.player_pid
-            and _identity_matches(getattr(verify, "file_name", None), fid, url, binding.session.bookmark_id)
+            and _identity_matches(getattr(verify, "file_name", None), fid, url, binding.session.bookmark_id, binding.session.account_id)
             and abs(_ms(getattr(verify, "position_ms", 0)) - target) <= VERIFY_TOLERANCE_MS
         ):
             self._set(task.player_pid, task.generation, None, MSG_SEEK_FAILED)
@@ -971,7 +973,7 @@ class PlaybackMonitor:
         verified = (
             verify is not None
             and getattr(verify, "player_pid", None) == player_pid
-            and _identity_matches(getattr(verify, "file_name", None), fid, url)
+            and _identity_matches(getattr(verify, "file_name", None), fid, url, binding.session.bookmark_id, binding.session.account_id)
             and abs(_ms(getattr(verify, "position_ms", 0)) - saved) <= VERIFY_TOLERANCE_MS
         )
         self._finish_restore(player_pid, generation, saved, MSG_RESTORED if verified else MSG_SEEK_FAILED)

@@ -1126,6 +1126,7 @@ class Service:
         """
         with self._history_lock:
             session = self.sessions.create(media)
+            session.account_id = self.accounts.active or ''
             session.parent = self.parent_of(media.fid)
             session.parent_name = self.parent_name_of(media.fid)
             session.context = self.directories.context(session.parent) if session.parent else {}
@@ -1680,7 +1681,7 @@ class _Handler(BaseHTTPRequestHandler):
         gate = ReadAhead(size=session.size, start=start, budget=session.buffer_budget)
         bound = self._stream_monitor.buffer_state(session.session) is not None
 
-        def wait_for_buffer(offset):
+        def wait_for_buffer(offset, maximum=MEDIA_SEGMENT):
             while True:
                 ensure_current()
                 row = self._stream_monitor.buffer_state(session.session)
@@ -1696,8 +1697,11 @@ class _Handler(BaseHTTPRequestHandler):
                 if row['state'] == 'stopped':
                     self.close_connection = True
                     return False
-                if gate.allowance(offset, row) > 0:
-                    return True
+                if gate.credit:
+                    return min(maximum, gate.credit)
+                count = gate.reserve(offset, row, maximum)
+                if count:
+                    return count
                 # A seek/close can leave a paused response waiting for a clock;
                 # detect its peer closing instead of retaining an idle worker.
                 ready, _, _ = select.select([self.connection], [], [], .2)
@@ -1713,9 +1717,10 @@ class _Handler(BaseHTTPRequestHandler):
                 position = start
                 while position <= end:
                     ensure_current()
-                    stop = min(position + MEDIA_SEGMENT - 1, end)
-                    if not wait_for_buffer(position):
+                    available = wait_for_buffer(position, min(MEDIA_SEGMENT, end - position + 1))
+                    if not available:
                         return
+                    stop = min(position + available - 1, end)
                     with open_content(
                         client, session, (position, stop), refetch, on_origin=on_origin
                     ) as response:
@@ -1725,7 +1730,7 @@ class _Handler(BaseHTTPRequestHandler):
                             self._stream_headers(session, byte_range, end - start + 1)
                             sent = True
                         if not self._forward(response, length, on_started=record_once, on_chunk=on_chunk,
-                                             before_chunk=lambda written: wait_for_buffer(position + written)):
+                                             before_chunk=lambda written, maximum: wait_for_buffer(position + written, maximum)):
                             return
                     position = stop + 1
                 return
@@ -1737,7 +1742,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._stream_headers(session, byte_range if status == 206 else None, length, status=status, header=header)
                 sent = True
                 self._forward(response, length, on_started=record_once, on_chunk=on_chunk,
-                              before_chunk=lambda written: wait_for_buffer(start + written))
+                              before_chunk=lambda written, maximum: wait_for_buffer(start + written, maximum))
         except (QuarkError, httpx.HTTPError) as exc:
             if sent:
                 # The body is already in flight; only an aborted connection is
@@ -1746,6 +1751,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._record_failure(exc, phase="origin")
             else:
                 self._failure_response(exc, phase="origin")
+        finally:
+            gate.release()
 
     def _record_played(self, session: PlaySession) -> None:
         """One disk write per started media response, never per chunk or segment.
@@ -1807,7 +1814,7 @@ class _Handler(BaseHTTPRequestHandler):
         *,
         on_started: Callable[[], None] | None = None,
         on_chunk: Callable[[int], None] | None = None,
-        before_chunk: Callable[[int], bool] | None = None,
+        before_chunk: Callable[[int, int], int] | None = None,
     ) -> bool:
         """Copy exactly ``length`` bytes; ``False`` means the body stopped short.
 
@@ -1823,8 +1830,6 @@ class _Handler(BaseHTTPRequestHandler):
         written = 0
         try:
             for chunk in response.iter_raw(CHUNK_SIZE):
-                if before_chunk is not None and not before_chunk(written):
-                    return False
                 if not chunk:
                     continue
                 remaining = length - written
@@ -1832,13 +1837,21 @@ class _Handler(BaseHTTPRequestHandler):
                     break
                 if len(chunk) > remaining:
                     chunk = chunk[:remaining]
-                self.wfile.write(chunk)
-                written += len(chunk)
-                if on_chunk is not None:
-                    on_chunk(len(chunk))
-                if on_started is not None:
-                    on_started()
-                    on_started = None
+                offset = 0
+                while offset < len(chunk):
+                    count = len(chunk) - offset
+                    if before_chunk is not None:
+                        count = before_chunk(written, count)
+                    if not count:
+                        return False
+                    self.wfile.write(chunk[offset:offset + count])
+                    offset += count
+                    written += count
+                    if on_chunk is not None:
+                        on_chunk(count)
+                    if on_started is not None:
+                        on_started()
+                        on_started = None
                 if written >= length:
                     break
         except httpx.HTTPError:
