@@ -55,9 +55,9 @@ class LocalClient:
             and payload.get("instance") == self._endpoint.instance
         )
 
-    def _get_object(self, path: str) -> dict[str, Any] | None:
+    def _get_object(self, path: str, *, timeout: float | None = None) -> dict[str, Any] | None:
         try:
-            response = self._client.get(path, headers=self._account_header())
+            response = self._client.get(path, headers=self._account_header(), **({'timeout': timeout} if timeout is not None else {}))
             if response.status_code != 200:
                 return None
             payload = response.json()

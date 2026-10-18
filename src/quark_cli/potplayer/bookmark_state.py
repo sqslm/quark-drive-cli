@@ -26,9 +26,10 @@ from .plugin_state import plugin_directory
 BOOKMARK_NAME = "bookmark.json"
 #: Longest accepted note in *characters* (Chinese counts one per character).
 NOTE_LIMIT = 200
-_DOCUMENT_VERSION = 2
+_DOCUMENT_VERSION = 3
 _KEYS = frozenset({"id", "fid", "name", "size", "position_ms", "duration_ms", "note"})
 _DIRECTORY_KEYS = frozenset({'parent', 'parent_name'})
+_CONTEXT_KEYS = frozenset({'series_fid', 'series_name', 'category', 'version', 'video_prefix'})
 _CORRUPT = "精彩标记库损坏，已停止；不会覆盖现有文件"
 _UNSUPPORTED = "精彩标记库版本不受支持，已停止"
 
@@ -56,7 +57,7 @@ def _count(value: Any) -> int:
 
 
 def _entry(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, dict) or set(raw) not in (_KEYS, _KEYS | _DIRECTORY_KEYS):
+    if not isinstance(raw, dict) or set(raw) not in (_KEYS, _KEYS | _DIRECTORY_KEYS, _KEYS | _DIRECTORY_KEYS | _CONTEXT_KEYS):
         raise LocalIOError(_CORRUPT)
     try:
         fid = valid_fid(raw["fid"])
@@ -79,6 +80,10 @@ def _entry(raw: Any) -> dict[str, Any]:
         if not isinstance(raw['parent_name'], str):
             raise LocalIOError(_CORRUPT)
         entry['parent_name'] = raw['parent_name']
+    if 'series_fid' in raw:
+        if not all(isinstance(raw[key], str) for key in _CONTEXT_KEYS):
+            raise LocalIOError(_CORRUPT)
+        entry.update({key: raw[key] for key in _CONTEXT_KEYS})
     return entry
 
 
@@ -86,7 +91,7 @@ def _checked(document: Any) -> list[dict[str, Any]]:
     """Validate the stored document instead of silently dropping its entries."""
     if not isinstance(document, dict):
         raise LocalIOError(_CORRUPT)
-    if document.get("version") not in (1, _DOCUMENT_VERSION):
+    if document.get("version") not in (1, 2, _DOCUMENT_VERSION):
         raise LocalIOError(_UNSUPPORTED)
     raw = document.get("bookmarks")
     if not isinstance(raw, list):
@@ -155,6 +160,7 @@ class BookmarkStore:
         *,
         parent: str = '',
         parent_name: str = '',
+        context: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Prepend one bookmark for the exact ``fid``/``size``; return the stored row.
 
@@ -175,6 +181,8 @@ class BookmarkStore:
             if not isinstance(parent_name, str):
                 raise UsageError('精彩标记目录名称无效')
             entry.update(parent=_caller_fid(parent), parent_name=parent_name)
+            if context:
+                entry.update({key: context[key] for key in _CONTEXT_KEYS})
         with self._lock:
             entries = self._document()
             entries.insert(0, entry)
@@ -197,6 +205,19 @@ class BookmarkStore:
                 if entry.get('parent') != parent or (name and entry.get('parent_name') != name):
                     saved_name = entry.get('parent_name', '') if entry.get('parent') == parent else ''
                     entry.update(parent=parent, parent_name=name or saved_name)
+                    changed = True
+            if changed:
+                self._store(entries)
+
+    def set_contexts(self, contexts: dict[str, dict[str, str]]) -> None:
+        with self._lock:
+            entries = self._document()
+            changed = False
+            for entry in entries:
+                context = contexts.get(entry['fid'])
+                if context and any(entry.get(key) != value for key, value in context.items()):
+                    entry.update(context)
+                    _entry(entry)
                     changed = True
             if changed:
                 self._store(entries)
@@ -255,10 +276,14 @@ def bookmark_groups(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Group by real parent FID; never merge series by their display names."""
     groups: dict[str, dict[str, Any]] = {}
     for entry in items:
-        parent = entry.get('parent', '')
-        name = entry.get('parent_name') or ('我的网盘' if parent == '0' else '未命名剧集' if parent else '未分类')
-        group = groups.setdefault(parent, {'parent': parent, 'name': name, 'count': 0})
-        if entry.get('parent_name'):
-            group['name'] = entry['parent_name']
+        parent = group_key(entry)
+        name = entry.get('series_name') or entry.get('parent_name') or ('我的网盘' if parent == '0' else '未命名剧集' if parent else '未分类')
+        group = groups.setdefault(parent, {'parent': parent, 'name': name, 'count': 0, 'category': entry.get('category', '未分类')})
+        if entry.get('series_name') or entry.get('parent_name'):
+            group['name'] = name
         group['count'] += 1
     return list(groups.values())
+
+
+def group_key(entry):
+    return entry.get('series_fid') or entry.get('parent', '')

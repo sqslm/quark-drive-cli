@@ -6,9 +6,9 @@ and never touch a real PotPlayer installation.
 
 Layout produced by ``install``::
 
-    %LOCALAPPDATA%\\QuarkPotPlayer\\
+    <PotPlayer>\\Plugin\\QuarkPotPlayer\\
         app\\QuarkPotPlayer.exe      bridge component (PyInstaller onedir)
-        QuarkPotPlayer-Setup.exe     copy of the running installer (for uninstall)
+        Uninstall.exe               independent lightweight uninstall entry point
         install.json                 manifest of everything this installer created
     <PotPlayer>\\Extension\\Media\\{UrlList,PlayParse}\\Media* - Quark*.as
     %APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\夸克网盘 (PotPlayer).lnk
@@ -38,6 +38,7 @@ PRODUCT_NAME = "夸克网盘 PotPlayer 插件"
 APP_DIR_NAME = "QuarkPotPlayer"
 COMPONENT_EXE = "QuarkPotPlayer.exe"
 SETUP_EXE_NAME = "QuarkPotPlayer-Setup.exe"
+UNINSTALL_EXE_NAME = 'Uninstall.exe'
 #: Path taken by the AngelScript extensions: ``HostGetScriptFolder()\..\..\<name>``.
 LAUNCHER_NAME = "quark-potplayer.exe"
 LAUNCHER_PATH_NAME = "quark-potplayer.path"
@@ -75,8 +76,9 @@ def local_app_data(env: Mapping[str, str] | None = None) -> Path:
     return Path(base)
 
 
-def default_install_dir(env: Mapping[str, str] | None = None) -> Path:
-    return local_app_data(env) / APP_DIR_NAME
+def default_install_dir(env: Mapping[str, str] | None = None, *, potplayer_dir: Path | None = None) -> Path:
+    player = potplayer_dir or detect_potplayer_dir(env=env)
+    return (Path(player) if player else Path()) / 'Plugin' / APP_DIR_NAME
 
 
 def cli_config_dir(env: Mapping[str, str] | None = None) -> Path:
@@ -472,11 +474,11 @@ def install(
 
     _install_launcher(payload_dir, install_dir / "app" / COMPONENT_EXE, potplayer_dir, record)
 
-    if self_exe is not None:
-        setup_copy = install_dir / SETUP_EXE_NAME
-        if Path(self_exe).resolve() != setup_copy.resolve():
-            shutil.copyfile(self_exe, setup_copy)
-        record.created.append(SETUP_EXE_NAME)
+    # The launcher also contains the small uninstall entry point; the downloaded
+    # installer and its compressed payload are never retained for management.
+    shutil.copyfile(Path(payload_dir) / 'launcher' / LAUNCHER_NAME, install_dir / UNINSTALL_EXE_NAME)
+    record.created.append(UNINSTALL_EXE_NAME)
+    stop_service(install_dir)
 
     if make_shortcut and start_menu_dir is not None:
         # The bridge needs an action argument (--serve/--login/...), so a shortcut
@@ -528,15 +530,15 @@ def register_uninstall(install_dir: Path, *, version: str) -> None:
     """Per-user Add/Remove Programs entry; no elevation is involved."""
     if winreg is None or sys.platform != "win32":  # pragma: no cover - non-Windows
         return
-    setup = Path(install_dir) / SETUP_EXE_NAME
+    setup = Path(install_dir) / UNINSTALL_EXE_NAME
     values = {
         "DisplayName": PRODUCT_NAME,
         "DisplayVersion": version,
         "Publisher": "quark-cli",
         "InstallLocation": str(install_dir),
         "DisplayIcon": str(Path(install_dir) / "app" / COMPONENT_EXE),
-        "UninstallString": f'"{setup}" --uninstall',
-        "QuietUninstallString": f'"{setup}" --uninstall --silent',
+        "UninstallString": f'"{setup}" --uninstall --install-dir "{install_dir}"',
+        "QuietUninstallString": f'"{setup}" --uninstall --install-dir "{install_dir}" --silent',
         "NoModify": 1,
         "NoRepair": 1,
         "EstimatedSize": _tree_size_kb(Path(install_dir) / "app"),
@@ -616,7 +618,7 @@ def stop_service(install_dir: Path, *, timeout: float = 5.0) -> bool:
 
 #: Entries ``install`` creates directly inside the install directory. Anything else
 #: found there was added by the user afterwards and is left untouched.
-_OWNED_INSTALL_ENTRIES = ("app", SETUP_EXE_NAME, MANIFEST_NAME)
+_OWNED_INSTALL_ENTRIES = ("app", SETUP_EXE_NAME, UNINSTALL_EXE_NAME, MANIFEST_NAME)
 
 
 def _remove_installed_files(install_dir: Path, manifest: Mapping[str, Any], report: UninstallReport) -> None:

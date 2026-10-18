@@ -430,7 +430,8 @@ class PlaybackDesignTests(unittest.TestCase):
         listing = body_raw(
             self.url_raw, "array<dictionary> QuarkDirectoryList(string PathToken, string page, bool favorite_action)"
         )
-        self.assertRegex(listing, r'up\["folder"\]\s*=\s*"parent"')
+        self.assertIn('up["PathToken"] = ancestor.asString()', listing)
+        self.assertIn('root["up"]', listing)
         self.assertIn("QuarkAttachPageToken", listing)
 
     def test_play_request_body_is_a_json_object_with_a_fid(self):
@@ -576,7 +577,7 @@ class LibraryEntryDesignTests(unittest.TestCase):
             "array<dictionary> QuarkDirectoryList(string PathToken, string page, bool favorite_action)"
         )
         self.assertIn('bool first = page == "1"', body)
-        self.assertRegex(body, r"if \(!PathToken\.empty\(\) && first\)")
+        self.assertIn('if (!PathToken.empty() && PathToken != "0" && first)', body)
         self.assertIn('root["favorite"]', body)
         self.assertNotIn("QuarkIsFavorite(PathToken)", body)
         # 收藏状态取自本地收藏列表，而不是远端目录数据。
@@ -700,7 +701,7 @@ class SeriesEntryDesignTests(unittest.TestCase):
         )
         self.assertIn("QuarkAppendSeriesRows(ret, parent, series)", listing)
         self.assertIn("&include_series=1", listing)
-        self.assertIn('if (!PathToken.empty() && page == "1") request += "&include_series=1"', listing)
+        self.assertIn('if (!PathToken.empty() && PathToken != "0" && page == "1") request += "&include_series=1"', listing)
         rows = self.body("void QuarkAppendSeriesRows(array<dictionary> &ret, string parent, JsonValue &root)")
         self.assertNotIn("QuarkRequest", rows)
         self.assertLess(rows.index("total.asInt() == 0"), rows.index("QUARK_ACTION_HIGHLIGHTS"))
@@ -985,7 +986,7 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
     def test_versions_report_the_current_release(self):
         # 本任务只把 UrlList 升到 0.8.0；PlayParse/SubtitleSearch 的版本由各自的
         # 任务维护，这里只要求仍是语义化版本串。
-        self.assertIn('return "0.11.0";', self.raw_body(self.url_raw, "string GetVersion()"))
+        self.assertIn('return "0.12.0";', self.raw_body(self.url_raw, "string GetVersion()"))
         self.assertRegex(
             self.raw_body(self.play_raw, "string GetVersion()"), r'return "\d+\.\d+\.\d+";'
         )

@@ -6,8 +6,8 @@ The same executable installs, upgrades and uninstalls:
 * ``QuarkPotPlayer-Setup.exe --uninstall`` uninstall window
 * ``--silent`` variants for scripted runs
 
-The installer writes per-user locations only (``%LOCALAPPDATA%``, ``HKCU``), so it
-never needs elevation, and it refuses to delete anything absent from the manifest
+The installer defaults to PotPlayer's own ``Plugin`` directory (registry in
+``HKCU``); a protected player folder requires write permission. It refuses to delete anything absent from the manifest
 its own install wrote. Tkinter is imported lazily so ``--silent`` runs without a
 window station.
 """
@@ -68,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--uninstall", action="store_true", help="卸载本安装器创建的组件")
     parser.add_argument("--silent", action="store_true", help="不显示窗口，按参数直接执行")
     parser.add_argument("--potplayer-dir", type=Path, default=None, help="PotPlayer 安装目录（含 Extension）")
-    parser.add_argument("--install-dir", type=Path, default=None, help="组件安装目录，默认 %LOCALAPPDATA%\\QuarkPotPlayer")
+    parser.add_argument("--install-dir", type=Path, default=None, help="组件安装目录，默认 PotPlayer\\Plugin\\QuarkPotPlayer")
     parser.add_argument("--clear-credentials", action="store_true", help="卸载时同时清除插件凭证（不影响 CLI 登录）")
     parser.add_argument("--no-shortcut", action="store_true", help="不创建开始菜单快捷方式")
     parser.add_argument("--no-registry", action="store_true", help="不写入卸载注册表项")
@@ -126,6 +126,9 @@ def options_from(args: argparse.Namespace) -> Options:
     potplayer = args.potplayer_dir
     if potplayer is None and saved:
         potplayer = Path(saved)
+    if not args.install_dir and not args.uninstall:
+        potplayer = core.detect_potplayer_dir(explicit=potplayer)
+        install_dir = core.default_install_dir(potplayer_dir=potplayer)
     return Options(
         potplayer_dir=potplayer,
         install_dir=install_dir,
@@ -151,6 +154,8 @@ def do_install(options: Options, payload: Payload, emit: Callable[[str], None]) 
     potplayer = core.detect_potplayer_dir(explicit=options.potplayer_dir, saved=None)
     if potplayer is None:
         raise core.InstallError("未找到 PotPlayer，请手动选择其安装目录（应包含 PotPlayerMini64.exe 与 Extension）")
+    if not options.install_dir.is_absolute():
+        options.install_dir = potplayer / options.install_dir
     emit(f"PotPlayer：{potplayer}")
     emit(f"组件目录：{options.install_dir}")
     emit(f"组件版本：{payload.version}")
@@ -322,6 +327,8 @@ class InstallerWindow:
             self.log("未自动找到 PotPlayer，请点击「浏览…」选择安装目录")
             return
         self.potplayer.set(str(found))
+        if not self.args.install_dir:
+            self.install_dir.set(str(core.default_install_dir(potplayer_dir=found)))
         self.log(f"已找到 PotPlayer：{found}")
 
     def browse(self) -> None:
@@ -336,6 +343,8 @@ class InstallerWindow:
             self.log(f"无效目录：{exc}")
             return
         self.potplayer.set(str(directory))
+        if not self.args.install_dir:
+            self.install_dir.set(str(core.default_install_dir(potplayer_dir=directory)))
         self.log(f"已选择：{directory}")
 
     def options(self) -> Options:

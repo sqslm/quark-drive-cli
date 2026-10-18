@@ -19,6 +19,7 @@ import install_core as core  # noqa: E402
 import installer  # noqa: E402
 import launcher_entry  # noqa: E402
 import service_entry  # noqa: E402
+import uninstall_entry  # noqa: E402
 
 
 def make_payload(root: Path) -> Path:
@@ -51,6 +52,12 @@ def make_as(root: Path) -> list[core.AsFile]:
 
 
 class RoutingTests(unittest.TestCase):
+    def test_standalone_uninstall_keeps_silent_flag_on_the_temporary_copy(self):
+        with mock.patch.object(core, 'needs_temp_relaunch', return_value=True), \
+             mock.patch.object(core, 'relaunch_uninstall_from_temp', return_value=Path('temp.exe')) as relaunch:
+            self.assertEqual(uninstall_entry._run(['--uninstall', '--silent', '--install-dir', 'E:/fixture']), 0)
+        self.assertIn('--silent', relaunch.call_args.kwargs['extra'])
+
     def test_targets_follow_file_name_prefix(self) -> None:
         self.assertEqual(core.as_target_for("MediaUrlList - Quark网盘.as"), "Media/UrlList")
         self.assertEqual(core.as_target_for("MediaPlayParse - Quark网盘.as"), "Media/PlayParse")
@@ -133,7 +140,7 @@ class DetectionTests(unittest.TestCase):
 
     def test_user_roots_come_from_environment(self) -> None:
         env = {"LOCALAPPDATA": r"C:\Users\u\AppData\Local", "APPDATA": r"C:\Users\u\AppData\Roaming"}
-        self.assertEqual(core.default_install_dir(env), Path(r"C:\Users\u\AppData\Local/QuarkPotPlayer"))
+        self.assertEqual(core.default_install_dir(env, potplayer_dir=Path('E:/PotPlayer')), Path('E:/PotPlayer/Plugin/QuarkPotPlayer'))
         self.assertEqual(
             core.plugin_credential_dir(core.cli_config_dir(env)),
             Path(r"C:\Users\u\AppData\Roaming/quark-drive-cli/potplayer"),
@@ -179,6 +186,8 @@ class DetectCallbackTests(unittest.TestCase):
         window = installer.InstallerWindow.__new__(installer.InstallerWindow)
         window.potplayer = _StubVar(typed)
         window.messages = []
+        window.args = installer.build_parser().parse_args([])
+        window.install_dir = _StubVar('')
         window.log = window.messages.append
         return window
 
@@ -335,7 +344,7 @@ class InstallTests(unittest.TestCase):
                 registry=False,
             )
 
-    def test_install_copies_the_setup_executable_for_uninstall(self) -> None:
+    def test_install_keeps_only_the_lightweight_uninstaller_not_the_setup(self) -> None:
         fake_setup = self.root / "QuarkPotPlayer-Setup.exe"
         fake_setup.write_bytes(b"MZ setup")
         core.install(
@@ -349,7 +358,8 @@ class InstallTests(unittest.TestCase):
             make_shortcut=False,
             registry=False,
         )
-        self.assertEqual((self.install_dir / core.SETUP_EXE_NAME).read_bytes(), b"MZ setup")
+        self.assertFalse((self.install_dir / core.SETUP_EXE_NAME).exists())
+        self.assertEqual((self.install_dir / core.UNINSTALL_EXE_NAME).read_bytes(), b'MZ launcher')
 
     def test_upgrade_replaces_component_and_keeps_credentials(self) -> None:
         config_dir = self.root / "config"

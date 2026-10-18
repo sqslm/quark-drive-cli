@@ -982,7 +982,7 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertEqual(window._bookmark_pending, (1, "F1"))
         window._handle("bookmarks", (1, "F1", [dict(BOOKMARK_ENTRY), "junk", {"note": "无 id"}]))
         self.assertIsNone(window._bookmark_pending)
-        self.assertEqual(window._bookmark_tree.rows, [("mark0", ("A.mkv", "01:01:01", "第 3 分钟"))])
+        self.assertEqual(window._bookmark_tree.rows, [("mark0", ("A.mkv", "01:01:01", "第 3 分钟", '未分类'))])
         self.assertEqual(window._bookmark_rows, {"mark0": "b1"})
         self.assertIn("精彩标记：1 条", window._bookmark_header_var.value)
 
@@ -1122,7 +1122,7 @@ class BookmarkWindowTests(unittest.TestCase):
         window._bookmark_pending = (1, "F1")
         blank = dict(BOOKMARK_ENTRY, id="b2", note="", position_ms=90_000)
         window._handle("bookmarks", (1, "F1", [blank]))
-        self.assertEqual(window._bookmark_tree.rows, [("mark0", ("A.mkv", "00:01:30", "00:01:30"))])
+        self.assertEqual(window._bookmark_tree.rows, [("mark0", ("A.mkv", "00:01:30", "00:01:30", '未分类'))])
 
     def test_a_dialog_error_and_an_inactive_player_never_ask_the_bridge(self):
         window = _highlights_panel(dialog=_FakeDialog(error=RuntimeError("窗口已销毁")))

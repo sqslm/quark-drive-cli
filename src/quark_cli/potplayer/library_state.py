@@ -389,6 +389,10 @@ class Library:
                         return False
                     entry["position_ms"], entry["duration_ms"] = position_ms, duration_ms
                     entry["progress_at"] = self._clock()
+                    if duration_ms > 0 and position_ms * 100 > duration_ms * 90:
+                        document['marks'] = [mark for mark in document['marks'] if mark['fid'] != fid]
+                        document['marks'].insert(0, {'fid': fid, 'name': entry['name'], 'size': size,
+                                                     'watched_at': self._clock()})
                     self._store(document)
                     return True
             return False

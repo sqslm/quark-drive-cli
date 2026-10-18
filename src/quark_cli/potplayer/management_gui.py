@@ -7,6 +7,7 @@ from ..errors import LocalIOError
 from . import plugin_state
 from .accounts_gui import AccountClient, AccountsPanel
 from .highlights_gui import HighlightsClient, HighlightsPanel
+from .installation_gui import InstallationPanel
 from .status_gui import BridgeClient, StatusWindow
 from .gui_common import (
     EXIT_OK, EXIT_UNAVAILABLE, WINDOW_WIDTH, WINDOW_HEIGHT, MIN_WIDTH, MIN_HEIGHT,
@@ -37,10 +38,11 @@ class ManagementWindow:
                 ('播放诊断', StatusWindow, BridgeClient),
                 ('账号管理', AccountsPanel, AccountClient),
                 ('精彩标记', HighlightsPanel, HighlightsClient),
+                ('安装管理', InstallationPanel, None),
             ):
                 frame = ttk.Frame(tabs)
                 tabs.add(frame, text=title)
-                client = client_type(self.endpoint) if self.endpoint is not None else None
+                client = client_type(self.endpoint) if self.endpoint is not None and client_type is not None else None
                 page = page_type(client, self.endpoint)
                 if isinstance(page, HighlightsPanel):
                     page.consume_requests = False

@@ -44,7 +44,7 @@ from .gui_common import (
     state_label,
 )
 from .gui_transport import LocalClient, LocalWorker, LocalPanel
-from .bookmark_state import bookmark_groups
+from .bookmark_state import bookmark_groups, group_key
 
 
 class HighlightsClient(LocalClient):
@@ -59,7 +59,8 @@ class HighlightsClient(LocalClient):
         path = f"{BOOKMARKS_PATH}?fid={quote(fid, safe='')}" if fid else BOOKMARKS_PATH
         if fid.startswith('parent/'):
             path = f"{BOOKMARKS_PATH}?parent={quote(fid[7:], safe='')}"
-        payload = self._get_object(path)
+        payload = self._get_object(path, timeout=30)
+        self.metadata_notice = payload.get('metadata_notice', '') if payload else ''
         items = payload.get("items") if payload is not None else None
         if not isinstance(items, list):
             return None
@@ -92,6 +93,8 @@ class HighlightsWorker(LocalWorker):
         if kind == "bookmarks":
             _, player_pid, fid = request
             items = self._client.bookmarks(fid)
+            if getattr(self._client, 'metadata_notice', ''):
+                self._emit('metadata_notice', self._client.metadata_notice)
             self._emit("bookmarks", (player_pid, fid, items))
         elif kind == "bookmark_add":
             _, player_pid, fid, note = request
@@ -202,6 +205,8 @@ class HighlightsPanel(LocalPanel):
             self._show_disconnected()
         elif kind == 'bookmarks':
             self._apply_bookmarks(value)
+        elif kind == 'metadata_notice':
+            self._bookmark_notice(value)
         elif kind == "bookmark_added":
             self._apply_bookmark_result(value, _BOOKMARK_ADDED, _BOOKMARK_ADD_FAILED, refresh=True)
         elif kind == "bookmark_renamed":
@@ -363,7 +368,7 @@ class HighlightsPanel(LocalPanel):
             live = [row for row in self._playback if row.get("state") in _OPERABLE_STATES]
             parent = self._external.get('parent') if self._external.get('scope') == 'parent' else self._group
             if parent is not None:
-                live = [row for row in live if row.get('parent') == parent]
+                live = [row for row in live if row.get('parent') == parent or row.get('series_fid') == parent]
             if len(live) != 1:
                 return None
             return external_action_target(self._playback, live[0].get("fid"))
@@ -496,9 +501,9 @@ class HighlightsPanel(LocalPanel):
         table.columnconfigure(0, weight=1)
         table.rowconfigure(0, weight=1)
         self._bookmark_tree = ttk.Treeview(
-            table, columns=("video", "time", "note"), show="headings", selectmode="browse"
+            table, columns=("video", "time", "note", "category"), show="headings", selectmode="browse"
         )
-        for column, title, width in (("video", "视频", 220), ("time", "时间", 100), ("note", "备注", 280)):
+        for column, title, width in (("video", "视频", 220), ("time", "时间", 100), ("note", "备注", 280), ('category', '分类', 80)):
             self._bookmark_tree.heading(column, text=title)
             self._bookmark_tree.column(column, width=width, anchor="w", stretch=(column == "note"))
         self._bookmark_tree.grid(row=0, column=0, sticky="nsew")
@@ -666,13 +671,13 @@ class HighlightsPanel(LocalPanel):
         if self._external is not None and self._external.get('scope') == 'all' and self._group is None:
             for index, group in enumerate(bookmark_groups(self._bookmarks)):
                 iid = f'group{index}'
-                tree.insert('', 'end', iid=iid, values=('📁 ' + group['name'], '', f"{group['count']} 个精彩点"))
+                tree.insert('', 'end', iid=iid, values=('📁 ' + group['name'], '', f"{group['count']} 个精彩点", group['category']))
                 self._group_rows[iid] = group['parent']
             self._refresh_bookmark_header()
             self._update_bookmark_actions()
             return
         for index, entry in enumerate(self._bookmarks):
-            if self._external is not None and self._external.get('scope') == 'all' and self._group is not None and entry.get('parent', '') != self._group:
+            if self._external is not None and self._external.get('scope') == 'all' and self._group is not None and group_key(entry) != self._group:
                 continue
             bookmark_id = bookmark_id_of(entry)
             if bookmark_id is None:
@@ -686,7 +691,7 @@ class HighlightsPanel(LocalPanel):
                 iid=iid,
                 # An empty note is valid; the bookmark's own time point stands in
                 # as its default name.
-                values=(entry.get("name") or self._binding_name(), position, note if isinstance(note, str) and note else position),
+                values=('/'.join(part for part in (entry.get('video_prefix'), entry.get('name') or self._binding_name()) if part), position, note if isinstance(note, str) and note else position, entry.get('category', '未分类')),
             )
             self._bookmark_rows[iid] = bookmark_id
         self._refresh_bookmark_header()
@@ -717,7 +722,7 @@ class HighlightsPanel(LocalPanel):
         elif self._group is not None:
             group = next((g for g in bookmark_groups(self._bookmarks) if g['parent'] == self._group), None)
             prefix = '剧集：' + (group['name'] if group else '未分类')
-        visible = [entry for entry in self._bookmarks if entry.get('parent', '') == self._group] if self._group is not None else self._bookmarks
+        visible = [entry for entry in self._bookmarks if group_key(entry) == self._group] if self._group is not None else self._bookmarks
         header = f"{prefix}　精彩标记：{len(visible)} 条"
         if self._external is not None and self._external_action_target() is None:
             # The list/rename/remove work offline; add/jump cannot, so say so

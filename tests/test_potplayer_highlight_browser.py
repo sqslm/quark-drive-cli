@@ -47,10 +47,11 @@ class HighlightBrowserCase(_Case):
         self.assertEqual(len(self.fixture.requests), before)
 
     def test_new_mark_keeps_directory_without_a_recent_record(self):
+        self.fixture.records[0]['file_name'] = '兰香如故'
         store = self.service.monitor.bookmarks
         store.add('v2', '01.mkv', 2048, 1_000, 9_000, '对白', parent='root-dir', parent_name='兰香如故')
         self.assertEqual(self.api('GET', '/v1/bookmarks').json()['groups'],
-                         [{'parent': 'root-dir', 'name': '兰香如故', 'count': 1}])
+                         [{'parent': 'root-dir', 'name': '兰香如故', 'count': 1, 'category': '未分类'}])
 
     def test_directory_filter_never_fetches_the_drive_for_unknown_marks(self):
         self.service.monitor.bookmarks.add('ghost', '01.mkv', 2048, 1_000, 9_000, '')

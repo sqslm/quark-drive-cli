@@ -88,7 +88,7 @@
 - `parent`：目录 FID，缺省或空串等价于根目录 `0`。
 - `page`：从 `1` 开始，上限 `1000000`。
 - `size`：每页条数，`1..100`，缺省 `50`。
-- `include_series=1`：第一页从一次完整目录快照返回本页内容，并附 `series`（同 `/v1/series`）和 `favorite` 布尔值。扩展复用这些字段，避免为继续观看和收藏状态再读一次目录。后续页仍按原分页规则读取；未传该参数时响应保持原状。
+- `include_series=1`：第一页从一次完整目录快照返回本页内容，并附 `series`（同 `/v1/series`）和 `favorite` 布尔值。扩展复用这些字段，避免为继续观看和收藏状态再读一次目录。后续页仍按原分页规则读取；未传该参数时仍按原分页返回 items/page/has_more，目录导航元数据独立附加。
 
 返回服务端排序的原始一页，不递归、不重排：
 
@@ -239,7 +239,7 @@
 - 最近记录在**首个非空媒体块成功转发之后**写入，不等整集传输结束：取链、`HEAD`、未转发任何媒体字节的失败 `GET` 不记录。已经开始传输后再关闭、拖动或遇到上游中断，已写入的记录仍保留；每个 HTTP 请求只记一次，不按分段或数据块重复写盘。
 - 收藏与最近观看存放在账号私有目录 `config_directory()/potplayer/accounts/<account_id>/library.json`（升级导入账号沿用原 `potplayer/library.json`）（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。文件版本 2 起，最近观看条目另含观看进度字段 `position_ms`、`duration_ms`、`progress_at`（本机时间）；版本 3 起另含真实 `parent` 目录 FID，并新增独立的 `marks` 列表保存显式“已看”标记（不受 100 条最近上限影响）；`marks` 按 FID **和大小** 记录，FID 被替换成不同大小的文件时不会继承旧的已看标记。版本 4 起，最近观看条目另存真实目录名 `parent_name`：它只取自桥接**已经拉取过**的目录清单或“收藏目录”，从不使用窗口标题、从不猜测剧名、也不为此新增任何云端请求；`/v1/recent` 与 `/v1/continue` 的 `display` 因此显示“目录名 / 原文件名”，无法确认所属目录（含根目录，`parent` 为 `0`）时保留原文件名。版本 1/2/3 记录可正常读取，读取时不改写文件，仅在下次正常写入时才就地升级为版本 4，既有收藏/最近观看不受影响。
 - 切换、退出与登录过期均保留各账号的本机数据。退出仅移除所选账号凭证；切回或重新登录同一账号后读取其独立记录。
-- `/v1/watch-center`、`/v1/recent/remove`、本机 `/v1/bookmarks` 查看与编辑接口 与 `/v1/diagnostics*` 都只要求本地 Bearer，**不需要**夸克登录：`watch-center` 只读本地 `library.json`（不扫盘、不联网）；`recent/remove` 只删本地那一条观看记录，不动云端文件、收藏、`marks` 或精彩标记；`bookmarks/open` 只打开本机窗口。自动播放接口 `/v1/bookmarks/play` 需要登录；目录筛选只读本机标记与已知目录信息。它们都不改变视频落盘策略：无分片、无磁盘缓存、无转码、无后台扫描，也不存在向云端回传记录或报告的步骤。
+- `/v1/watch-center`、`/v1/recent/remove`、本机 `/v1/bookmarks` 查看与编辑接口 与 `/v1/diagnostics*` 都只要求本地 Bearer，**不需要**夸克登录：`watch-center` 只读本地 `library.json`（不扫盘、不联网）；`recent/remove` 只删本地那一条观看记录，不动云端文件、收藏、`marks` 或精彩标记；`bookmarks/open` 只打开本机窗口。自动播放接口 `/v1/bookmarks/play` 需要登录；目录筛选使用本机标记，缺失的祖先信息可在登录时补全；失败不会隐藏本地标记。它们都不改变视频落盘策略：无分片、无磁盘缓存、无转码、无后台扫描，也不存在向云端回传记录或报告的步骤。
 
 ## 播放流
 
@@ -283,7 +283,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.11.0", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.12.0", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -303,7 +303,7 @@
 
 ### `POST /v1/management/open`
 
-需 Bearer；异步打开“夸克网盘插件管理”窗口，返回 `202`；重复调用复用窗口，关闭不停止播放。三个独立页面分别持有客户端、工作线程和队列，壳窗口不持有账号列表或精彩标记数据。`POST /v1/diagnostics/open` 保留为同一窗口入口。
+需 Bearer；异步打开“夸克网盘插件管理”窗口，返回 `202`；重复调用复用窗口，关闭不停止播放。账号、诊断与标记三个独立页面分别持有客户端、工作线程和队列，壳窗口不持有账号列表或精彩标记数据；新增“安装管理”页只读取本机安装清单并调用独立卸载入口。`POST /v1/diagnostics/open` 保留为同一窗口入口。
 
 ### `GET /v1/bookmarks/state`
 
@@ -327,10 +327,10 @@
 
 ### 精彩标记
 
-沿用既有 `bookmark.json` 和 `/v1/bookmarks*` 路径，名称变化不迁移旧数据。根分类新增 `highlights`；全局查看与管理只读本机数据。
+沿用既有 `bookmark.json` 和 `/v1/bookmarks*` 路径，名称变化不迁移旧数据。根分类新增 `highlights`；标记点数据仅在本机保存；目录名称缺失时可读取并缓存祖先详情。
 
-- `GET /v1/bookmarks` 省略 `fid` 时返回所有视频的标记，最近添加在前，并增加 `groups: [{parent, name, count}]`，按真实目录 FID 分组。同名目录不合并；无法确认目录的组为 `parent: ""`、`name: "未分类"`。`?unclassified=1` 只列未分类标记。明确传空 `fid` 仍为 `400`；`?fid=<fid>` 仍返回 `{"items":[…]}`。
-- `?parent=<目录 fid>` 按已保存目录筛选，离线可用。不会为筛选额外访问夸克或扫描目录；正常浏览网盘得到的清单可用于补全未知归属的旧标记。返回项可含 `parent`、`parent_name`，已有最近记录与已浏览目录可用于就地补全。
+- `GET /v1/bookmarks` 省略 `fid` 时返回所有视频的标记，最近添加在前，并增加 `groups: [{parent, name, count, category}]`，按真实剧集 FID 分组（跳过分辨率等版本层）。同名目录不合并；无法确认目录的组为 `parent: ""`、`name: "未分类"`。`?unclassified=1` 只列未分类标记。明确传空 `fid` 仍为 `400`；`?fid=<fid>` 仍返回 `{"items":[…]}`。
+- `?parent=<目录 fid>` 按已保存目录筛选，离线可用。优先使用本机目录信息；祖先缺失时读取并缓存父目录详情，不扫描兄弟目录或整份网盘。补全失败仍返回本地标记及固定 `metadata_notice` 提示。返回项可含 `parent`、`parent_name`，已有最近记录与已浏览目录可用于就地补全。
 - `POST /v1/bookmarks/open` 可传 `{"scope":"all"}`、`{"fid":"…"}` 或 `{"parent":"目录 fid"}`。独立启动/复用 `--highlights-window`，不打开插件管理或诊断窗口。目录请求在状态中包含 `scope: "parent"` 与 `parent`；可附加 `action: "add"`，列表加载后针对该目录唯一的播放绑定弹出备注框。
 - 全局打开请求在 `/v1/bookmarks/state` 的 `bookmark_request` 中表示为 `{"id":"…","scope":"all","fid":"","name":"全部视频"}`；单视频请求仍是非空 `id`/`fid`。导出报告不包含此字段。
 - `POST /v1/bookmarks/play` 请求体 `{"id":"…"}`：核对本机标记存在并要求已登录，然后通过安装清单定位 PotPlayer，用 `https://quark.invalid/mark/<id>` 打开。返回 `202 {"status":"opening"}` 只表示已请求打开；未知标记 `404`，安装信息不可用为本地错误。
@@ -347,9 +347,9 @@
 - `POST /v1/bookmarks/jump`，请求体 `{"player_pid":1234,"fid":"…","id":"…"}` → `200 {"status":"jumped"}`。
 - `POST /v1/bookmarks/open` 返回 `202 {"status":"opened"}` 或 `already_open`，每次使用新请求 id 重新定位目标列表；打开本身不要求正在播放、不访问云端。管理窗口中的精彩标记页不消费此请求，避免同时弹出两个窗口。查看、编辑备注、删除离线可用；跳转可通过 `/v1/bookmarks/play` 自动打开视频。
 
-`add`/`jump` 只对**当前正在播放同一逻辑文件**的绑定生效，并核对实时身份：该 PID 没有绑定、播放器中的文件不符、同一 fid 被多实例打开、或本机缺少原生读取能力时返回 `409 media_changed`；`add` 在位置无效（为 0 或已在结尾）时同样失败，但它始终记录当前文件的真实时间点，因此文件换了大小/时长后仍可对新文件添加精彩标记；`jump` 额外在精彩标记保存的大小/时长与当前文件明显不符时失败（指向旧文件的旧精彩标记因此不可跳转）。参数、`fid`、`id` 或备注非法（含 `note` 非字符串或超过 200 字符）→ `400 bad_request`；写入路由只接受 `POST`，任何其它方法（含 `HEAD`）都只会得到 `405 method_not_allowed`，不会执行写入。`GET`/`rename`/`remove` 只读写本地文件，不访问夸克；`add`/`jump` 也不产生额外的云请求。
+`add`/`jump` 只对**当前正在播放同一逻辑文件**的绑定生效，并核对实时身份：该 PID 没有绑定、播放器中的文件不符、同一 fid 被多实例打开、或本机缺少原生读取能力时返回 `409 media_changed`；`add` 在位置无效（为 0 或已在结尾）时同样失败，但它始终记录当前文件的真实时间点，因此文件换了大小/时长后仍可对新文件添加精彩标记；`jump` 额外在精彩标记保存的大小/时长与当前文件明显不符时失败（指向旧文件的旧精彩标记因此不可跳转）。参数、`fid`、`id` 或备注非法（含 `note` 非字符串或超过 200 字符）→ `400 bad_request`；写入路由只接受 `POST`，任何其它方法（含 `HEAD`）都只会得到 `405 method_not_allowed`，不会执行写入。`rename`/`remove` 只读写本地文件；`GET` 的目录元数据补全可访问夸克，标记本身始终来自本机；`add`/`jump` 也不产生额外的云请求。
 
-精彩标记存放在账号目录的独立小文件 `bookmark.json`（升级导入账号沿用原路径）（与 `library.json` 分开，见下），**不**进入诊断报告；切换、退出及登录过期均保留。文件版本为 2，兼容读取版本 1；已知目录的条目增加成对的 `parent`、`parent_name`。目录信息随标记持久保存，不依赖最近观看条数；旧文件缺少目录信息时保留原条目。
+精彩标记存放在账号目录的独立小文件 `bookmark.json`（升级导入账号沿用原路径）（与 `library.json` 分开，见下），**不**进入诊断报告；切换、退出及登录过期均保留。文件版本为 3，兼容读取版本 1/2；已知目录的条目包含 `parent`、`parent_name`，版本 3 还保存 `series_fid`、`series_name`、`version`、`category`、`video_prefix`。目录信息随标记持久保存，不依赖最近观看条数；旧文件缺少目录信息时保留原条目。
 
 > 通用约定：本地令牌无效 → `401 unauthorized`；参数非法 → `400 bad_request`；方法不被支持 → `405 method_not_allowed`（与既有路由一致）。这些接口只要求本地 Bearer，不要求夸克登录，因此在未登录、登录过期或冷却中仍可用于查看状态与导出报告。
 
@@ -388,7 +388,7 @@
 - 冷却期间的列表/数据/登录接口返回 `429 rate_limited` 或 `403 access_restricted` 并带 `Retry-After`；`/v1/health`、`/v1/favorites`、`/v1/recent`、`/v1/continue`、`/v1/auth/logout` 等本地接口仍可用。
 - 冷却错误**不会**清除插件凭证、不会打开扫码登录、不会清空收藏/最近记录；`401` 凭证失效的语义不变。
 - 若冷却状态无法写入本机，服务会以 `500 local_io_error` 停止后续自动请求；另一个进程或重启无法得知未写入的冷却，需先修复本机存储并用官方夸克客户端确认账号。
-- 此节奏不改变 4 MiB 串行分段、64 KiB 转发或内嵌字幕/音轨的原生处理，也不新增字节速率限制。以上数值是本工具的保守默认值，不代表夸克官方安全阈值，不能保证账号不被限制。`Retry-After` 定义见 [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#field.retry-after)（`429` 源自 RFC 6585 §4）。
+- 此节奏不改变 4 MiB 串行分段、64 KiB 转发或内嵌字幕/音轨的原生处理，预缓冲另依据播放时钟限制前取，未知时钟采用保守字节预算。以上数值是本工具的保守默认值，不代表夸克官方安全阈值，不能保证账号不被限制。`Retry-After` 定义见 [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#field.retry-after)（`429` 源自 RFC 6585 §4）。
 
 ## 错误格式
 
@@ -425,3 +425,11 @@
 - 内嵌字幕/音轨由播放器原生解码、显示与切换，本插件不替换、不自动选中外挂轨；同目录外挂字幕经原生“字幕搜索”手动选择，只从本桥接读取内存文本——桥接自身不写字幕或视频文件，播放器是否把所选字幕保存到磁盘由 PotPlayer 自身行为决定。
 - 本地凭证与诊断数据保持私有：`/v1/diagnostics/report` 只在用户显式导出时才写文件，且经白名单裁剪，不含 Cookie/令牌/URL/FID/文件名/观看进度/绝对路径。
 - 不含分享转存、海报库、转码。观看进度依赖 Windows 原生读取能力；其它平台的 CLI 不受影响。
+
+## 0.12 目录与播放策略
+
+- `GET /v1/files` 增加 `up`（真实父 FID）、`path`（祖先到当前目录的 fid/name/parent 数组）。缺失元数据通过 file/info 补齐并写入当前账号的 `directories.json`；无法补齐时保留目录列表，增加 `navigation_error`，原生入口显示重试提示。`parent=0` 不读取父链。
+- 标记 `parent` 筛选同时匹配实际视频父目录或 `series_fid`，因此可管理一部剧的多个清晰度版本。全局分组使用 series_fid，分类独立于剧名。
+- 原生有效播放采样超过 90% 后写入既有 `marks`，FID/size 隔离、存储代次屏障和手动操作校验不变；下次采样触发，不等待原先 10 秒进度周期。
+- Content-Length、Range、Content-Range 不变，仍按最大 4 MiB 范围顺序读取；发送前依据播放时钟限制前取（平均码率约 30 秒，4–32 MiB）。未知时钟为会话共享 8 MiB 初始预算加约 1 MiB/s，拖动允许有限探测；不同 Range 共用预算。no-store 与无视频磁盘缓存策略不变。
+- 安装默认 `<PotPlayer>/Plugin/QuarkPotPlayer`；独立 `Uninstall.exe` 不含组件压缩包。根管理窗口增加“安装管理”，日常管理不依赖下载的安装包。

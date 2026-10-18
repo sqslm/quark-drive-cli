@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 import httpx
@@ -19,6 +19,7 @@ import httpx
 from ..client import QuarkClient
 from ..errors import AccessRestrictedError, RemoteError
 from ..files import Files
+from .buffering import BufferBudget
 from ..request_guard import REASON_ACCESS_RESTRICTED
 from ..transfer import download_address, successor_url, trusted_url
 
@@ -92,6 +93,8 @@ class PlaySession:
     bookmark_id: str | None = None
     parent: str = ''
     parent_name: str = ''
+    context: dict[str, str] = field(default_factory=dict)
+    buffer_budget: BufferBudget = field(default_factory=BufferBudget)
 
 
 @dataclass(frozen=True)

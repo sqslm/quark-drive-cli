@@ -12,6 +12,8 @@ import json
 import math
 import os
 import secrets
+import select
+import socket
 import subprocess
 import sys
 import threading
@@ -44,6 +46,8 @@ from . import SERVICE_VERSION
 from .bookmark_state import NOTE_LIMIT, BookmarkStore, bookmark_groups
 from .accounts import Accounts, account_key
 from .diagnostics import Diagnostics
+from .directory_state import Directories
+from .buffering import ReadAhead
 from .library import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
@@ -601,6 +605,7 @@ class Service:
                                      clock=clock, poll_interval=monitor_poll_interval, start=monitor_start)
         self.sessions = Sessions(clock)
         self.library = Library(self.accounts.data_path('library.json'))
+        self.directories = Directories(self.accounts.data_path('directories.json'))
         self.diagnostics = Diagnostics()
         # The native receiver is created lazily on the monitor's own worker, so
         # no HTTP request thread ever touches it.
@@ -696,6 +701,7 @@ class Service:
         network request; only a real directory FID and file name from server
         metadata are ever recorded, never a window title or a guess.
         """
+        self.directories.note(parent, items)
         with self._parent_lock:
             for item in items:
                 if not isinstance(item, Mapping):
@@ -799,6 +805,7 @@ class Service:
         self._cookie = self.accounts.cookie()
         self.sessions = Sessions(self._clock)
         self.library = Library(self.accounts.data_path('library.json'))
+        self.directories = Directories(self.accounts.data_path('directories.json'))
         self.monitor = PlaybackMonitor(self.library, bookmarks=BookmarkStore(self.accounts.data_path('bookmark.json')),
                                        **self._monitor_options)
         self.diagnostics = Diagnostics()
@@ -1021,12 +1028,38 @@ class Service:
                 raise LocalIOError('无法打开精彩标记窗口') from None
 
     def bookmark_items(self) -> list[dict[str, Any]]:
-        """Upgrade known old marks using local history/listing metadata only."""
+        """Enrich directory context, retaining local marks when metadata is unavailable."""
+        self._bookmark_metadata_notice = ''
         directories = {row['fid']: (row.get('parent', ''), row.get('parent_name', '')) for row in self.library.snapshot()['recent']}
         names = self.directory_names()
         with self._parent_lock:
             directories.update({fid: (parent, names.get(parent, '')) for fid, parent in self._parents.items()})
-        self.monitor.bookmarks.set_directories(directories)
+        entries = self.monitor.bookmarks.list()
+        saved_entries = {entry['fid']: entry for entry in entries}
+        for entry in entries:
+            if entry.get('parent'):
+                directories.setdefault(entry['fid'], (entry['parent'], entry.get('parent_name', '')))
+        contexts = {}
+        for fid, (parent, name) in directories.items():
+            if not parent or fid not in saved_entries:
+                continue
+            if self.authenticated():
+                try:
+                    self.directories.chain(parent, self.files().info)
+                except (RemoteError, AuthenticationError):
+                    # Missing/deleted remote folders do not hide saved marks.
+                    self._bookmark_metadata_notice = ('目录信息尚未补全：当前未登录、网络不可用或处于访问冷却。已保留本地标记与已知名称，稍后刷新重试。')
+            context = self.directories.context(parent)
+            if not context['parent_name']:
+                saved_context = saved_entries[fid]
+                if saved_context.get('series_name'):
+                    contexts[fid] = {key: saved_context[key] for key in context}
+                    continue
+                context['parent_name'] = name
+                if name and context['series_name'] == '未命名剧集':
+                    context.update(series_name=name, video_prefix=name)
+            contexts[fid] = context
+        self.monitor.bookmarks.set_contexts(contexts)
         return self.monitor.bookmarks.list()
 
     def _bookmark_target_name(self, fid: str) -> str:
@@ -1062,6 +1095,7 @@ class Service:
             recent = next(row for row in self.library.snapshot()['recent'] if row['fid'] == session.fid)
             session.parent = recent['parent']
             session.parent_name = recent['parent_name']
+            session.context = self.directories.context(session.parent) if session.parent else {}
             self.monitor.stream_started(session.session)
 
     def remove_history(self, fid: str) -> None:
@@ -1094,6 +1128,7 @@ class Service:
             session = self.sessions.create(media)
             session.parent = self.parent_of(media.fid)
             session.parent_name = self.parent_name_of(media.fid)
+            session.context = self.directories.context(session.parent) if session.parent else {}
             return session
 
     # -- lifecycle -------------------------------------------------------
@@ -1269,6 +1304,14 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 payload = page(service.files(), parent, number, size)
             service.note_directory(parent, payload["items"])
+            try:
+                chain = service.directories.chain(parent, service.files().info)
+                payload['up'] = chain[-1]['parent'] if chain else '0'
+                payload['path'] = chain
+            except (RateLimitError, AccessRestrictedError):
+                raise
+            except RemoteError:
+                payload['navigation_error'] = '上级目录信息暂不可用，请刷新重试'
             return self._json(200, payload)
         if route == "/v1/playlist":
             if method not in ("GET", "HEAD"):
@@ -1279,6 +1322,7 @@ class _Handler(BaseHTTPRequestHandler):
             start = require_fid(start_value, label="start") if start_value is not None else None
             resolved, items = playlist(service.files(), parent, start)
             service.note_directory(resolved, items)
+            service.directories.chain(resolved, service.files().info)
             return self._json(200, {"parent": resolved, "items": items})
         if route == "/v1/play":
             if method != "POST":
@@ -1494,10 +1538,11 @@ class _Handler(BaseHTTPRequestHandler):
             parent = _first(query, "parent", None)
             if parent is not None:
                 parent = require_fid(parent, label="parent", allow_root=True)
-                items = [entry for entry in items if entry.get('parent') == parent]
+                items = [entry for entry in items if entry.get('parent') == parent or entry.get('series_fid') == parent]
             if _first(query, 'unclassified', '') == '1':
                 items = [entry for entry in items if not entry.get('parent')]
-            return self._json(200, {"items": items, **({'groups': bookmark_groups(items)} if fid is None else {})})
+            return self._json(200, {"items": items, **({'groups': bookmark_groups(items)} if fid is None else {}),
+                                    **({'metadata_notice': service._bookmark_metadata_notice} if service._bookmark_metadata_notice else {})})
         if route == "/v1/bookmarks/add":
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
@@ -1625,12 +1670,38 @@ class _Handler(BaseHTTPRequestHandler):
 
         def on_chunk(count: int) -> None:
             ensure_current()
+            gate.consume(count)
             # Counted only after a successful socket write; every chunk, including
             # a repeated seek over the same range, counts again.
             diagnostics.transferred(session.session, count)
 
         sent = False
         start, end = byte_range if byte_range is not None else (0, session.size - 1)
+        gate = ReadAhead(size=session.size, start=start, budget=session.buffer_budget)
+        bound = self._stream_monitor.buffer_state(session.session) is not None
+
+        def wait_for_buffer(offset):
+            while True:
+                ensure_current()
+                row = self._stream_monitor.buffer_state(session.session)
+                if row is None:
+                    if bound:
+                        self.close_connection = True
+                        return False
+                    row = {'state': 'unavailable', 'position_ms': 0, 'duration_ms': 0}
+                if row['state'] in ('stopped', 'missing', 'mismatch'):
+                    self.close_connection = True
+                    return False
+                if gate.allowance(offset, row) > 0:
+                    return True
+                # A seek/close can leave a paused response waiting for a clock;
+                # detect its peer closing instead of retaining an idle worker.
+                ready, _, _ = select.select([self.connection], [], [], .2)
+                if ready and not self.connection.recv(1, socket.MSG_PEEK):
+                    self.close_connection = True
+                    return False
+                if ready:
+                    time.sleep(.1)
         try:
             if end - start + 1 > MEDIA_SEGMENT:
                 # One large ask is throttled by the origin; take the same bytes
@@ -1639,6 +1710,8 @@ class _Handler(BaseHTTPRequestHandler):
                 while position <= end:
                     ensure_current()
                     stop = min(position + MEDIA_SEGMENT - 1, end)
+                    if not wait_for_buffer(position):
+                        return
                     with open_content(
                         client, session, (position, stop), refetch, on_origin=on_origin
                     ) as response:
@@ -1647,7 +1720,8 @@ class _Handler(BaseHTTPRequestHandler):
                         if not sent:
                             self._stream_headers(session, byte_range, end - start + 1)
                             sent = True
-                        if not self._forward(response, length, on_started=record_once, on_chunk=on_chunk):
+                        if not self._forward(response, length, on_started=record_once, on_chunk=on_chunk,
+                                             before_chunk=lambda written: wait_for_buffer(position + written)):
                             return
                     position = stop + 1
                 return
@@ -1658,7 +1732,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._pin_version(session, response)
                 self._stream_headers(session, byte_range if status == 206 else None, length, status=status, header=header)
                 sent = True
-                self._forward(response, length, on_started=record_once, on_chunk=on_chunk)
+                self._forward(response, length, on_started=record_once, on_chunk=on_chunk,
+                              before_chunk=lambda written: wait_for_buffer(start + written))
         except (QuarkError, httpx.HTTPError) as exc:
             if sent:
                 # The body is already in flight; only an aborted connection is
@@ -1728,6 +1803,7 @@ class _Handler(BaseHTTPRequestHandler):
         *,
         on_started: Callable[[], None] | None = None,
         on_chunk: Callable[[int], None] | None = None,
+        before_chunk: Callable[[int], bool] | None = None,
     ) -> bool:
         """Copy exactly ``length`` bytes; ``False`` means the body stopped short.
 
@@ -1743,6 +1819,8 @@ class _Handler(BaseHTTPRequestHandler):
         written = 0
         try:
             for chunk in response.iter_raw(CHUNK_SIZE):
+                if before_chunk is not None and not before_chunk(written):
+                    return False
                 if not chunk:
                     continue
                 remaining = length - written

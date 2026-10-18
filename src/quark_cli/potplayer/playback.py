@@ -327,10 +327,18 @@ class PlaybackMonitor:
                     "duration_ms": binding.last_duration,
                     "state": binding.state,
                     "message": binding.message,
-                    **({'parent': binding.session.parent} if directories else {}),
+                    **({'parent': binding.session.parent, 'series_fid': binding.session.context.get('series_fid', '')} if directories else {}),
                 }
                 for binding in sorted(self._bindings.values(), key=lambda item: item.player_pid)
             ]
+
+    def buffer_state(self, session_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            binding = next((row for row in self._bindings.values() if row.session.session == session_id), None)
+            if binding is None:
+                return None
+            return {'state': binding.state if binding.active else 'stopped',
+                    'position_ms': binding.last_position, 'duration_ms': binding.last_duration}
 
     def restart(self, player_pid: int, fid: str) -> bool:
         """Restart one binding from the top and report the real, confirmed result.
@@ -695,7 +703,7 @@ class PlaybackMonitor:
                     # unchanged paused frame from repeating the IO.
                     writing = now - binding.last_save_at >= SAVE_INTERVAL or (
                         status == 1 and not binding.paused_seen
-                    )
+                    ) or (position * 100 > duration * 90 and binding.last_saved_position * 100 <= duration * 90)
                     binding.paused_seen = status == 1
                     if writing and position > 0 and position != binding.last_saved_position:
                         decisions.append(("write", player_pid, generation, fid, size, position, duration))
@@ -824,7 +832,8 @@ class PlaybackMonitor:
                 return None
             try:
                 return self.bookmarks.add(fid, name, size, position, duration, task.note,
-                                          parent=binding.session.parent, parent_name=binding.session.parent_name)
+                                          parent=binding.session.parent, parent_name=binding.session.parent_name,
+                                          context=binding.session.context)
             except LocalIOError as exc:
                 task.error = exc
                 return None

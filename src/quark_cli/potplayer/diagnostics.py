@@ -72,7 +72,7 @@ from typing import Any, Callable
 from ..errors import LocalIOError
 from . import SERVICE_VERSION
 
-RELEASE = "0.11.0"
+RELEASE = "0.12.0"
 PROTOCOL = SERVICE_VERSION
 SCHEMA_VERSION = 1
 MAX_SESSIONS = 128

@@ -6,7 +6,7 @@ The extensions compute the launcher path themselves::
     launcher = folder + "\\\\..\\\\..\\\\quark-potplayer.exe"     # <PotPlayer>\\Extension
     result = HostExecuteProgram(launcher, "--ensure-service")
 
-The bridge itself is installed per user under ``%LOCALAPPDATA%\\QuarkPotPlayer\\app``,
+The bridge itself is installed under ``<PotPlayer>\\Plugin\\QuarkPotPlayer\\app``,
 so this small executable sits next to the player's ``Extension`` folder and forwards
 ``argv`` to the bridge, re-passing our own standard handles so the bridge's stdout
 (the ``--ensure-service`` JSON line) reaches PotPlayer unchanged; the exit code is
@@ -256,6 +256,9 @@ def emit_player_pid(pid: int) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv if argv is None else argv)
+    if '--uninstall' in args[1:] or (getattr(sys, 'frozen', False) and Path(sys.executable).name.lower() == 'uninstall.exe'):
+        from uninstall_entry import main as uninstall_main
+        return uninstall_main(args[1:])
     if PID_ACTION in args[1:]:
         emit_player_pid(resolve_player_pid())
         return 0

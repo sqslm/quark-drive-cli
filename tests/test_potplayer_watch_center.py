@@ -136,7 +136,7 @@ class HighlightsCase(_Case):
     def test_directory_first_page_combines_series_with_one_upstream_read(self):
         self.api("GET", "/v1/files?parent=root-dir")
         self.api("GET", "/v1/series?parent=root-dir")
-        self.assertEqual(len(self.fixture.requests), 2)
+        self.assertEqual(len([r for r in self.fixture.requests if r.url.path.endswith('/file/sort')]), 2)
         self.fixture.requests.clear()
         response = self.api("GET", "/v1/files?parent=root-dir&include_series=1")
         self.assertEqual(response.status_code, 200)
@@ -155,7 +155,7 @@ class HighlightsCase(_Case):
         self.assertEqual(len(payload["items"]), 50)
         self.assertTrue(payload["has_more"])
         self.assertEqual(payload["series"]["total"], 205)
-        self.assertEqual(len(self.fixture.requests), 3)
+        self.assertEqual(len([r for r in self.fixture.requests if r.url.path.endswith('/file/sort')]), 3)
 
     def test_marker_play_resolves_saved_video_and_binds_the_requested_point(self):
         entry = self.service.monitor.bookmarks.add("v2", "第2集.mp4", self.SIZE, 60_000, 1_800_000, "对白")

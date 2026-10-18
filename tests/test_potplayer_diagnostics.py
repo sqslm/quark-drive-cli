@@ -263,7 +263,7 @@ class SanitizationTests(unittest.TestCase):
         diag, _ = _make()
         report = diag.report(credential_present=True)
         self.assertEqual(report["schema_version"], 1)
-        self.assertEqual(report["release"], "0.11.0")
+        self.assertEqual(report["release"], "0.12.0")
         self.assertEqual(report["protocol"], "1")
         self.assertEqual(
             set(report),

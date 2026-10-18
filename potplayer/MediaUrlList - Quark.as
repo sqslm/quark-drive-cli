@@ -73,7 +73,7 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "0.11.0";
+	return "0.12.0";
 }
 
 string GetDesc()
@@ -784,7 +784,7 @@ array<dictionary> QuarkDirectoryList(string PathToken, string page, bool favorit
 
 	string request = "/v1/files?parent=" + HostUrlEncode(parent) + "&page=" + HostUrlEncode(page);
 	// 我的网盘根目录保持分页，不为首屏扫描整份网盘；非根目录才合并剧集状态。
-	if (!PathToken.empty() && page == "1") request += "&include_series=1";
+	if (!PathToken.empty() && PathToken != "0" && page == "1") request += "&include_series=1";
 	string response = QuarkRequest(request, "");
 	string message;
 
@@ -798,12 +798,19 @@ array<dictionary> QuarkDirectoryList(string PathToken, string page, bool favorit
 
 	bool first = page == "1";
 
-	if (!PathToken.empty() && first)
+	if (!PathToken.empty() && PathToken != "0" && first)
 	{
 		dictionary up;
 
 		up["title"] = "..";
-		up["folder"] = "parent";
+		up["folder"] = "1";
+		JsonValue ancestor = root["up"];
+		if (ancestor.isString()) up["PathToken"] = ancestor.asString();
+		else
+		{
+			up["title"] = "上级目录信息暂不可用 · 刷新重试";
+			up["PathToken"] = PathToken;
+		}
 		ret.insertLast(up);
 
 		JsonValue favorite = root["favorite"];
