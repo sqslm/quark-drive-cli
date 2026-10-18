@@ -26,6 +26,8 @@
 // array<dictionary> SubtitleSearch(string MovieFileName, dictionary MovieMetaData)	-> search subtitle
 // string SubtitleDownload(string id)												-> download subtitle
 
+string QUARK_ACCOUNT_SCOPE = "";
+
 string QUARK_VIDEO_PREFIX = "https://quark.invalid/video/";
 string QUARK_PLAY_PREFIX = "https://quark.invalid/play/";
 
@@ -43,7 +45,7 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "0.9.0";
+	return "0.10.0";
 }
 
 string GetDesc()
@@ -229,7 +231,10 @@ string QuarkRequest(string path, string body)
 
 		if (base.empty() || token.empty()) return "";
 
-		string response = HostUrlGetString(base + path, "", QuarkHeader(token, post), body, true);
+		string header = QuarkHeader(token, post);
+		if (path.find("/v1/auth") != 0 && !QUARK_ACCOUNT_SCOPE.empty())
+			header += "X-Quark-Account: " + QUARK_ACCOUNT_SCOPE + "\r\n";
+		string response = HostUrlGetString(base + path, "", header, body, true);
 
 		if (response.empty()) return "";
 
@@ -334,6 +339,8 @@ string QuarkFid(const string &in path, const string &in prefix)
 	if (path.find(prefix) != 0) return "";
 
 	string fid = path.substr(prefix.length());
+	int account = fid.find("?account=");
+	if (account >= 0) fid = fid.Left(account);
 
 	if (!QuarkValidId(fid)) return "";
 	return fid;
@@ -380,8 +387,21 @@ string QuarkStreamSession(const string &in source)
 }
 
 // 当前播放的夸克视频：优先逻辑链接，其次是本机回环播放地址；两者都不是时返回 false。
+string QuarkAccountOf(const string &in path)
+{
+    int offset = path.find("?account=");
+    if (offset < 0) return "";
+    string value = path.substr(offset + 9);
+    if (value.length() != 64) return "invalid";
+    string hex = "0123456789abcdef";
+    for (int index = 0; index < value.length(); index++)
+        if (hex.find(value.substr(index, 1)) < 0) return "invalid";
+    return value;
+}
+
 bool QuarkCurrentVideo(string source, string &out fid, string &out session)
 {
+	QUARK_ACCOUNT_SCOPE = QuarkAccountOf(source);
 	fid = "";
 	session = "";
 
@@ -434,6 +454,8 @@ array<dictionary> SubtitleSearch(string MovieFileName, dictionary MovieMetaData)
 
 	if (!reader.parse(response, root) || !root.isObject()) return ret;
 
+	JsonValue account = root["account_id"];
+	if (account.isString()) QUARK_ACCOUNT_SCOPE = account.asString();
 	JsonValue items = root["items"];
 
 	if (!items.isArray()) return ret;
@@ -455,6 +477,7 @@ array<dictionary> SubtitleSearch(string MovieFileName, dictionary MovieMetaData)
 
 		// id 前缀让 SubtitleDownload 能识别回本插件的列表项；title 用真实文件名。
 		row["id"] = QUARK_SUBTITLE_ID_PREFIX + id.asString();
+		if (!QUARK_ACCOUNT_SCOPE.empty()) row["id"] = QUARK_SUBTITLE_ID_PREFIX + id.asString() + "?account=" + QUARK_ACCOUNT_SCOPE;
 		row["title"] = name.asString();
 
 		JsonValue format = item["format"];
@@ -474,7 +497,10 @@ string SubtitleDownload(string id)
 {
 	if (id.find(QUARK_SUBTITLE_ID_PREFIX) != 0) return "";
 
+	QUARK_ACCOUNT_SCOPE = QuarkAccountOf(id);
 	string fid = id.substr(QUARK_SUBTITLE_ID_PREFIX.length());
+	int account = fid.find("?account=");
+	if (account >= 0) fid = fid.Left(account);
 
 	if (!QuarkValidId(fid)) return "";
 
@@ -491,7 +517,9 @@ string SubtitleDownload(string id)
 
 		if (base.empty() || token.empty()) return "";
 
-		string text = HostUrlGetString(base + "/v1/subtitle?fid=" + HostUrlEncode(fid), "", QuarkHeader(token, false), "", true);
+		string header = QuarkHeader(token, false);
+		if (!QUARK_ACCOUNT_SCOPE.empty()) header += "X-Quark-Account: " + QUARK_ACCOUNT_SCOPE + "\r\n";
+		string text = HostUrlGetString(base + "/v1/subtitle?fid=" + HostUrlEncode(fid), "", header, "", true);
 
 		if (text.empty()) return "";
 

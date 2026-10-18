@@ -1,4 +1,4 @@
-"""Standalone Tk status window for the PotPlayer bridge (release 0.9.0).
+"""Standalone Tk status window for the PotPlayer bridge (release 0.10.0).
 
 The service owns the bridge; this module only *observes* it. It loads the
 bridge's private runtime record (``plugin_state.read_runtime``), confirms that
@@ -321,6 +321,7 @@ class BridgeClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._endpoint = endpoint
+        self.account_id: str | None = None
         # ``trust_env=False``: environment proxies must never rewrite loopback.
         self._client = httpx.Client(
             base_url=endpoint.base_url,
@@ -359,7 +360,7 @@ class BridgeClient:
         """Ask the bridge to restart one binding; returns ``(ok, fixed message)``."""
         try:
             response = self._client.post(
-                RESTART_PATH, json={"player_pid": player_pid, "fid": fid}
+                RESTART_PATH, json={"player_pid": player_pid, "fid": fid}, headers=self._account_header()
             )
             status = response.status_code
             payload = response.json()
@@ -376,7 +377,7 @@ class BridgeClient:
 
     def _get_object(self, path: str) -> dict[str, Any] | None:
         try:
-            response = self._client.get(path)
+            response = self._client.get(path, headers=self._account_header())
             if response.status_code != 200:
                 return None
             payload = response.json()
@@ -424,10 +425,22 @@ class BridgeClient:
         message) can ever reach the window; failures are a plain ``False``.
         """
         try:
-            response = self._client.post(path, json=body)
+            response = self._client.post(path, json=body, headers=self._account_header())
         except httpx.HTTPError:
             return False
         return 200 <= response.status_code < 300
+
+    def _account_header(self):
+        return {} if self.account_id is None else {'X-Quark-Account': self.account_id}
+
+    def account_action(self, action: str, key: str | None):
+        path = '/v1/auth/login' if action == 'login' else '/v1/accounts/' + action
+        try:
+            response = self._client.post(path, json={'id': key}, timeout=30.0,
+                                         headers=self._account_header())
+            return 200 <= response.status_code < 300
+        except httpx.HTTPError:
+            return False
 
 
 # -- worker -------------------------------------------------------------
@@ -466,6 +479,13 @@ class BridgeWorker:
         self._interval = interval
         self._stop = stop if stop is not None else threading.Event()
         self.polls = 0
+        self._scope: str | None = None
+
+    def _emit(self, kind, value):
+        if self._scope is not None:
+            self._events.put(('scoped', (self._scope, kind, value)))
+        else:
+            self._events.put((kind, value))
 
     def cancel(self) -> None:
         self._stop.set()
@@ -498,35 +518,51 @@ class BridgeWorker:
 
     def _serve(self, request: tuple) -> None:
         kind = request[0] if request else None
+        if kind == 'scoped':
+            _, scope, command = request
+            self._scope = scope
+            self._client.account_id = scope
+            try:
+                self._serve(command)
+            finally:
+                self._scope = None
+                self._client.account_id = None
+            return
+        if kind == 'account':
+            ok = self._client.account_action(request[1], request[2])
+            self._emit('account_done', (request[1], ok))
+            self._client.account_id = None
+            self.tick()
+            return
         if kind == "export":
             self._export(request[1])
         elif kind == "restart":
             ok, message = self._client.restart(request[1], request[2])
-            self._events.put(("restart_done", (ok, message)))
+            self._emit("restart_done", (ok, message))
         elif kind == "bookmarks":
             _, player_pid, fid = request
             items = self._client.bookmarks(fid)
-            self._events.put(("bookmarks", (player_pid, fid, items)))
+            self._emit("bookmarks", (player_pid, fid, items))
         elif kind == "bookmark_add":
             _, player_pid, fid, note = request
             ok = self._client.add_bookmark(player_pid, fid, note)
-            self._events.put(("bookmark_added", (player_pid, fid, ok)))
+            self._emit("bookmark_added", (player_pid, fid, ok))
         elif kind == "bookmark_rename":
             _, player_pid, fid, bookmark_id, note = request
             ok = self._client.rename_bookmark(bookmark_id, note)
-            self._events.put(("bookmark_renamed", (player_pid, fid, ok)))
+            self._emit("bookmark_renamed", (player_pid, fid, ok))
         elif kind == "bookmark_remove":
             _, player_pid, fid, bookmark_id = request
             ok = self._client.remove_bookmark(bookmark_id)
-            self._events.put(("bookmark_removed", (player_pid, fid, ok)))
+            self._emit("bookmark_removed", (player_pid, fid, ok))
         elif kind == "bookmark_jump":
             _, player_pid, fid, bookmark_id = request
             ok = self._client.jump_bookmark(player_pid, fid, bookmark_id)
-            self._events.put(("bookmark_jumped", (player_pid, fid, ok)))
+            self._emit("bookmark_jumped", (player_pid, fid, ok))
         elif kind == "bookmark_play":
             _, player_pid, fid, bookmark_id = request
             ok = self._client.play_bookmark(bookmark_id)
-            self._events.put(("bookmark_jumped", (player_pid, fid, ok)))
+            self._emit("bookmark_jumped", (player_pid, fid, ok))
 
     def _export(self, path: str) -> None:
         report = self._client.report()
@@ -722,6 +758,15 @@ class StatusWindow:
 
         self._connected = False
         self._snapshot: dict[str, Any] | None = None
+        self._account_id: str | None = None
+        self._accounts: list[dict[str, Any]] = []
+        self._account_pending = False
+        self._accounts_tree: Any = None
+        self._accounts_notice: Any = None
+        self._current_account_var: Any = None
+        self._account_buttons: dict[str, Any] = {}
+        self._login_waiting = False
+        self._account_tab_seen = False
         self._playback: list[dict[str, Any]] = []
         self._selected: tuple[Any, Any] | None = None
         self._rows: dict[str, tuple[Any, Any]] = {}
@@ -847,6 +892,10 @@ class StatusWindow:
             self._bookmark_rename_button = None
             self._bookmark_remove_button = None
             self._bookmark_refresh_button = None
+            self._accounts_tree = None
+            self._accounts_notice = None
+            self._current_account_var = None
+            self._account_buttons = {}
 
     # -- widget construction ---------------------------------------------
 
@@ -854,7 +903,7 @@ class StatusWindow:
         from tkinter import filedialog, font as tkfont, ttk
 
         self._filedialog = filedialog
-        root.title("夸克网盘播放诊断")
+        root.title("夸克网盘插件管理")
         root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         root.minsize(MIN_WIDTH, MIN_HEIGHT)
         _apply_font(root, tkfont, ttk)
@@ -864,8 +913,19 @@ class StatusWindow:
         self._protection_var = tk.StringVar(value="—")
         self._notice_var = tk.StringVar(value="正在连接本地服务……")
 
-        outer = ttk.Frame(root, padding=10)
-        outer.pack(fill="both", expand=True)
+        tabs = ttk.Notebook(root)
+        tabs.pack(fill='both', expand=True)
+        outer = ttk.Frame(tabs, padding=10)
+        account_tab = ttk.Frame(tabs, padding=16)
+        tabs.add(outer, text='播放诊断')
+        tabs.add(account_tab, text='账号管理')
+        self._build_accounts(tk, ttk, account_tab)
+        def on_tab(_event):
+            if tabs.select() == str(account_tab) and not self._account_tab_seen and self._connected:
+                self._account_tab_seen = True
+                if self._account_id:
+                    self._account_command('refresh')
+        tabs.bind('<<NotebookTabChanged>>', on_tab)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(3, weight=3)
         outer.rowconfigure(4, weight=2)
@@ -976,6 +1036,99 @@ class StatusWindow:
 
         root.protocol("WM_DELETE_WINDOW", self._close)
 
+    def _build_accounts(self, tk, ttk, frame):
+        self._current_account_var = tk.StringVar(value='当前账号：未登录')
+        self._accounts_notice = tk.StringVar(value='切换会保留其他账号登录；退出只清除所选账号凭证。')
+        ttk.Label(frame, textvariable=self._current_account_var, font=('Microsoft YaHei UI', 13)).pack(anchor='w', pady=(0, 12))
+        self._accounts_tree = ttk.Treeview(frame, columns=('nickname', 'state', 'remaining', 'total'),
+                                          show='headings', selectmode='browse')
+        for column, title, width in (('nickname', '账号昵称', 220), ('state', '登录状态', 110),
+                                     ('remaining', '剩余容量', 150), ('total', '总容量', 150)):
+            self._accounts_tree.heading(column, text=title)
+            self._accounts_tree.column(column, width=width, stretch=True)
+        self._accounts_tree.pack(fill='both', expand=True)
+        self._accounts_tree.bind('<<TreeviewSelect>>', lambda _event: self._update_account_buttons())
+        actions = ttk.Frame(frame)
+        actions.pack(fill='x', pady=12)
+        for action, title in (('login', '扫码添加账号'), ('switch', '切换到所选账号'),
+                              ('logout', '退出所选账号'), ('refresh', '刷新当前昵称与容量')):
+            button = ttk.Button(actions, text=title, command=lambda action=action: self._account_command(action))
+            button.pack(side='left', padx=(0, 8))
+            self._account_buttons[action] = button
+        ttk.Label(frame, textvariable=self._accounts_notice, wraplength=720).pack(anchor='w')
+        ttk.Label(frame, text='容量为最近一次查询结果。切换会中断旧播放，请从网盘根目录重新打开视频。\n'
+                              '最近观看、进度、收藏和精彩标记按账号保存；退出账号保留本机记录。',
+                  wraplength=720, justify='left').pack(anchor='w', pady=(12, 0))
+        self._update_account_buttons()
+
+    def _refresh_accounts(self, snapshot):
+        payload = snapshot.get('accounts')
+        if not isinstance(payload, dict) or self._accounts_tree is None:
+            return
+        self._accounts = payload.get('items', [])
+        self._login_waiting = snapshot.get('login_state') == 'waiting'
+        selected = self._accounts_tree.selection()
+        self._accounts_tree.delete(*self._accounts_tree.get_children())
+        current_name = '未登录'
+        for row in self._accounts:
+            key = row['id']
+            capacity = row.get('capacity')
+            capacity = capacity if isinstance(capacity, dict) else {}
+            total, used = capacity.get('total_bytes'), capacity.get('used_bytes')
+            remaining = max(0, total - used) if type(total) is int and type(used) is int else None
+            state = '当前账号' if row['current'] else ('已登录' if row['logged_in'] else '已退出 / 已失效')
+            self._accounts_tree.insert('', 'end', iid=key,
+                                       values=(row['nickname'], state, format_bytes(remaining), format_bytes(total)))
+            if row['current']:
+                current_name = row['nickname']
+        self._current_account_var.set('当前账号：' + current_name)
+        target = next((key for key in selected if self._accounts_tree.exists(key)), None) or payload.get('active')
+        if target:
+            self._accounts_tree.selection_set(target)
+        if self._login_waiting:
+            self._accounts_notice.set('等待扫码确认；关闭扫码窗口可取消，原账号保持登录。')
+        elif not self._account_pending and self._accounts_notice.get().startswith('等待扫码'):
+            self._accounts_notice.set('扫码已结束；账号列表已更新。')
+        self._update_account_buttons()
+
+    def _update_account_buttons(self):
+        if self._accounts_tree is None:
+            return
+        selection = self._accounts_tree.selection()
+        row = next((row for row in self._accounts if selection and row['id'] == selection[0]), None)
+        ready = self._connected and not self._account_pending and not self._login_waiting
+        for action, button in self._account_buttons.items():
+            enabled = ready
+            if action == 'switch':
+                enabled = enabled and row is not None and row['logged_in'] and not row['current']
+            elif action == 'logout':
+                enabled = enabled and row is not None and row['logged_in']
+            elif action == 'refresh':
+                enabled = enabled and bool(self._account_id)
+            button.state(['!disabled' if enabled else 'disabled'])
+
+    def _queue_command(self, command):
+        if self._account_id is None:
+            self._requests.put(command)
+        else:
+            self._requests.put(('scoped', self._account_id, command))
+
+    def _account_command(self, action):
+        if not self._connected or self._account_pending or self._login_waiting:
+            return
+        selection = self._accounts_tree.selection()
+        key = selection[0] if selection else None
+        if action in ('switch', 'logout') and not key:
+            return
+        self._account_pending = True
+        self._accounts_notice.set('正在处理账号操作……')
+        # Clear old mark targets immediately; queued operations still carry the
+        # old account header and will be refused if a switch has already won.
+        if action in ('switch', 'logout'):
+            self._close_bookmarks()
+        self._queue_command(('account', action, key))
+        self._update_account_buttons()
+
     # -- Tk-thread event handling ----------------------------------------
 
     def _pump(self) -> None:
@@ -995,6 +1148,19 @@ class StatusWindow:
             self._pump_id = root.after(200, self._pump)
 
     def _handle(self, kind: str, value: Any) -> None:
+        if kind == 'scoped':
+            scope, event, payload = value
+            if scope == self._account_id:
+                self._handle(event, payload)
+            return
+        if kind == 'account_done':
+            self._account_pending = False
+            action, ok = value
+            if self._accounts_notice is not None:
+                self._accounts_notice.set(('已打开扫码窗口，请在手机上确认' if action == 'login' else '账号操作已完成')
+                                          if ok else '账号操作失败，请检查登录状态或稍后重试')
+            self._update_account_buttons()
+            return
         if kind == "snapshot":
             self._apply_snapshot(value)
         elif kind == "failed":
@@ -1033,6 +1199,16 @@ class StatusWindow:
 
     def _apply_snapshot(self, snapshot: dict[str, Any]) -> None:
         self._connected = True
+        account_id = (snapshot.get('account_id') or '') if 'account_id' in snapshot else self._account_id
+        if self._account_id is not None and self._account_id != account_id:
+            self._close_bookmarks()
+            self._selected = None
+            self._external = None
+            self._last_request_id = None
+            self._restart_pending = False
+            self._account_pending = False
+        self._account_id = account_id
+        self._refresh_accounts(snapshot)
         self._snapshot = snapshot
         playback = snapshot.get("playback")
         self._playback = playback if isinstance(playback, list) else []
@@ -1078,6 +1254,7 @@ class StatusWindow:
     def _show_disconnected(self) -> None:
         self._connected = False
         self._snapshot = None
+        self._update_account_buttons()
         self._playback = []
         self._external = None
         self._transfer_var.set("—")
@@ -1256,7 +1433,7 @@ class StatusWindow:
         self._restart_pending = True
         self._notice_var.set("正在请求从头开始播放……")
         self._update_actions()
-        self._requests.put(("restart", row.get("player_pid"), row.get("fid")))
+        self._queue_command(("restart", row.get("player_pid"), row.get("fid")))
 
     def _export(self) -> None:
         if not self._connected:
@@ -1546,7 +1723,7 @@ class StatusWindow:
             self._bookmark_notice(_BOOKMARK_LOADING)
         self._update_bookmark_actions()
         self._update_actions()
-        self._requests.put(("bookmarks", player_pid, fid))
+        self._queue_command(("bookmarks", player_pid, fid))
 
     def _apply_bookmarks(self, value: Any) -> None:
         """Apply a list answer, dropping any that belongs to another binding."""
@@ -1696,7 +1873,7 @@ class StatusWindow:
         self._bookmark_notice(_BOOKMARK_WORKING)
         self._update_bookmark_actions()
         self._update_actions()
-        self._requests.put(("bookmark_add", target[0], target[1], note))
+        self._queue_command(("bookmark_add", target[0], target[1], note))
 
     def _rename_bookmark(self) -> None:
         """Rename the selected bookmark's note."""
@@ -1717,7 +1894,7 @@ class StatusWindow:
         self._bookmark_notice(_BOOKMARK_WORKING)
         self._update_bookmark_actions()
         self._update_actions()
-        self._requests.put(("bookmark_rename", target[0], target[1], bookmark_id, note))
+        self._queue_command(("bookmark_rename", target[0], target[1], bookmark_id, note))
 
     def _remove_bookmark(self) -> None:
         """Remove the selected bookmark."""
@@ -1729,7 +1906,7 @@ class StatusWindow:
         self._bookmark_notice(_BOOKMARK_WORKING)
         self._update_bookmark_actions()
         self._update_actions()
-        self._requests.put(("bookmark_remove", target[0], target[1], bookmark_id))
+        self._queue_command(("bookmark_remove", target[0], target[1], bookmark_id))
 
     def _jump_bookmark(self) -> None:
         """Ask the player to seek to the selected bookmark."""
@@ -1750,7 +1927,7 @@ class StatusWindow:
                 self._bookmark_pending = target
                 self._bookmark_notice(_BOOKMARK_WORKING)
                 self._update_bookmark_actions()
-                self._requests.put(("bookmark_play", target[0], target[1], bookmark_id))
+                self._queue_command(("bookmark_play", target[0], target[1], bookmark_id))
                 return
         if target is None:
             return
@@ -1758,7 +1935,7 @@ class StatusWindow:
         self._bookmark_notice(_BOOKMARK_WORKING)
         self._update_bookmark_actions()
         self._update_actions()
-        self._requests.put(("bookmark_jump", target[0], target[1], bookmark_id))
+        self._queue_command(("bookmark_jump", target[0], target[1], bookmark_id))
 
     def _note_of(self, bookmark_id: Any) -> str:
         """The stored note of one bookmark id, used as the rename default."""

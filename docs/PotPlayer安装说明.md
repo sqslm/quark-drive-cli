@@ -10,7 +10,7 @@
 | `SHA256SUMS.txt` | 安装程序 SHA-256 |
 | `build-info.json` | 构建时间、组件版本、随包扩展脚本清单 |
 
-当前版本为 **0.8.0**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.8.0/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
+当前版本为 **0.10.0**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.10.0/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
 
 构建方式见文末“开发者构建”。
 
@@ -94,14 +94,14 @@ QuarkPotPlayer-Setup.exe --uninstall --silent [--clear-credentials]
 | 需要重新登录 | 在插件入口重新扫码；如需彻底重置，卸载时勾选清除插件凭证后重装 |
 | 卸载后有残留 | 文件被占用时先退出 PotPlayer，再删除 `%LOCALAPPDATA%\QuarkPotPlayer` |
 
-## 首版不包含
+## 当前不包含
 
-分享转存、影视海报库、转码、多账号；不实现视频落盘缓存。内嵌字幕/音轨保留原生解码与切换；同目录外挂字幕在原生“字幕搜索”里手动选择，插件自身不写字幕或视频文件。
+分享转存、影视海报库、转码；不实现视频落盘缓存。内嵌字幕/音轨保留原生解码与切换；同目录外挂字幕在原生“字幕搜索”里手动选择，插件自身不写字幕或视频文件。
 
 ## 开发者构建
 
 ```
-python packaging/potplayer/build.py                        # 读取 potplayer/*.as 生成发行包（dist/potplayer/）
+python packaging/potplayer/build.py --tag 0.10.0          # 读取 potplayer/*.as 生成 dist/potplayer/0.10.0/
 python packaging/potplayer/build.py --as-dir DIR --out-dir DIR   # 指定扩展脚本目录与输出目录
 python packaging/potplayer/build.py --component-only       # 只构建并打包组件
 python packaging/potplayer/build.py --skip-component       # 复用既有组件产物

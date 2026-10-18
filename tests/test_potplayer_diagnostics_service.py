@@ -199,7 +199,7 @@ class DiagnosticsRouteCase(_ServerCase):
         self.assertEqual(snapshot["playback"], [])
         report = self.api("GET", "/v1/diagnostics/report").json()
         self.assertEqual(report["schema_version"], 1)
-        self.assertEqual(report["release"], "0.9.0")
+        self.assertEqual(report["release"], "0.10.0")
         # No account/API request was made by either projection.
         self.assertEqual(self.fixture.requests, [])
 
@@ -282,6 +282,7 @@ class CredentialStateCase(_ServerCase):
         self.assertEqual(self.account()["validation"], "expired")
         # A new saved credential is a credential change: unverified again.
         plugin_state.store_cookie("b=2; __puus=other")
+        self.api("GET", "/v1/auth")
         self.service.client()
         self.assertEqual(self.account()["validation"], "saved_unverified")
         self.assertIsNone(self.account()["last_success_at"])

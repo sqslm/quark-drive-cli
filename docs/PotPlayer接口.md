@@ -34,10 +34,10 @@
 返回插件凭证状态：
 
 ```json
-{"authenticated":false,"login_state":"idle","login_message":null,"qr_png":null}
+{"authenticated":false,"login_state":"idle","login_message":null,"qr_png":null,"account_id":null}
 ```
 
-- `authenticated`：插件凭证文件是否存在（本地判断，不联网校验）。
+- `authenticated`：当前账号是否有已保存凭证（本地判断，不联网校验）。`account_id` 为当前账号的本机不透明标识，未选择账号时为 `null`。
 - `login_state`：`idle`（未开始或已取消）、`waiting`（窗口已打开，等待扫码）、`success`（凭证已保存）、`failed`（失败，见 `login_message`）。
 - `login_message`：失败原因（中文，可直接展示）。
 - `qr_png`：等待期间二维码图片的临时路径；窗口自己展示，扩展可忽略。
@@ -57,11 +57,29 @@
 
 ### `POST /v1/auth/logout`
 
-清除插件凭证（磁盘上的插件凭证文件与进程内注入的会话一并失效），返回 `{"authenticated": false}`。只删除插件自己的凭证，绝不读取或删除 `quark` CLI 的 Cookie。
+清除当前插件账号凭证并使旧播放会话失效，保留该账号本机观看数据，返回 `{"authenticated": false}`。只删除插件自己的凭证，绝不读取或删除 `quark` CLI 的 Cookie。
 
 ### 请求体处理
 
 `auth/login`、`auth/logout`、`shutdown` 不接受请求体；若客户端仍带 `Content-Length`，服务会读完这段有界请求体后再响应，避免污染同一 keep-alive 连接上的下一次请求（无请求体的 `POST` 亦正常）。请求体上限 `64 KiB`，超出则关闭连接。
+
+## 账号管理与请求隔离（0.10.0）
+
+下列接口均需本地 Bearer；返回的账号列表仅含 `active` 和 `items`。每行字段为 `id`、`nickname`、`logged_in`、`current`、`capacity`；容量是缓存的 `{used_bytes,total_bytes}` 或 `null`，剩余量取 `max(0,total_bytes-used_bytes)`，从不返回 Cookie 或原始 UID。
+
+| 接口 | 行为 |
+| --- | --- |
+| `GET /v1/accounts` | 读取已保存账号与当前账号，只读本地 |
+| `POST /v1/accounts/switch`，`{"id":"..."}` | 切换已登录账号，保留其他凭证；已退出账号返回 400 |
+| `POST /v1/accounts/logout`，`{"id":"..."}` | 清除所选账号凭证；退出非当前账号不影响当前播放 |
+| `POST /v1/accounts/refresh`，`{}` | 读取当前昵称与容量并更新缓存；只查询当前账号 |
+| `POST /v1/auth/login` | 扫码添加或重新登录，成功后激活该账号；取消保持当前账号 |
+
+- `/v1/diagnostics` 增加本地 `account_id`、`accounts`、`login_state`，供标签页刷新；诊断导出白名单不变，不包含账号列表、昵称或容量。
+- 目录、分页、逻辑播放链接和字幕选项携带账号标识；请求用 `X-Quark-Account` 指明来源账号。与当前账号不同返回 `409 account_changed`，提示从根目录重新打开。存在多个账号时，缺少账号归属的数据请求同样拒绝；唯一随机播放会话可用于字幕查询，返回所属 `account_id` 后绑定字幕选项。
+- 控制请求与切换互斥。旧流固定使用原客户端，迟到刷新不借用新账号凭证；切换撤销旧会话，旧观看写入被拒绝，旧客户端在最后一个流退出后关闭。
+- 账号标识用扫码 Cookie 的 `__uid` 摘要生成；缺失 UID 时按整份凭证摘要单独建档，绝不按昵称合并。相同 UID 重新扫码仍使用原数据目录。
+- 升级时，原 `library.json` / `bookmark.json` 仅归属导入旧凭证的那个账号，继续保留原路径。没有凭证时的旧文件不自动归给新账号。
 
 ## 目录与播放列表
 
@@ -219,8 +237,8 @@
 ### 写入时机与数据边界
 
 - 最近记录在**首个非空媒体块成功转发之后**写入，不等整集传输结束：取链、`HEAD`、未转发任何媒体字节的失败 `GET` 不记录。已经开始传输后再关闭、拖动或遇到上游中断，已写入的记录仍保留；每个 HTTP 请求只记一次，不按分段或数据块重复写盘。
-- 收藏与最近观看存放在插件私有目录 `config_directory()/potplayer/library.json`（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。文件版本 2 起，最近观看条目另含观看进度字段 `position_ms`、`duration_ms`、`progress_at`（本机时间）；版本 3 起另含真实 `parent` 目录 FID，并新增独立的 `marks` 列表保存显式“已看”标记（不受 100 条最近上限影响）；`marks` 按 FID **和大小** 记录，FID 被替换成不同大小的文件时不会继承旧的已看标记。版本 4 起，最近观看条目另存真实目录名 `parent_name`：它只取自桥接**已经拉取过**的目录清单或“收藏目录”，从不使用窗口标题、从不猜测剧名、也不为此新增任何云端请求；`/v1/recent` 与 `/v1/continue` 的 `display` 因此显示“目录名 / 原文件名”，无法确认所属目录（含根目录，`parent` 为 `0`）时保留原文件名。版本 1/2/3 记录可正常读取，读取时不改写文件，仅在下次正常写入时才就地升级为版本 4，既有收藏/最近观看不受影响。
-- 显式插件退出登录（`POST /v1/auth/logout`）会一并清空这两份列表及其中的观看进度；本地清理失败时返回 `500 local_io_error`，凭证仍已失效，不误报清理成功。登录过期只要求重新扫码，不清空。跨进程重启与升级保留。
+- 收藏与最近观看存放在账号私有目录 `config_directory()/potplayer/accounts/<account_id>/library.json`（升级导入账号沿用原 `potplayer/library.json`）（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。文件版本 2 起，最近观看条目另含观看进度字段 `position_ms`、`duration_ms`、`progress_at`（本机时间）；版本 3 起另含真实 `parent` 目录 FID，并新增独立的 `marks` 列表保存显式“已看”标记（不受 100 条最近上限影响）；`marks` 按 FID **和大小** 记录，FID 被替换成不同大小的文件时不会继承旧的已看标记。版本 4 起，最近观看条目另存真实目录名 `parent_name`：它只取自桥接**已经拉取过**的目录清单或“收藏目录”，从不使用窗口标题、从不猜测剧名、也不为此新增任何云端请求；`/v1/recent` 与 `/v1/continue` 的 `display` 因此显示“目录名 / 原文件名”，无法确认所属目录（含根目录，`parent` 为 `0`）时保留原文件名。版本 1/2/3 记录可正常读取，读取时不改写文件，仅在下次正常写入时才就地升级为版本 4，既有收藏/最近观看不受影响。
+- 切换、退出与登录过期均保留各账号的本机数据。退出仅移除所选账号凭证；切回或重新登录同一账号后读取其独立记录。
 - `/v1/watch-center`、`/v1/recent/remove`、本机 `/v1/bookmarks` 查看与编辑接口 与 `/v1/diagnostics*` 都只要求本地 Bearer，**不需要**夸克登录：`watch-center` 只读本地 `library.json`（不扫盘、不联网）；`recent/remove` 只删本地那一条观看记录，不动云端文件、收藏、`marks` 或精彩标记；`bookmarks/open` 只打开本机窗口。自动播放接口 `/v1/bookmarks/play` 和带 parent 的标记筛选需要登录。它们都不改变视频落盘策略：无分片、无磁盘缓存、无转码、无后台扫描，也不存在向云端回传记录或报告的步骤。
 
 ## 播放流
@@ -265,7 +283,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.9.0", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.10.0", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -313,7 +331,7 @@
 
 以下原有接口继续可用：
 
-需 Bearer；查看、修改备注、删除和打开管理窗口不要求夸克登录，记录存于原 `bookmark.json`。添加时间点仍取本机播放器的实时采样；自动打开未播放视频需要有效夸克登录。
+需 Bearer；查看、修改备注、删除和打开管理窗口不要求夸克登录，记录存于对应账号的 `bookmark.json`。添加时间点仍取本机播放器的实时采样；自动打开未播放视频需要有效夸克登录。
 
 - `GET /v1/bookmarks?fid=<视频 fid>` → `{"items":[{"id":"…","fid":"…","name":"…","size":123,"position_ms":0,"duration_ms":0,"note":""}]}`。`fid` 可省略以列出全部，最近添加在前；无精彩标记时 `items` 为空数组。
 - `POST /v1/bookmarks/add`，请求体 `{"player_pid":1234,"fid":"…","note":"…"}`（`player_pid` 为**严格 JSON 整数**，`note` 为字符串、最长 200 个字符、**可以为空**）→ `200 {"bookmark":{…}}`。时间点与时长取自播放器的实时采样，**不信任**客户端提供的时间、名称或大小。
@@ -324,7 +342,7 @@
 
 `add`/`jump` 只对**当前正在播放同一逻辑文件**的绑定生效，并核对实时身份：该 PID 没有绑定、播放器中的文件不符、同一 fid 被多实例打开、或本机缺少原生读取能力时返回 `409 media_changed`；`add` 在位置无效（为 0 或已在结尾）时同样失败，但它始终记录当前文件的真实时间点，因此文件换了大小/时长后仍可对新文件添加精彩标记；`jump` 额外在精彩标记保存的大小/时长与当前文件明显不符时失败（指向旧文件的旧精彩标记因此不可跳转）。参数、`fid`、`id` 或备注非法（含 `note` 非字符串或超过 200 字符）→ `400 bad_request`；写入路由只接受 `POST`，任何其它方法（含 `HEAD`）都只会得到 `405 method_not_allowed`，不会执行写入。`GET`/`rename`/`remove` 只读写本地文件，不访问夸克；`add`/`jump` 也不产生额外的云请求。
 
-精彩标记存放在同目录的独立小文件 `bookmark.json`（与 `library.json` 分开，见下），**不**进入诊断报告；显式退出登录会一并清空，登录过期不清。
+精彩标记存放在账号目录的独立小文件 `bookmark.json`（升级导入账号沿用原路径）（与 `library.json` 分开，见下），**不**进入诊断报告；切换、退出及登录过期均保留。
 
 > 通用约定：本地令牌无效 → `401 unauthorized`；参数非法 → `400 bad_request`；方法不被支持 → `405 method_not_allowed`（与既有路由一致）。这些接口只要求本地 Bearer，不要求夸克登录，因此在未登录、登录过期或冷却中仍可用于查看状态与导出报告。
 
@@ -387,15 +405,16 @@
 | `remote_error` | 502 | 上游（夸克）返回错误 |
 | `network_error` | 504 | 上游网络失败/超时 |
 | `local_io_error` | 500 | 本地读写失败 |
+| `account_changed` | 409 | 账号已切换或旧链接缺少账号归属 |
 | `internal_error` | 500 | 未分类内部错误 |
 
 ## 凭证与数据边界
 
-- 插件凭证：`config_directory()/potplayer/cookie`，由 `QRLogin` 单独保存；`quark` CLI 的 Cookie 从不读取、写入或删除。
+- 插件账号与凭证：`config_directory()/potplayer/accounts.json`，通过现有私有状态读写及当前用户 ACL 保存。扫码先写 `login-cookie`，完成建档后删除临时凭证。旧版及独立 `--login` 的 `cookie` 在启动或下一次 `/v1/auth` 时导入；`quark` CLI 的 Cookie 从不读取、写入或删除。
 - 运行配置：同目录 `runtime.json`；单实例锁 `service.lock`。
-- 收藏、最近观看与已看标记：同目录 `library.json`，含 FID、名称、大小与本机时间，版本 2 起另含观看进度（`position_ms`/`duration_ms`/`progress_at`），版本 3 起另含真实 `parent` 目录与 `marks` 已看列表，版本 4 起另存目录名 `parent_name`（只来自已拉取的目录清单或收藏目录，零额外云请求；未知目录保留原文件名）；显式退出登录清空，过期不清、升级保留。
-- 精彩标记：同目录独立文件 `bookmark.json`（含 fid、名称、大小、时间点、时长与备注，备注最长 200 字符、可为空；不含 Cookie/令牌/签名地址）；显式退出登录一并清空，过期不清、升级保留；不进入诊断报告。
+- 收藏、最近观看与已看标记：`accounts/<account_id>/library.json`，含 FID、名称、大小与本机时间，版本 2 起另含观看进度（`position_ms`/`duration_ms`/`progress_at`），版本 3 起另含真实 `parent` 目录与 `marks` 已看列表，版本 4 起另存目录名 `parent_name`（只来自已拉取的目录清单或收藏目录，零额外云请求；未知目录保留原文件名）；切换、退出、过期与升级均保留。
+- 精彩标记：`accounts/<account_id>/bookmark.json`（含 fid、名称、大小、时间点、时长与备注，备注最长 200 字符、可为空；不含 Cookie/令牌/签名地址）；切换、退出、过期与升级均保留；不进入诊断报告。
 - 视频不落盘：无分片、无磁盘缓存、无转码；仅内存转发请求的字节范围。
 - 内嵌字幕/音轨由播放器原生解码、显示与切换，本插件不替换、不自动选中外挂轨；同目录外挂字幕经原生“字幕搜索”手动选择，只从本桥接读取内存文本——桥接自身不写字幕或视频文件，播放器是否把所选字幕保存到磁盘由 PotPlayer 自身行为决定。
 - 本地凭证与诊断数据保持私有：`/v1/diagnostics/report` 只在用户显式导出时才写文件，且经白名单裁剪，不含 Cookie/令牌/URL/FID/文件名/观看进度/绝对路径。
-- 不含分享转存、海报库、转码、多账号。观看进度依赖 Windows 原生读取能力；其它平台的 CLI 不受影响。
+- 不含分享转存、海报库、转码。观看进度依赖 Windows 原生读取能力；其它平台的 CLI 不受影响。

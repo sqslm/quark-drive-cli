@@ -16,6 +16,7 @@ import httpx
 
 from quark_cli import auth
 from quark_cli.errors import AuthenticationError
+from quark_cli.potplayer.library_state import Library
 from quark_cli.potplayer import plugin_state
 from quark_cli.potplayer.service import Service
 from quark_cli.potplayer.stream import Media, Sessions
@@ -536,7 +537,7 @@ class FakeLogin:
         self.release.wait(10)
         if self.fail_with is not None:
             raise self.fail_with
-        plugin_state.store_cookie(COOKIE)
+        auth.save_cookie(COOKIE, plugin_state.plugin_directory() / "login-cookie")
 
 
 # Four full 4 MiB segments plus a short tail: enough to force several
@@ -852,27 +853,17 @@ class FavoritesCase(_ServerCase):
         self.assertFalse(self.service.library.path.exists())
         self.assertTrue(cli_cookie.exists())
 
-    def test_logout_reports_a_clear_failure_and_keeps_the_records(self):
+    def test_logout_preserves_account_records_and_only_removes_credentials(self):
         plugin_state.store_cookie(COOKIE)
         self.api("POST", "/v1/favorites", body={"fid": "root-dir"})
         library_path = self.service.library.path
-        self.assertTrue(library_path.exists())
-        real_unlink = Path.unlink
-
-        def refuse(target, *args, **kwargs):
-            if target == library_path:
-                raise PermissionError("sharing violation")
-            return real_unlink(target, *args, **kwargs)
-
-        with mock.patch.object(Path, "unlink", refuse):
-            response = self.api("POST", "/v1/auth/logout")
-
-        self.assertEqual(response.status_code, 500)
-        self.assertEqual(response.json()["error"]["type"], "local_io_error")
-        self.assertFalse(self.api("GET", "/v1/auth").json()["authenticated"])
-        self.assertEqual(self.api("GET", "/v1/files").status_code, 401)
+        response = self.api("POST", "/v1/auth/logout")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(self.service.authenticated())
         self.assertFalse(plugin_state.credential_path().exists())
-        self.assertEqual([entry["fid"] for entry in self.service.library.favorites()], ["root-dir"])
+        self.assertTrue(library_path.exists())
+        self.assertEqual([row["fid"] for row in Library(library_path).favorites()], ["root-dir"])
+        self.assertEqual(self.service.library.favorites(), [])
 
     def test_credential_expiry_keeps_favorites_and_recent(self):
         self.api("POST", "/v1/favorites", body={"fid": "root-dir"})
@@ -1735,7 +1726,7 @@ class BookmarksNativeCase(_ServerCase):
                 self.assertEqual(response.json()["error"]["type"], "media_changed")
         self.assertEqual(self.player.seeks, [])
 
-    def test_explicit_logout_clears_bookmarks_while_an_expired_credential_keeps_them(self):
+    def test_explicit_logout_and_expiry_preserve_account_bookmarks(self):
         seed_bookmark(self.service.monitor.bookmarks, "v2", "保留")
         path = self.service.monitor.bookmarks.path
         self.assertTrue(path.exists())
@@ -1748,8 +1739,8 @@ class BookmarksNativeCase(_ServerCase):
         self.assertEqual(len(self.api("GET", "/v1/bookmarks?fid=v2").json()["items"]), 1)
 
         self.assertEqual(self.api("POST", "/v1/auth/logout").json(), {"authenticated": False})
-        self.assertFalse(path.exists())
-        self.assertEqual(self.api("GET", "/v1/bookmarks?fid=v2").json(), {"items": []})
+        self.assertTrue(path.exists())
+        self.assertEqual(len(self.api("GET", "/v1/bookmarks?fid=v2").json()["items"]), 1)
 
     def test_the_diagnostics_report_never_carries_a_bookmark_note(self):
         secret = "机密备注-9f3c1a"

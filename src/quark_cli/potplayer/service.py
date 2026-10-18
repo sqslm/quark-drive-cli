@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 
-from ..auth import LoginCancelled
+from ..auth import LoginCancelled, get_account_nickname, get_account_capacity, load_saved_cookie
 from ..client import QuarkClient, default_guard
 from ..errors import (
     AccessRestrictedError,
@@ -41,7 +41,8 @@ from ..files import Files
 from ..paths import is_directory
 from ..request_guard import RequestGuard
 from . import SERVICE_VERSION
-from .bookmark_state import NOTE_LIMIT
+from .bookmark_state import NOTE_LIMIT, BookmarkStore
+from .accounts import Accounts, account_key
 from .diagnostics import Diagnostics
 from .library import (
     DEFAULT_PAGE_SIZE,
@@ -62,7 +63,6 @@ from .plugin_state import (
     acquire_service_lock,
     clear_cookie,
     clear_runtime,
-    credential_path,
     load_cookie,
     read_runtime,
     write_runtime,
@@ -107,6 +107,7 @@ WATCH_UNNAMED = "来源目录未命名"
 BOOKMARK_FALLBACK_NAME = "所选视频"
 
 _CONTROL_ROUTES = frozenset({
+    "/v1/accounts", "/v1/accounts/switch", "/v1/accounts/logout", "/v1/accounts/refresh",
     "/v1/auth", "/v1/auth/login", "/v1/auth/logout",
     "/v1/files", "/v1/playlist", "/v1/play", "/v1/shutdown",
     "/v1/search", "/v1/favorites", "/v1/favorites/remove",
@@ -581,8 +582,18 @@ class Service:
         self.token = secrets.token_urlsafe(32)
         self.port = 0
         self.server: ThreadingHTTPServer | None = None
+        self.account_lock = threading.RLock()
+        self.accounts = Accounts()
+        previous_cookie = cookie or load_cookie()
+        if previous_cookie:
+            self.accounts.add(previous_cookie, legacy=True)
+            if cookie is None:
+                clear_cookie()
+        self._clock = clock
+        self._monitor_options = dict(native_factory=native_factory if native_factory is not None else NativePlayer,
+                                     clock=clock, poll_interval=monitor_poll_interval, start=monitor_start)
         self.sessions = Sessions(clock)
-        self.library = Library()
+        self.library = Library(self.accounts.data_path('library.json'))
         self.diagnostics = Diagnostics()
         # The native receiver is created lazily on the monitor's own worker, so
         # no HTTP request thread ever touches it.
@@ -592,14 +603,15 @@ class Service:
             clock=clock,
             poll_interval=monitor_poll_interval,
             start=monitor_start,
+            bookmarks=BookmarkStore(self.accounts.data_path('bookmark.json')),
         )
         self._transport = transport
-        self._cookie = cookie
+        self._cookie = self.accounts.cookie()
         # One guard is shared by the bridge, its Quark client and the QR login it
         # starts, so a cooldown survives client rebuilds within this process.
         self._guard = guard if guard is not None else default_guard(transport, None)
         self._login_factory = login_factory or (
-            lambda: QrLoginWindow(transport=transport, cookie_path=credential_path(), guard=self._guard)
+            lambda: QrLoginWindow(transport=transport, cookie_path=self.accounts.directory / 'login-cookie', guard=self._guard)
         )
         # Verified video→directory associations and directory names seen in a
         # listing: used only to stamp a following /v1/play with its real parent
@@ -612,11 +624,13 @@ class Service:
         self._client: QuarkClient | None = None
         self._client_cookie: str | None = None
         self._client_lock = threading.Lock()
+        self._stream_users: dict[QuarkClient, int] = {}
+        self._retired_clients: set[QuarkClient] = set()
         self._login_lock = threading.Lock()
         self._login_thread: threading.Thread | None = None
         self._login_window: QrLoginWindow | None = None
         self._status_launcher = status_launcher
-        self._player_launcher = player_launcher or _spawn_bookmark_player
+        self._player_launcher = player_launcher or (lambda bookmark_id: _spawn_bookmark_player(bookmark_id, self.accounts.active))
         self._status_process: Any = None
         self._status_lock = threading.Lock()
         # One-shot bookmark-window target handed to the status GUI, plus the lock
@@ -641,7 +655,7 @@ class Service:
 
     def client(self) -> QuarkClient:
         """Reuse the Quark session, rebuilding it when the saved credential changed."""
-        cookie = self._cookie or load_cookie()
+        cookie = self._cookie
         if not cookie:
             raise AuthenticationError("插件尚未登录夸克网盘，请先扫码登录")
         with self._client_lock:
@@ -722,11 +736,34 @@ class Service:
             raise AuthenticationError("插件尚未登录夸克网盘，请先扫码登录")
 
     def drop_client(self) -> None:
-        with self._client_lock:
+        with self.account_lock, self._client_lock:
             client, self._client = self._client, None
             self._client_cookie = None
-        if client is not None:
-            client.close()
+            if client is not None:
+                if self._stream_users.get(client, 0):
+                    self._retired_clients.add(client)
+                else:
+                    client.close()
+
+    @contextmanager
+    def stream_client(self):
+        # An old origin response may still be reading when the user switches.
+        # Keep that client alive until its last reader exits, never reuse the
+        # new account's client to refresh the old video's signed URL.
+        with self.account_lock:
+            client = self.client()
+            self._stream_users[client] = self._stream_users.get(client, 0) + 1
+            resources = client, self.sessions, self.monitor, self.diagnostics
+        try:
+            yield resources
+        finally:
+            with self.account_lock:
+                self._stream_users[client] -= 1
+                if not self._stream_users[client]:
+                    del self._stream_users[client]
+                    if client in self._retired_clients:
+                        self._retired_clients.remove(client)
+                        client.close()
 
     def close(self) -> None:
         """Stop the bridge: flush/close the monitor, then the QR window and client."""
@@ -738,12 +775,68 @@ class Service:
         self.drop_client()
 
     def authenticated(self) -> bool:
-        if self._cookie:
-            return True
-        try:
-            return load_cookie() is not None
-        except LocalIOError:
-            return False
+        return bool(self._cookie)
+
+    def _activate_account(self) -> None:
+        """Caller holds account_lock; old monitors keep their original stores."""
+        self.monitor.close()
+        self.drop_client()
+        self._cookie = self.accounts.cookie()
+        self.sessions = Sessions(self._clock)
+        self.library = Library(self.accounts.data_path('library.json'))
+        self.monitor = PlaybackMonitor(self.library, bookmarks=BookmarkStore(self.accounts.data_path('bookmark.json')),
+                                       **self._monitor_options)
+        self.diagnostics = Diagnostics()
+        with self._parent_lock:
+            self._parents.clear()
+            self._dir_names.clear()
+        with self._bookmark_lock:
+            self._bookmark_request = None
+
+    def switch_account(self, key):
+        with self.account_lock:
+            if not isinstance(key, str) or key not in self.accounts.document['accounts']:
+                raise UsageError('请选择已保存的账号')
+            with self._login_lock:
+                if self._login_thread is not None:
+                    raise UsageError('请先完成或取消扫码登录')
+            if key != self.accounts.active:
+                self.accounts.switch(key)
+                self._activate_account()
+            return self.accounts.public()
+
+    def logout_account(self, key):
+        with self.account_lock:
+            with self._login_lock:
+                if self._login_thread is not None:
+                    raise UsageError('请先完成或取消扫码登录')
+            current = key == self.accounts.active
+            legacy = load_cookie()
+            if legacy and account_key(legacy) == key:
+                clear_cookie()
+            self.accounts.logout(key)
+            if current:
+                self._activate_account()
+            return self.accounts.public()
+
+    def refresh_account(self):
+        self.require_login()
+        nickname = get_account_nickname(self._cookie, transport=self._transport, guard=self._guard)
+        capacity = get_account_capacity(self._cookie, transport=self._transport, guard=self._guard)
+        self.accounts.profile(nickname, capacity)
+        return self.accounts.public()
+
+    def import_login_cookie(self):
+        """Consume a credential explicitly saved by the standalone --login action.
+
+        Only /auth calls this, before any file identifier is interpreted.
+        Ordinary file and stream requests never change their account midway.
+        """
+        cookie = load_cookie()
+        if cookie:
+            self.accounts.add(cookie)
+            self._activate_account()
+            clear_cookie()
 
     # -- login -----------------------------------------------------------
 
@@ -753,6 +846,7 @@ class Service:
             "login_state": self.login_state,
             "login_message": self.login_message,
             "qr_png": self.qr_png,
+            "account_id": self.accounts.active,
         }
 
     def login_payload(self) -> dict[str, Any]:
@@ -782,6 +876,17 @@ class Service:
             with self._login_lock:
                 self._login_window = login
             login.run(on_qr_ready=self._qr_ready)
+            candidate = load_saved_cookie(self.accounts.directory / 'login-cookie')
+            if not candidate:
+                raise AuthenticationError('扫码登录未保存有效凭证')
+            with self.account_lock:
+                self.accounts.add(candidate)
+                self._activate_account()
+                clear_cookie()
+                try:
+                    self.refresh_account()
+                except QuarkError:
+                    message = '登录已保存，昵称或容量暂不可用，请在账号管理中刷新'
         except LoginCancelled:
             state = "idle"
         except QuarkError as exc:
@@ -790,14 +895,18 @@ class Service:
             message = "扫码登录过程失败"
         else:
             state = "success"
+        pending = self.accounts.directory / 'login-cookie'
+        try:
+            if pending.exists():
+                pending.unlink()
+        except OSError:
+            message = '临时登录凭证清理失败，请检查配置目录权限'
         with self._login_lock:
             self.login_state = state
             self.login_message = message
             self.qr_png = None
             self._login_thread = None
             self._login_window = None
-        if state == "success":
-            self.drop_client()
 
     def _qr_ready(self, path: Any) -> None:
         with self._login_lock:
@@ -811,31 +920,19 @@ class Service:
         Only the bridge's own credential is removed; the ``quark`` CLI Cookie is
         never touched.
         """
-        self._cookie = None
-        self.drop_client()
-        try:
-            clear_cookie()
-        except LocalIOError:
-            pass
+        with self.account_lock:
+            legacy = load_cookie()
+            if legacy and account_key(legacy) == self.accounts.active:
+                clear_cookie()
+            self._cookie = None
+            self.drop_client()
+            if self.accounts.active is not None:
+                self.accounts.logout(self.accounts.active)
 
     def logout(self) -> dict[str, Any]:
-        """Clear only the bridge's own credential; the CLI Cookie stays untouched.
-
-        An explicit logout also drops the favorites, recent lists and playback
-        bookmarks; a merely expired credential (``invalidate_credential``) keeps
-        all of them. Monitor bindings are suppressed before the library is
-        cleared, so a poll that was already in flight cannot resurrect the
-        progress (or a late bookmark capture) logout just removed.
-        """
-        self.invalidate_credential()
-        self.monitor.clear()
-        self.monitor.bookmarks.clear()
-        self.library.clear()
-        with self._login_lock:
-            self.login_state = "idle"
-            self.login_message = None
-            self.qr_png = None
-        self.diagnostics.credential_changed()
+        """Log out the active plugin account; retain its private viewing data."""
+        if self.accounts.active is not None:
+            self.logout_account(self.accounts.active)
         return {"authenticated": False}
 
     # -- diagnostics window ----------------------------------------------
@@ -918,8 +1015,8 @@ class Service:
         ``/v1/play``) is unmarked and records normally. A corrupt library raises
         ``LocalIOError`` here; it is left to propagate.
         """
-        with self._history_lock:
-            if session.history_removed:
+        with self.account_lock, self._history_lock:
+            if session.history_removed or self.sessions.get(session.session) is not session:
                 return
             self.library.record_recent(
                 session.fid, session.name, session.size,
@@ -1013,6 +1110,8 @@ class _Handler(BaseHTTPRequestHandler):
     # -- routing ---------------------------------------------------------
 
     def _dispatch(self, method: str) -> None:
+        for name in ('_stream_client', '_stream_sessions', '_stream_monitor', '_stream_diagnostics'):
+            self.__dict__.pop(name, None)
         raw = self._consume_body()
         try:
             parsed = urlsplit(self.path)
@@ -1031,10 +1130,32 @@ class _Handler(BaseHTTPRequestHandler):
             if route.startswith("/v1/stream/"):
                 if method not in ("GET", "HEAD"):
                     return self._json(405, _failure("method_not_allowed", "该接口只接受 GET 或 HEAD"))
-                return self._stream(route)
+                with ExitStack() as stack:
+                    with self.service.account_lock:
+                        self._stream_sessions = self.service.sessions
+                        try:
+                            resources = stack.enter_context(self.service.stream_client())
+                        except QuarkError as exc:
+                            return self._failure_response(exc)
+                    self._stream_client, self._stream_sessions, self._stream_monitor, self._stream_diagnostics = resources
+                    return self._stream(route)
             if not self.service.authorized(self.headers.get("Authorization")):
                 return self._json(401, _failure("unauthorized", "本地访问令牌无效"))
-            return self._control(route, method, query, raw)
+            with self.service.account_lock:
+                self._account_id = self.service.accounts.active
+                expected = self.headers.get('X-Quark-Account')
+                if (expected is None and len(self.service.accounts.document['accounts']) > 1
+                        and route not in ('/v1/auth', '/v1/auth/login', '/v1/accounts', '/v1/accounts/switch',
+                                          '/v1/accounts/logout', '/v1/diagnostics', '/v1/diagnostics/open',
+                                          '/v1/diagnostics/report', '/v1/shutdown')
+                        and not (route == '/v1/subtitles' and 'session' in query and 'fid' not in query)):
+                    return self._json(409, _failure('account_changed', '旧链接缺少账号归属，请从根目录重新打开'))
+                if expected is not None and expected != (self._account_id or ''):
+                    return self._json(409, _failure('account_changed', '账号已切换，请从根目录重新打开'))
+                try:
+                    return self._control(route, method, query, raw)
+                except QuarkError as exc:
+                    return self._failure_response(exc)
         except QuarkError as exc:
             self._failure_response(exc)
         except httpx.HTTPError:
@@ -1042,9 +1163,25 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _control(self, route: str, method: str, query: Mapping[str, list[str]], raw: bytes | None) -> None:
         service = self.service
+        if route == '/v1/accounts':
+            if method not in ('GET', 'HEAD'):
+                return self._json(405, _failure('method_not_allowed', '该接口只接受 GET'))
+            return self._json(200, service.accounts.public())
+        if route in ('/v1/accounts/switch', '/v1/accounts/logout', '/v1/accounts/refresh'):
+            if method != 'POST':
+                return self._json(405, _failure('method_not_allowed', '该接口只接受 POST'))
+            body = self._body(raw)
+            if route.endswith('/switch'):
+                result = service.switch_account(body.get('id'))
+            elif route.endswith('/logout'):
+                result = service.logout_account(body.get('id'))
+            else:
+                result = service.refresh_account()
+            return self._json(200, result)
         if route == "/v1/auth":
             if method not in ("GET", "HEAD"):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
+            service.import_login_cookie()
             return self._json(200, service.login_payload())
         if route == "/v1/auth/login":
             if method != "POST":
@@ -1123,6 +1260,9 @@ class _Handler(BaseHTTPRequestHandler):
             )
             payload["playback"] = service.monitor.snapshot()
             payload["bookmark_request"] = service.bookmark_request()
+            payload['account_id'] = service.accounts.active
+            payload['accounts'] = service.accounts.public()
+            payload['login_state'] = service.login_state
             return self._json(200, payload)
         if route == "/v1/diagnostics/report":
             if method not in ("GET", "HEAD"):
@@ -1259,6 +1399,8 @@ class _Handler(BaseHTTPRequestHandler):
                 )
             except UnknownSession:
                 return self._json(404, _failure("not_found", "播放会话不存在或已失效"))
+            if 'session' in query:
+                payload['account_id'] = service.accounts.active
             return self._json(200, payload)
         if route == "/v1/subtitle":
             if method not in ("GET", "HEAD"):
@@ -1349,7 +1491,7 @@ class _Handler(BaseHTTPRequestHandler):
         parts = route.split("/")
         if len(parts) < 4 or not parts[3]:
             return self._json(400, _failure("bad_request", "播放地址无效"))
-        session = self.service.sessions.get(parts[3])
+        session = self._stream_sessions.get(parts[3])
         if session is None:
             return self._json(404, _failure("not_found", "播放会话不存在或已失效"))
         try:
@@ -1368,14 +1510,21 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _stream_body(self, session: PlaySession, byte_range: tuple[int, int] | None) -> None:
         service = self.service
-        diagnostics = service.diagnostics
+        client = self._stream_client
+        sessions = self._stream_sessions
+        diagnostics = self._stream_diagnostics
+
+        def ensure_current():
+            if sessions is not service.sessions:
+                raise UsageError('账号已切换，旧播放会话已停止')
 
         def refetch() -> None:
-            media = resolve(service.files(), service.client(), session.fid)
+            ensure_current()
+            media = resolve(Files(client), client, session.fid)
             if media.size != session.size:
-                service.sessions.forget(session.session)
+                sessions.forget(session.session)
                 raise MediaChanged("文件大小或版本已变化，已中止播放")
-            service.sessions.refresh(session.session, media)
+            sessions.refresh(session.session, media)
 
         def on_origin(status: int, elapsed_ms: int) -> None:
             # One fixed, URL-free observation per real origin response/redirect.
@@ -1392,9 +1541,10 @@ class _Handler(BaseHTTPRequestHandler):
             if not recorded:
                 recorded = True
                 self._record_played(session)
-                service.monitor.stream_started(session.session)
+                self._stream_monitor.stream_started(session.session)
 
         def on_chunk(count: int) -> None:
+            ensure_current()
             # Counted only after a successful socket write; every chunk, including
             # a repeated seek over the same range, counts again.
             diagnostics.transferred(session.session, count)
@@ -1407,9 +1557,10 @@ class _Handler(BaseHTTPRequestHandler):
                 # in serial bounded ranges and forward each as it arrives.
                 position = start
                 while position <= end:
+                    ensure_current()
                     stop = min(position + MEDIA_SEGMENT - 1, end)
                     with open_content(
-                        service.client(), session, (position, stop), refetch, on_origin=on_origin
+                        client, session, (position, stop), refetch, on_origin=on_origin
                     ) as response:
                         _, length, _ = _upstream_plan(response, session, (position, stop))
                         self._pin_version(session, response)
@@ -1421,7 +1572,7 @@ class _Handler(BaseHTTPRequestHandler):
                     position = stop + 1
                 return
             with open_content(
-                service.client(), session, byte_range, refetch, on_origin=on_origin
+                client, session, byte_range, refetch, on_origin=on_origin
             ) as response:
                 status, length, header = _upstream_plan(response, session, byte_range)
                 self._pin_version(session, response)
@@ -1450,6 +1601,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _record_failure(self, exc: BaseException, *, phase: str | None = None) -> None:
         """Log one fixed, sanitized failure event; never a raw exception or URL."""
+        if hasattr(self, '_stream_sessions') and self._stream_sessions is not self.service.sessions:
+            return
         status, kind = _status_for(exc)
         if kind == "local_io_error":
             phase = "local"
@@ -1460,7 +1613,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _pin_version(self, session: PlaySession, response: httpx.Response) -> None:
         """Bind the first strong ETag; any later different strong ETag aborts."""
         etag = response.headers.get("etag")
-        if etag and not etag.startswith("W/") and not self.service.sessions.pin_etag(session.session, etag):
+        sessions = getattr(self, '_stream_sessions', self.service.sessions)
+        if etag and not etag.startswith("W/") and not sessions.pin_etag(session.session, etag):
             raise MediaChanged("文件版本已变化，已中止播放")
 
     def _stream_headers(
@@ -1525,7 +1679,7 @@ class _Handler(BaseHTTPRequestHandler):
                     break
         except httpx.HTTPError:
             self.close_connection = True
-            self.service.diagnostics.error("origin", "network_error")
+            getattr(self, '_stream_diagnostics', self.service.diagnostics).error("origin", "network_error")
             return False
         except OSError:
             # The player closed the connection (seek/close): not a failure.
@@ -1534,7 +1688,7 @@ class _Handler(BaseHTTPRequestHandler):
         if written < length:
             # The origin ended early; the announced Content-Length can no longer hold.
             self.close_connection = True
-            self.service.diagnostics.error("origin", "remote_error")
+            getattr(self, '_stream_diagnostics', self.service.diagnostics).error("origin", "remote_error")
             return False
         return True
 
@@ -1602,7 +1756,9 @@ class _Handler(BaseHTTPRequestHandler):
         if kind == "login_required":
             # The account API (not the origin) rejected the Cookie: the plugin's
             # own credential is stale, so drop it and ask the player to re-scan.
-            self.service.invalidate_credential()
+            with self.service.account_lock:
+                if not hasattr(self, '_stream_sessions') or self._stream_sessions is self.service.sessions:
+                    self.service.invalidate_credential()
             message = "插件未登录或登录已失效，请在播放器中重新扫码登录"
         else:
             message = str(exc) or "服务内部错误"
@@ -1694,7 +1850,7 @@ def _spawn_service(executable: str) -> None:
         raise LocalIOError("无法启动夸克网盘本地服务进程") from None
 
 
-def _spawn_bookmark_player(bookmark_id: str) -> Any:
+def _spawn_bookmark_player(bookmark_id: str, account_id: str | None = None) -> Any:
     """Open the installed player with an opaque, extension-owned marker URL."""
     candidates = [Path(sys.executable).parent / "install.json"]
     local = os.environ.get("LOCALAPPDATA")
@@ -1715,7 +1871,8 @@ def _spawn_bookmark_player(bookmark_id: str) -> Any:
             if executable.is_file():
                 try:
                     return subprocess.Popen(
-                        [str(executable), "https://quark.invalid/mark/" + quote(bookmark_id, safe="")],
+                        [str(executable), "https://quark.invalid/mark/" + quote(bookmark_id, safe="")
+                         + ('?account=' + account_id if account_id else '')],
                         close_fds=True,
                     )
                 except OSError:

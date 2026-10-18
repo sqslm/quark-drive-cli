@@ -657,7 +657,7 @@ class LibraryEntryDesignTests(unittest.TestCase):
 
     def test_get_url_list_dispatches_without_a_generic_router(self):
         body = self.body(
-            "array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)"
+            "array<dictionary> QuarkAccountUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)"
         )
         self.assertIn("QUARK_ACTION_ADD", body)
         self.assertIn("QUARK_ACTION_DEL", body)
@@ -753,7 +753,7 @@ class SeriesEntryDesignTests(unittest.TestCase):
 
     def test_action_tokens_are_dispatched_and_validate_their_pieces(self):
         body = self.body(
-            "array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)"
+            "array<dictionary> QuarkAccountUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)"
         )
         self.assertIn("QUARK_ACTION_SERIES", body)
         self.assertIn("QUARK_ACTION_WATCH", body)
@@ -919,7 +919,7 @@ class VideoActionsDesignTests(unittest.TestCase):
 
     def test_local_actions_precede_the_login_gate(self):
         body = self.body(
-            "array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)"
+            "array<dictionary> QuarkAccountUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)"
         )
         gate = body.index("QuarkEnsureLogin()")
         for marker in (
@@ -983,7 +983,7 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
     def test_versions_report_the_current_release(self):
         # 本任务只把 UrlList 升到 0.8.0；PlayParse/SubtitleSearch 的版本由各自的
         # 任务维护，这里只要求仍是语义化版本串。
-        self.assertIn('return "0.9.0";', self.raw_body(self.url_raw, "string GetVersion()"))
+        self.assertIn('return "0.10.0";', self.raw_body(self.url_raw, "string GetVersion()"))
         self.assertRegex(
             self.raw_body(self.play_raw, "string GetVersion()"), r'return "\d+\.\d+\.\d+";'
         )
@@ -1340,9 +1340,10 @@ class SavingLogin:
     """Stand-in for a completed scan: persists a credential like the real window."""
 
     def run(self, *, on_qr_ready=None) -> None:
-        from quark_cli.potplayer.plugin_state import store_cookie
+        from quark_cli.auth import save_cookie
+        from quark_cli.potplayer.plugin_state import plugin_directory
 
-        store_cookie(COOKIE)
+        save_cookie(COOKIE, plugin_directory() / "login-cookie")
 
 
 class LoginStateBridgeTests(BridgeCase):

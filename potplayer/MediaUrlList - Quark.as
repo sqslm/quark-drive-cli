@@ -28,6 +28,9 @@
 // array<dictionary> GetCategorys()													-> get category list
 // array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)	-> get url list for Category
 
+string QUARK_ACCOUNT_SCOPE = "";
+bool QUARK_ACCOUNT_BOUND = false;
+
 string QUARK_VIDEO_PREFIX = "https://quark.invalid/video/";
 string QUARK_PLAY_PREFIX = "https://quark.invalid/play/";
 string QUARK_FOLDER_PREFIX = "https://quark.invalid/folder/";
@@ -68,7 +71,7 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "0.9.0";
+	return "0.10.0";
 }
 
 string GetDesc()
@@ -246,7 +249,10 @@ string QuarkRequest(string path, string body)
 
 		if (base.empty() || token.empty()) return "";
 
-		string response = HostUrlGetString(base + path, "", QuarkHeader(token, post), body, true);
+		string header = QuarkHeader(token, post);
+		if (path.find("/v1/auth") != 0 && !QUARK_ACCOUNT_SCOPE.empty())
+			header += "X-Quark-Account: " + QUARK_ACCOUNT_SCOPE + "\r\n";
+		string response = HostUrlGetString(base + path, "", header, body, true);
 
 		if (response.empty()) return "";
 
@@ -316,6 +322,8 @@ bool QuarkAuthenticated()
 
 	if (!reader.parse(response, root) || !root.isObject()) return false;
 
+	JsonValue account = root["account_id"];
+	if (!QUARK_ACCOUNT_BOUND && account.isString()) QUARK_ACCOUNT_SCOPE = account.asString();
 	JsonValue ok = root["authenticated"];
 
 	return ok.isBool() && ok.asBool();
@@ -1402,7 +1410,7 @@ array<dictionary> GetCategorys()
 	return ret;
 }
 
-array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)
+array<dictionary> QuarkAccountUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)
 {
 	string page = PageToken;
 
@@ -1466,4 +1474,58 @@ array<dictionary> GetUrlList(string Category, string Extra, string PathToken, st
 	if (Category == "recent") return QuarkRecentList();
 	if (Category == "continue") return QuarkWatchCenterList();
 	return QuarkDirectoryList(PathToken, page, true);
+}
+
+bool QuarkValidAccount(string value)
+{
+    if (value.length() != 64) return false;
+    string hex = "0123456789abcdef";
+    for (int index = 0; index < value.length(); index++)
+        if (hex.find(value.substr(index, 1)) < 0) return false;
+    return true;
+}
+
+// Keep the originating account on every navigation token and media link.
+array<dictionary> GetUrlList(string Category, string Extra, string PathToken, string Query, string PageToken)
+{
+    QUARK_ACCOUNT_SCOPE = "";
+    QUARK_ACCOUNT_BOUND = false;
+    string tag = "quark-account:";
+    if (PathToken.find(tag) == 0)
+    {
+        int split = PathToken.find("|");
+        if (split < 0) return QuarkStatus("账号标识无效，请从根目录重新打开");
+        QUARK_ACCOUNT_SCOPE = PathToken.substr(tag.length(), split - tag.length());
+        PathToken = PathToken.substr(split + 1);
+        QUARK_ACCOUNT_BOUND = true;
+    }
+    if (PageToken.find(tag) == 0)
+    {
+        int split = PageToken.find("|");
+        if (split < 0) return QuarkStatus("分页标识无效，请从根目录重新打开");
+        string scope = PageToken.substr(tag.length(), split - tag.length());
+        if (QUARK_ACCOUNT_BOUND && scope != QUARK_ACCOUNT_SCOPE)
+            return QuarkStatus("账号已切换，请从根目录重新打开");
+        QUARK_ACCOUNT_SCOPE = scope;
+        QUARK_ACCOUNT_BOUND = true;
+        PageToken = PageToken.substr(split + 1);
+    }
+    if (QUARK_ACCOUNT_BOUND && !QuarkValidAccount(QUARK_ACCOUNT_SCOPE))
+        return QuarkStatus("账号标识无效，请从根目录重新打开");
+    if (!QUARK_ACCOUNT_BOUND && !PathToken.empty())
+        return QuarkStatus("旧目录已失效，请从根目录重新打开");
+    if (!QUARK_ACCOUNT_BOUND) QuarkAuthenticated();
+    array<dictionary> ret = QuarkAccountUrlList(Category, Extra, PathToken, Query, PageToken);
+    if (QUARK_ACCOUNT_SCOPE.empty()) return ret;
+    for (int index = 0; index < ret.size(); index++)
+    {
+        string value;
+        if (ret[index].get("PathToken", value))
+            ret[index]["PathToken"] = tag + QUARK_ACCOUNT_SCOPE + "|" + value;
+        if (ret[index].get("PageToken", value))
+            ret[index]["PageToken"] = tag + QUARK_ACCOUNT_SCOPE + "|" + value;
+        if (ret[index].get("url", value) && value.find("https://quark.invalid/") == 0)
+            ret[index]["url"] = value + "?account=" + QUARK_ACCOUNT_SCOPE;
+    }
+    return ret;
 }

@@ -297,9 +297,10 @@ class ReadCase(_BridgeCase):
         self.assertEqual(response.json()["error"]["type"], "remote_error")
 
     def test_read_writes_nothing_and_leaves_recent_untouched(self):
+        before = {path: path.read_bytes() for path in self.directory.rglob("*") if path.is_file()}
         self.assertEqual(self.api("GET", "/v1/subtitle?fid=sub1").status_code, 200)
-        self.assertFalse((self.directory / "library.json").exists())
-        self.assertEqual(list(self.directory.iterdir()), [])
+        self.assertFalse(self.service.library.path.exists())
+        self.assertEqual({path: path.read_bytes() for path in self.directory.rglob("*") if path.is_file()}, before)
         self.assertEqual(self.api("GET", "/v1/recent").json()["items"], [])
 
     def test_head_read_answers_headers_without_a_body(self):

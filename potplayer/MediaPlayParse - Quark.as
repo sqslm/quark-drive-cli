@@ -21,6 +21,9 @@
 // bool PlaylistCheck(const string &in)						-> check playlist
 // array<dictionary> PlaylistParse(const string &in)			-> parse playlist
 
+string QUARK_ACCOUNT_SCOPE = "";
+bool QUARK_ACCOUNT_BOUND = false;
+
 string QUARK_VIDEO_PREFIX = "https://quark.invalid/video/";
 string QUARK_MARK_PREFIX = "https://quark.invalid/mark/";
 string QUARK_PLAY_PREFIX = "https://quark.invalid/play/";
@@ -37,7 +40,7 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "0.9.0";
+	return "0.10.0";
 }
 
 string GetDesc()
@@ -248,7 +251,10 @@ string QuarkRequest(string path, string body)
 
 		if (base.empty() || token.empty()) return "";
 
-		string response = HostUrlGetString(base + path, "", QuarkHeader(token, post), body, true);
+		string header = QuarkHeader(token, post);
+		if (path.find("/v1/auth") != 0 && !QUARK_ACCOUNT_SCOPE.empty())
+			header += "X-Quark-Account: " + QUARK_ACCOUNT_SCOPE + "\r\n";
+		string response = HostUrlGetString(base + path, "", header, body, true);
 
 		if (response.empty()) return "";
 
@@ -407,6 +413,8 @@ string QuarkFid(const string &in path, const string &in prefix)
 	if (path.find(prefix) != 0) return "";
 
 	string fid = path.substr(prefix.length());
+	int account = fid.find("?account=");
+	if (account >= 0) fid = fid.Left(account);
 
 	if (fid.empty()) return "";
 	if (fid.find("/") >= 0 || fid.find("\\") >= 0 || fid.find("\"") >= 0) return "";
@@ -430,6 +438,19 @@ string QuarkExtension(string name)
 	return lower.substr(last);
 }
 
+
+string QuarkAccountOf(const string &in path)
+{
+    int offset = path.find("?account=");
+    if (offset < 0) return "";
+    string value = path.substr(offset + 9);
+    if (value.length() != 64) return "invalid";
+    string hex = "0123456789abcdef";
+    for (int index = 0; index < value.length(); index++)
+        if (hex.find(value.substr(index, 1)) < 0) return "invalid";
+    return value;
+}
+
 bool PlayitemCheck(const string &in path)
 {
 	return path.find(QUARK_VIDEO_PREFIX) == 0 || path.find(QUARK_PLAY_PREFIX) == 0 || path.find(QUARK_MARK_PREFIX) == 0;
@@ -437,6 +458,7 @@ bool PlayitemCheck(const string &in path)
 
 string PlayitemParse(const string &in path, dictionary &MetaData, array<dictionary> &QualityList)
 {
+	QUARK_ACCOUNT_SCOPE = QuarkAccountOf(path);
 	string fid = QuarkFid(path, QUARK_PLAY_PREFIX);
 	string bookmark_id = QuarkFid(path, QUARK_MARK_PREFIX);
 
@@ -538,6 +560,7 @@ array<dictionary> QuarkPlaylist(string request)
 
 		// 稳定条目：只带文件标识，播放该集时才换取地址。
 		row["url"] = QUARK_VIDEO_PREFIX + fid.asString();
+		if (!QUARK_ACCOUNT_SCOPE.empty()) row["url"] = QUARK_VIDEO_PREFIX + fid.asString() + "?account=" + QUARK_ACCOUNT_SCOPE;
 		row["title"] = name.asString();
 		ret.insertLast(row);
 	}
@@ -546,6 +569,7 @@ array<dictionary> QuarkPlaylist(string request)
 
 array<dictionary> PlaylistParse(const string &in path)
 {
+	QUARK_ACCOUNT_SCOPE = QuarkAccountOf(path);
 	string request;
 
 	if (path.find(QUARK_FOLDER_PREFIX) == 0)

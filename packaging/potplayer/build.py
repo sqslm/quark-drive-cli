@@ -33,7 +33,7 @@ ROOT = HERE.parents[1]
 COMPONENT_NAME = "QuarkPotPlayer"
 LAUNCHER_NAME = "quark-potplayer"
 SETUP_NAME = "QuarkPotPlayer-Setup"
-DEFAULT_VERSION = "0.9.0"
+DEFAULT_VERSION = "0.10.0"
 
 
 class BuildError(RuntimeError):
