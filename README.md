@@ -698,7 +698,7 @@ Electron 主进程通过白名单 IPC 管理本地 Python 子进程；Renderer �
 
 接口请求形式参考[作者公开的批量复制实现](https://github.com/imeiming/quark-drive/blob/main/scripts/quark_cli.py)，未引入外部依赖。受控测试覆盖文件/目录混合、冲突、部分完成、源变化、错误副本身份、响应丢失、账号/只读边界、任务轮询及真实控件快捷键与进度。真实账号复制留给本人复测；本小版完成后暂停。
 
-发布产物默认目标为最近两版已验收客户端 ZIP，本轮为 0.5.24/0.5.25；当前 0.5.25 保留完整运行目录供复测，正在运行的 0.5.24 目录未动。本版复用现有冻结 Python 后端，没有重建或复制额外后端工作目录。历史产物清理此前被自动审批检查拦截，本轮未重试删除，0.5.22/0.5.23 等旧产物仍保留；工程约 2.574 GiB，其中 desktop/out 约 1879.81 MiB，新增本版 ZIP 167.70 MiB 和运行目录 403.00 MiB，回收量为零。源码、工程依赖、素材、用户数据和可复用后端保留。`desktop/out/cleanup-20261016.ps1` 是旧的一次性清单，不用于后续产物；后续清理仍须逐次核验目标。
+发布产物默认只保留最近两版已验收交付。本轮复用已有 v0.5.25 运行目录与冻结后端，新增 126.30 MiB 单文件向导安装包，没有再次复制完整运行目录。验证安装已由其卸载程序清除，剩余约 8.20 MiB 的隔离配置和日志删除命令被自动审批检查拦截，仅返回 blocked by policy，未改换工具重试。工程当前约 2.152 GiB，其中 desktop/out 约 1425.79 MiB。历史产物、源码、依赖、素材和用户数据保持原状；后续清理须重新核验目标。
 
 
 图片支持 JPG/JPEG、PNG 和 WebP：文件列表只为当前可见行加载缩略图，行高固定，先显示占位图；点击文件名或右键「预览图片」打开预览，支持上一张/下一张、方向键、缩放（25%–400%）、适应窗口及 Esc 关闭。切换范围限于当前筛选排序后的图片；目录、搜索和分享视图均可使用，分享预览只读取，不转存。失败显示重试入口，也可下载原图。
@@ -755,13 +755,24 @@ MD/Markdown 提供「原格式 / 渲染格式」切换；渲染格式同时显�
 验证：TypeScript 检查和 14 项桌面检查通过，包含真实控件的登录/切换/退出、菜单收起、忙碌状态、暗色菜单，以及 31 个常用文件夹在 1180×780 和 860×600 下滚动且头像固定。实际启动 v0.5.25 沙箱窗口并验证内置后端；ZIP CRC、应用/后端/许可文件哈希核对通过，后端与已有 dist 构建一致。ZIP SHA-256：`ed037c01a724ccd5c089613f34fe2c522b1ccb6a558a56ea6da07ff21a7d164a`。本版完成后暂停，等待手动复测。
 
 
-### Windows 安装包（0.5.25）
+### Windows 单文件向导安装包（0.5.25）
 
-可在 Windows x64 电脑上按当前用户安装，无需另装 Python。把下列三个文件一起复制到目标电脑的同一目录，再运行 Setup.exe：
+当前安装交付为单个 [QuarkDriveClient-0.5.25-Windows-x64-Setup.exe](desktop/out/v0.5.25-installer/wizard/QuarkDriveClient-0.5.25-Windows-x64-Setup.exe)，约 126.30 MiB。只需复制这个 EXE 到目标 Windows 10/11 x64 电脑运行，程序、Python 后端和运行依赖全部内置，无需配套文件或另外安装 Python。
 
-- 安装器：[QuarkDriveClient-0.5.25-Setup.exe](desktop/out/v0.5.25-installer/make/squirrel.windows/x64/QuarkDriveClient-0.5.25-Setup.exe)
-- 安装内容包：[QuarkDriveClient-0.5.25-full.nupkg](desktop/out/v0.5.25-installer/make/squirrel.windows/x64/QuarkDriveClient-0.5.25-full.nupkg)
-- 版本清单：[RELEASES](desktop/out/v0.5.25-installer/make/squirrel.windows/x64/RELEASES)
-- 校验值：[SHA256SUMS.txt](desktop/out/v0.5.25-installer/make/squirrel.windows/x64/SHA256SUMS.txt)
+中文向导包含欢迎、安装目录选择、桌面快捷方式选项、确认安装和完成页；完成页可选择启动程序。默认安装到当前用户的 `%LOCALAPPDATA%/Programs/QuarkDriveClient`，可修改路径，不要求管理员权限；开始菜单和 Windows 应用列表提供入口及卸载。升级前从托盘退出旧客户端，卸载保留用户配置目录。
 
-安装器按 Electron Forge 的 Squirrel.Windows 格式生成，需要三个文件放在一起。包内发布者/作者信息使用通用项目名称；打包文件清单中没有 Cookie、任务记录或桌面设置。登录凭证和客户端数据由应用在各自电脑的用户配置目录运行时保存。安装器未使用代码签名证书，Windows 可能显示“未知发布者”提示。首次使用仍需联网登录夸克。
+安装包只读取已打包的应用目录，发布者使用通用项目名称，编译时不读取 IDE 中的个人签名配置；核查 180 个运行文件，未发现 Cookie/任务/设置文件、已知账号昵称或开发机个人路径标记。登录数据在目标电脑运行时创建。安装器未签名，Windows 可能显示未知发布者提示。
+
+已检查实际中文向导；在带中文和空格的专用目录完成安装，180 个文件全部与原运行包哈希一致；实际启动未登录客户端并确认内置后端可用，指定的外部 Python 不存在；重复安装及卸载通过，验证配置保留、安装文件与卸载注册移除。此验证只使用隔离目录及未登录配置，没有使用现有账号。
+
+SHA-256：`0116af5177fc996304518546314d58380f5e12eedb1d1368c001bb8e8cd05d19`。交付目录只有一个 EXE，安装时校验内置压缩数据。
+
+开发机复用已有 Inno Setup 7，可用 `ISCC_PATH` 指定其他位置的 `ISCC.exe`。先准备已打包的 Windows 应用，再执行：
+
+```powershell
+cd desktop
+$env:QUARK_DESKTOP_OUT='out/v0.5.25-installer'
+npm run make:installer
+```
+
+输出为上述目录的 `wizard/`，版本读取 `package.json`，不复制额外运行目录。旧 Squirrel 构建文件属于之前的打包方案，本次交付使用新的向导 EXE。
