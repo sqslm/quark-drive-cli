@@ -90,6 +90,8 @@ class PlaySession:
     #: again. A brand-new session (a new explicit ``/v1/play``) starts ``False``.
     history_removed: bool = False
     bookmark_id: str | None = None
+    parent: str = ''
+    parent_name: str = ''
 
 
 @dataclass(frozen=True)

@@ -315,7 +315,7 @@ class PlaybackMonitor:
                     binding.streamed = True
                     self._wake.set()
 
-    def snapshot(self) -> list[dict[str, Any]]:
+    def snapshot(self, *, directories: bool = False) -> list[dict[str, Any]]:
         """Current view: no URL, session id, or signed address is exposed."""
         with self._lock:
             return [
@@ -327,6 +327,7 @@ class PlaybackMonitor:
                     "duration_ms": binding.last_duration,
                     "state": binding.state,
                     "message": binding.message,
+                    **({'parent': binding.session.parent} if directories else {}),
                 }
                 for binding in sorted(self._bindings.values(), key=lambda item: item.player_pid)
             ]
@@ -822,7 +823,8 @@ class PlaybackMonitor:
             if epoch != self._storage_epoch or task.cancelled:
                 return None
             try:
-                return self.bookmarks.add(fid, name, size, position, duration, task.note)
+                return self.bookmarks.add(fid, name, size, position, duration, task.note,
+                                          parent=binding.session.parent, parent_name=binding.session.parent_name)
             except LocalIOError as exc:
                 task.error = exc
                 return None

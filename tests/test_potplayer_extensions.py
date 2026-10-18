@@ -275,6 +275,7 @@ class _StartedBridge:
         self.service = Service(
             transport=self.fixture.transport(), cookie=cookie, login_factory=login_factory,
             status_launcher=lambda: _StatusProcess(),
+            highlight_launcher=lambda: _StatusProcess(),
         )
         self.server = self.service.build_server()
         self.thread = threading.Thread(
@@ -720,7 +721,8 @@ class SeriesEntryDesignTests(unittest.TestCase):
         self.assertIn('item["note"]', rows)
         items = self.body("void QuarkAppendItems(array<dictionary> &ret, JsonValue &items)")
         self.assertIn('QuarkIsVideo(name.asString())', items)
-        self.assertIn('mark["PathToken"] = QUARK_ACTION_BOOKMARKS + fid.asString()', items)
+        self.assertNotIn('mark["PathToken"]', items)
+        self.assertIn('capture["title"] = "标记当前时间点"', self.body('void QuarkAppendSeriesRows(array<dictionary> &ret, string parent, JsonValue &root)'))
         parse = read_script(PLAY_PARSE)
         self.assertIn('"https://quark.invalid/mark/"', parse)
         self.assertIn('bookmark_id', body_raw(parse, "string PlayitemParse(const string &in path, dictionary &MetaData, array<dictionary> &QualityList)"))
@@ -983,7 +985,7 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
     def test_versions_report_the_current_release(self):
         # 本任务只把 UrlList 升到 0.8.0；PlayParse/SubtitleSearch 的版本由各自的
         # 任务维护，这里只要求仍是语义化版本串。
-        self.assertIn('return "0.10.1";', self.raw_body(self.url_raw, "string GetVersion()"))
+        self.assertIn('return "0.11.0";', self.raw_body(self.url_raw, "string GetVersion()"))
         self.assertRegex(
             self.raw_body(self.play_raw, "string GetVersion()"), r'return "\d+\.\d+\.\d+";'
         )

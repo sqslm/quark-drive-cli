@@ -44,6 +44,7 @@ from .gui_common import (
     state_label,
 )
 from .gui_transport import LocalClient, LocalWorker, LocalPanel
+from .bookmark_state import bookmark_groups
 
 
 class HighlightsClient(LocalClient):
@@ -56,6 +57,8 @@ class HighlightsClient(LocalClient):
         an empty list is a valid answer (the video simply has no bookmark yet).
         """
         path = f"{BOOKMARKS_PATH}?fid={quote(fid, safe='')}" if fid else BOOKMARKS_PATH
+        if fid.startswith('parent/'):
+            path = f"{BOOKMARKS_PATH}?parent={quote(fid[7:], safe='')}"
         payload = self._get_object(path)
         items = payload.get("items") if payload is not None else None
         if not isinstance(items, list):
@@ -114,6 +117,7 @@ class HighlightsWorker(LocalWorker):
 
 class HighlightsPanel(LocalPanel):
     worker_type = HighlightsWorker
+    title = '精彩标记'
     def __init__(self, client, endpoint):
         super().__init__(client, endpoint)
         self._playback, self._rows = [], {}
@@ -128,24 +132,20 @@ class HighlightsPanel(LocalPanel):
         self._bookmark_add_button = self._bookmark_jump_button = None
         self._bookmark_rename_button = self._bookmark_remove_button = self._bookmark_refresh_button = None
         self._simpledialog = None
+        self._embedded = False
+        self.consume_requests = True
+        self._group = None
+        self._group_rows = {}
+        self._capture_requested = False
 
     def _build(self, tk, root):
         from tkinter import ttk
         frame = ttk.Frame(root, padding=16)
         frame.pack(fill='both', expand=True)
-        ttk.Label(frame, text='精彩标记独立管理：选择正在播放的视频记录时间点，或集中查看全部标记。').pack(anchor='w', pady=(0,12))
-        self._playback_tree = ttk.Treeview(frame, columns=('name','position','duration','state'), show='headings', selectmode='browse')
-        for key, title in (('name','视频'),('position','当前时间'),('duration','时长'),('state','播放状态')):
-            self._playback_tree.heading(key, text=title)
-            self._playback_tree.column(key, width=150)
-        self._playback_tree.pack(fill='both', expand=True)
-        self._playback_tree.bind('<<TreeviewSelect>>', self._on_select)
-        actions = ttk.Frame(frame)
-        actions.pack(fill='x', pady=12)
-        self._bookmark_button = ttk.Button(actions, text='管理所选视频标记', command=self._open_bookmarks)
-        self._bookmark_button.pack(side='left')
-        ttk.Button(actions, text='管理全部精彩标记', command=self._open_all).pack(side='left', padx=10)
+        ttk.Label(frame, text='双击剧集文件夹查看各集时间点与备注；双击标记可打开视频并跳转。').pack(anchor='w', pady=(0, 8))
         self._notice_var = tk.StringVar(value='正在连接精彩标记服务……')
+        self._embedded = True
+        self._build_bookmarks(host=frame)
         ttk.Label(frame, textvariable=self._notice_var).pack(anchor='w')
         self._update_actions()
 
@@ -157,11 +157,19 @@ class HighlightsPanel(LocalPanel):
         self._connected = True
         account_id = (snapshot.get('account_id') or '') if 'account_id' in snapshot else self._account_id
         if self._account_id is not None and self._account_id != account_id:
-            self._close_bookmarks()
+            if self._embedded:
+                self._clear_bookmarks()
+                self._group = None
+                self._capture_requested = False
+            else:
+                self._close_bookmarks()
             self._selected = self._external = self._last_request_id = None
         self._account_id = account_id
         self._playback = snapshot.get('playback', [])
-        self._consume_bookmark_request(snapshot)
+        if self.consume_requests:
+            self._consume_bookmark_request(snapshot)
+        if self._embedded and self._external is None:
+            self._open_all()
         self._refresh_playback()
         self._notice_var.set('已连接精彩标记服务')
         self._update_actions()
@@ -230,11 +238,13 @@ class HighlightsPanel(LocalPanel):
     def _open_external(self, request: dict[str, Any]) -> None:
         """Bind the bookmark manager to an external request (Tk thread only)."""
         self._external = request
+        self._group = None
+        self._capture_requested = request.get('action') == 'add'
         if self._root is None:
             return
         if self._bookmark_live():
             with contextlib.suppress(Exception):
-                self._bookmark_window.lift()
+                self._root.lift()
         else:
             self._build_bookmarks()
         # Drop any list or pending answer of the previous target, then read the
@@ -244,6 +254,10 @@ class HighlightsPanel(LocalPanel):
 
     def _refresh_playback(self) -> None:
         tree = self._playback_tree
+        if tree is None:
+            self._refresh_bookmark_header()
+            self._update_bookmark_actions()
+            return
         # Read the selection before rebuilding: a programmatic selection change
         # during ``delete``/``selection_set`` may fire ``_on_select``, and the
         # row is restored afterwards so the bookmark list keeps its binding.
@@ -327,7 +341,7 @@ class HighlightsPanel(LocalPanel):
         are never mistaken for a playback row's.
         """
         if self._external is not None:
-            return (EXTERNAL_PID, self._external["fid"])
+            return (EXTERNAL_PID, self._list_fid())
         return selection_target(self._playback, self._selected)
 
     def _binding_name(self) -> str:
@@ -342,15 +356,23 @@ class HighlightsPanel(LocalPanel):
         """The one live binding for the external FID, else ``None``."""
         if self._external is None or not self._connected:
             return None
-        if self._external.get("scope") == "all":
+        if self._external.get("scope") in ('all', 'parent'):
             selected = selection_target(self._playback, self._selected)
-            if selected is not None:
+            if selected is not None and self._external.get('scope') == 'all' and self._group is None:
                 return external_action_target(self._playback, selected[1])
             live = [row for row in self._playback if row.get("state") in _OPERABLE_STATES]
+            parent = self._external.get('parent') if self._external.get('scope') == 'parent' else self._group
+            if parent is not None:
+                live = [row for row in live if row.get('parent') == parent]
             if len(live) != 1:
                 return None
             return external_action_target(self._playback, live[0].get("fid"))
         return external_action_target(self._playback, self._external["fid"])
+
+    def _list_fid(self) -> str:
+        if self._external.get('scope') == 'parent':
+            return 'parent/' + self._external['parent']
+        return self._external['fid']
 
     def _list_target(self) -> tuple[int, str] | None:
         """The binding the list may be read for, else ``None``.
@@ -364,7 +386,7 @@ class HighlightsPanel(LocalPanel):
         if self._external is not None:
             if not self._connected:
                 return None
-            return (EXTERNAL_PID, self._external["fid"])
+            return (EXTERNAL_PID, self._list_fid())
         if not bookmark_enabled(self._connected, self._playback, self._selected):
             return None
         return selection_target(self._playback, self._selected)
@@ -442,19 +464,22 @@ class HighlightsPanel(LocalPanel):
         # list; the per-second highlight-state poll never does.
         self._request_bookmarks()
 
-    def _build_bookmarks(self) -> None:
+    def _build_bookmarks(self, host=None) -> None:
         """Create the manager window; every Tk call stays on this thread."""
         from tkinter import simpledialog, ttk
 
         root = self._root
         self._simpledialog = simpledialog
-        window = self._tk.Toplevel(root)
+        window = ttk.Frame(host) if host is not None else self._tk.Toplevel(root)
         self._bookmark_window = window
-        window.title("精彩标记")
-        window.geometry(f"{BOOKMARK_WIDTH}x{BOOKMARK_HEIGHT}")
-        window.minsize(BOOKMARK_MIN_WIDTH, BOOKMARK_MIN_HEIGHT)
-        window.transient(root)
-        window.protocol("WM_DELETE_WINDOW", self._close_bookmarks)
+        if host is not None:
+            window.pack(fill='both', expand=True)
+        else:
+            window.title("精彩标记")
+            window.geometry(f"{BOOKMARK_WIDTH}x{BOOKMARK_HEIGHT}")
+            window.minsize(BOOKMARK_MIN_WIDTH, BOOKMARK_MIN_HEIGHT)
+            window.transient(root)
+            window.protocol("WM_DELETE_WINDOW", self._close_bookmarks)
 
         self._bookmark_header_var = self._tk.StringVar(value="—")
         self._bookmark_notice_var = self._tk.StringVar(value="")
@@ -483,11 +508,12 @@ class HighlightsPanel(LocalPanel):
         self._bookmark_tree.configure(yscrollcommand=bookmark_scroll.set)
         bookmark_scroll.grid(row=0, column=1, sticky="ns")
         self._bookmark_tree.bind("<<TreeviewSelect>>", self._on_bookmark_select)
+        self._bookmark_tree.bind('<Double-1>', self._enter_group_or_jump)
 
         actions = ttk.Frame(outer)
         actions.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self._bookmark_add_button = ttk.Button(
-            actions, text="添加精彩标记", width=10, command=self._add_bookmark
+            actions, text="标记当前时间点", width=16, command=self._add_bookmark
         )
         self._bookmark_jump_button = ttk.Button(
             actions, text="跳转", width=8, command=self._jump_bookmark
@@ -509,7 +535,8 @@ class HighlightsPanel(LocalPanel):
             self._bookmark_refresh_button,
         ):
             button.pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text="关闭", width=8, command=self._close_bookmarks).pack(side="right")
+        ttk.Button(actions, text='全部剧集', command=self._open_all).pack(side='right')
+        ttk.Button(actions, text='返回剧集列表', command=self._back_to_groups).pack(side='right', padx=6)
         ttk.Label(
             outer, textvariable=self._bookmark_notice_var, anchor="w", wraplength=BOOKMARK_NOTICE_WRAP
         ).grid(row=3, column=0, sticky="ew", pady=(8, 0))
@@ -583,6 +610,7 @@ class HighlightsPanel(LocalPanel):
             return
         self._bookmark_pending = None
         if items is None:
+            self._capture_requested = False
             self._bookmarks = []
             self._render_bookmarks()
             self._bookmark_notice(_BOOKMARK_LOAD_FAILED)
@@ -594,6 +622,12 @@ class HighlightsPanel(LocalPanel):
         self._render_bookmarks()
         self._settle_bookmark_notice(self._load_notice())
         self._update_actions()
+        if self._capture_requested:
+            self._capture_requested = False
+            if self._action_target() is not None:
+                self._add_bookmark()
+            else:
+                self._bookmark_notice('当前目录没有唯一且正在播放的视频，无法标记时间点')
 
     def _load_notice(self) -> str:
         """The list-load result, with the fixed reason when add/jump are offline."""
@@ -628,7 +662,18 @@ class HighlightsPanel(LocalPanel):
             return
         tree.delete(*tree.get_children())
         self._bookmark_rows = {}
+        self._group_rows = {}
+        if self._external is not None and self._external.get('scope') == 'all' and self._group is None:
+            for index, group in enumerate(bookmark_groups(self._bookmarks)):
+                iid = f'group{index}'
+                tree.insert('', 'end', iid=iid, values=('📁 ' + group['name'], '', f"{group['count']} 个精彩点"))
+                self._group_rows[iid] = group['parent']
+            self._refresh_bookmark_header()
+            self._update_bookmark_actions()
+            return
         for index, entry in enumerate(self._bookmarks):
+            if self._external is not None and self._external.get('scope') == 'all' and self._group is not None and entry.get('parent', '') != self._group:
+                continue
             bookmark_id = bookmark_id_of(entry)
             if bookmark_id is None:
                 continue
@@ -647,11 +692,33 @@ class HighlightsPanel(LocalPanel):
         self._refresh_bookmark_header()
         self._update_bookmark_actions()
 
+    def _enter_group_or_jump(self, _event=None):
+        selection = self._bookmark_tree.selection()
+        iid = selection[0] if selection else None
+        if iid in self._group_rows:
+            self._group = self._group_rows[iid]
+            self._render_bookmarks()
+        else:
+            self._jump_bookmark()
+
+    def _back_to_groups(self):
+        if self._external is not None and self._external.get('scope') == 'all':
+            self._group = None
+            self._render_bookmarks()
+        else:
+            self._open_all()
+
     def _refresh_bookmark_header(self) -> None:
         if self._bookmark_header_var is None:
             return
         prefix = "全部视频" if self._external is not None and self._external.get("scope") == "all" else f"当前视频：{self._binding_name()}"
-        header = f"{prefix}　精彩标记：{len(self._bookmarks)} 条"
+        if self._external is not None and self._external.get('scope') == 'parent':
+            prefix = '当前目录：' + self._binding_name()
+        elif self._group is not None:
+            group = next((g for g in bookmark_groups(self._bookmarks) if g['parent'] == self._group), None)
+            prefix = '剧集：' + (group['name'] if group else '未分类')
+        visible = [entry for entry in self._bookmarks if entry.get('parent', '') == self._group] if self._group is not None else self._bookmarks
+        header = f"{prefix}　精彩标记：{len(visible)} 条"
         if self._external is not None and self._external_action_target() is None:
             # The list/rename/remove work offline; add/jump cannot, so say so
             # right where the operator looks for the video.
@@ -709,13 +776,14 @@ class HighlightsPanel(LocalPanel):
         target = self._action_target()
         if target is None:
             return
-        note = self._ask_note("添加精彩标记", "请输入精彩标记备注（可留空，最多 200 字）：")
+        account_id = self._account_id
+        note = self._ask_note("标记当前时间点", "记录此处精彩的原因（可留空，最多 200 字）：")
         if note is None:
             return
         if len(note) > MAX_NOTE_CHARS:
             self._bookmark_notice(_BOOKMARK_NOTE_TOO_LONG)
             return
-        if target != self._action_target():
+        if account_id != self._account_id or target != self._action_target():
             self._bookmark_notice(_BOOKMARK_STALE)
             return
         self._bookmark_pending = target
@@ -793,4 +861,12 @@ class HighlightsPanel(LocalPanel):
                 note = entry.get("note")
                 return note if isinstance(note, str) else ""
         return ""
+
+
+def run_highlights_window() -> int:
+    from .gui_common import load_endpoint
+    from .plugin_state import read_runtime
+    endpoint = load_endpoint(read_runtime)
+    client = HighlightsClient(endpoint) if endpoint is not None else None
+    return HighlightsPanel(client, endpoint).run()
 

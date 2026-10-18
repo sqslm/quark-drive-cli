@@ -41,7 +41,7 @@ from ..files import Files
 from ..paths import is_directory
 from ..request_guard import RequestGuard
 from . import SERVICE_VERSION
-from .bookmark_state import NOTE_LIMIT, BookmarkStore
+from .bookmark_state import NOTE_LIMIT, BookmarkStore, bookmark_groups
 from .accounts import Accounts, account_key
 from .diagnostics import Diagnostics
 from .library import (
@@ -575,6 +575,7 @@ class Service:
         guard: RequestGuard | None = None,
         native_factory: Callable[[], Any] | None = None,
         status_launcher: Callable[[], Any] | None = None,
+        highlight_launcher: Callable[[], Any] | None = None,
         player_launcher: Callable[[str], Any] | None = None,
         monitor_poll_interval: float = POLL_INTERVAL,
         monitor_start: bool = True,
@@ -636,11 +637,12 @@ class Service:
         self._login_thread: threading.Thread | None = None
         self._login_window: QrLoginWindow | None = None
         self._status_launcher = status_launcher
+        self._highlight_launcher = highlight_launcher
+        self._highlight_process: Any = None
         self._player_launcher = player_launcher or (lambda bookmark_id: _spawn_bookmark_player(bookmark_id, self.accounts.active))
         self._status_process: Any = None
         self._status_lock = threading.Lock()
-        # One-shot bookmark-window target handed to the status GUI, plus the lock
-        # that serializes setting/clearing it with the two diagnostics opens.
+        # One-shot target consumed only by the independent highlight window.
         self._bookmark_lock = threading.Lock()
         self._bookmark_request: dict[str, str] | None = None
         # Serializes a stream's one-time history record against
@@ -983,16 +985,8 @@ class Service:
             return "opened"
 
     def open_plain_status_window(self) -> str:
-        """Open/reuse the status window and drop any stale bookmark target.
-
-        A plain entry means the operator just wants the diagnostics window, so
-        the pending bookmark request is cleared under the lock shared with
-        :meth:`request_bookmark_window`; the GUI then never re-opens the video an
-        earlier request pointed at.
-        """
-        with self._bookmark_lock:
-            self._bookmark_request = None
-            return self.open_status_window()
+        """Open management independently of pending highlight actions."""
+        return self.open_status_window()
 
     def bookmark_request(self) -> dict[str, str] | None:
         """A copy of the pending bookmark-window request, or ``None``."""
@@ -1000,8 +994,8 @@ class Service:
             request = self._bookmark_request
             return None if request is None else dict(request)
 
-    def request_bookmark_window(self, fid: str | None = None) -> str:
-        """Retain one bookmark-window target, then open/reuse the status window.
+    def request_bookmark_window(self, fid: str | None = None, *, parent: str | None = None, action: str = 'manage') -> str:
+        """Retain a target, then open/reuse only the independent highlight window.
 
         The name is read from local state only (the recent row, else the local
         bookmark document, else a FID-neutral label): no cloud request is made.
@@ -1011,13 +1005,29 @@ class Service:
         request = {"id": secrets.token_hex(16), "fid": fid or "", "name": self._bookmark_target_name(fid) if fid else "全部视频"}
         if fid is None:
             request["scope"] = "all"
+        if parent is not None:
+            request.update(scope='parent', parent=parent, name=self.directory_names().get(parent, '当前目录'))
+        if action == 'add':
+            request['action'] = action
         with self._bookmark_lock:
             self._bookmark_request = request
             try:
-                return self.open_status_window()
-            except LocalIOError:
+                if self._highlight_process is not None and self._highlight_process.poll() is None:
+                    return 'already_open'
+                self._highlight_process = (self._highlight_launcher or _spawn_highlights_window)()
+                return 'opened'
+            except (OSError, LocalIOError):
                 self._bookmark_request = None
-                raise
+                raise LocalIOError('无法打开精彩标记窗口') from None
+
+    def bookmark_items(self) -> list[dict[str, Any]]:
+        """Upgrade known old marks using local history/listing metadata only."""
+        directories = {row['fid']: (row.get('parent', ''), row.get('parent_name', '')) for row in self.library.snapshot()['recent']}
+        names = self.directory_names()
+        with self._parent_lock:
+            directories.update({fid: (parent, names.get(parent, '')) for fid, parent in self._parents.items()})
+        self.monitor.bookmarks.set_directories(directories)
+        return self.monitor.bookmarks.list()
 
     def _bookmark_target_name(self, fid: str) -> str:
         """The best local name for ``fid``: recent row, then bookmark, else neutral."""
@@ -1049,6 +1059,9 @@ class Service:
                 session.fid, session.name, session.size,
                 self.parent_of(session.fid), self.parent_name_of(session.fid),
             )
+            recent = next(row for row in self.library.snapshot()['recent'] if row['fid'] == session.fid)
+            session.parent = recent['parent']
+            session.parent_name = recent['parent_name']
             self.monitor.stream_started(session.session)
 
     def remove_history(self, fid: str) -> None:
@@ -1078,7 +1091,10 @@ class Service:
         ``/v1/play`` and records normally.
         """
         with self._history_lock:
-            return self.sessions.create(media)
+            session = self.sessions.create(media)
+            session.parent = self.parent_of(media.fid)
+            session.parent_name = self.parent_name_of(media.fid)
+            return session
 
     # -- lifecycle -------------------------------------------------------
 
@@ -1327,7 +1343,7 @@ class _Handler(BaseHTTPRequestHandler):
             if method not in ('GET', 'HEAD'):
                 return self._json(405, _failure('method_not_allowed', '该接口只接受 GET'))
             return self._json(200, {'account_id': account_id,
-                                    'playback': monitor.snapshot(),
+                                    'playback': monitor.snapshot(directories=True),
                                     'bookmark_request': service.bookmark_request()})
         return self._json(404, _failure('not_found', '未知观察接口'))
 
@@ -1472,15 +1488,16 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
             # Local-only: the plugin's own bookmark document needs no Quark login.
             fid = require_fid(_first(query, "fid", ""), label="fid") if "fid" in query else None
-            items = service.monitor.bookmarks.list(fid)
+            items = service.bookmark_items()
+            if fid is not None:
+                items = [entry for entry in items if entry['fid'] == fid]
             parent = _first(query, "parent", None)
             if parent is not None:
-                service.require_login()
                 parent = require_fid(parent, label="parent", allow_root=True)
-                _, videos = playlist(service.files(), parent, None)
-                fids = {video["fid"] for video in videos}
-                items = [entry for entry in items if entry["fid"] in fids]
-            return self._json(200, {"items": items})
+                items = [entry for entry in items if entry.get('parent') == parent]
+            if _first(query, 'unclassified', '') == '1':
+                items = [entry for entry in items if not entry.get('parent')]
+            return self._json(200, {"items": items, **({'groups': bookmark_groups(items)} if fid is None else {})})
         if route == "/v1/bookmarks/add":
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
@@ -1517,8 +1534,12 @@ class _Handler(BaseHTTPRequestHandler):
             # Local-only: the target name is read from local state, no login and
             # no cloud request are needed to open the bookmark window.
             body = self._body(raw)
-            fid = None if body.get("scope") == "all" else require_fid(body.get("fid"), label="fid")
-            return self._json(202, {"status": service.request_bookmark_window(fid)})
+            parent = require_fid(body['parent'], label='parent', allow_root=True) if 'parent' in body else None
+            fid = None if body.get("scope") == "all" or parent is not None else require_fid(body.get("fid"), label="fid")
+            action = body.get('action', 'manage')
+            if action not in ('manage', 'add'):
+                raise UsageError('精彩标记动作无效')
+            return self._json(202, {"status": service.request_bookmark_window(fid, parent=parent, action=action)})
         if route == "/v1/bookmarks/play":
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
@@ -1940,6 +1961,12 @@ def _spawn_bookmark_player(bookmark_id: str, account_id: str | None = None) -> A
                 except OSError:
                     raise LocalIOError("无法打开 PotPlayer，请检查安装目录") from None
     raise LocalIOError("未找到已安装的 PotPlayer，请重新运行插件安装程序")
+
+
+def _spawn_highlights_window() -> Any:
+    return subprocess.Popen(
+        [sys.executable or 'python', '-m', 'quark_cli.potplayer', '--highlights-window'], **_detached_options()
+    )
 
 
 def _spawn_status_window() -> Any:

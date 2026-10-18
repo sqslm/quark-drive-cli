@@ -49,6 +49,7 @@ class _Case(unittest.TestCase):
             transport=self.fixture.transport(),
             cookie=self.cookie,
             status_launcher=self._launch,
+            highlight_launcher=self._launch,
             monitor_start=False,
         )
         self.server = self.service.build_server()
@@ -401,11 +402,11 @@ class BookmarkOpenCase(_Case):
         self.assertEqual(again["fid"], "ghost")
         self.assertNotEqual(again["id"], request["id"])
 
-    def test_a_plain_open_clears_a_stale_target(self):
+    def test_management_open_does_not_cancel_an_independent_highlight_request(self):
         self.api("POST", "/v1/bookmarks/open", body={"fid": "v2"})
         self.assertIsNotNone(self.snapshot_request())
         self.assertEqual(self.api("POST", "/v1/diagnostics/open", body={}).status_code, 202)
-        self.assertIsNone(self.snapshot_request())
+        self.assertEqual(self.snapshot_request()['fid'], 'v2')
 
     def test_a_launcher_failure_answers_500_and_leaves_no_target(self):
         self.fail_open = True

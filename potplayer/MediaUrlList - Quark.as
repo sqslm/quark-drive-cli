@@ -53,6 +53,8 @@ string QUARK_CENTER_SERIES = "quark-center-series-";
 string QUARK_ACTION_VIDEO = "quark-video-actions-";
 string QUARK_ACTION_BOOKMARKS = "quark-video-bookmarks-";
 string QUARK_ACTION_HIGHLIGHTS = "quark-highlights-directory-";
+string QUARK_HIGHLIGHTS_GROUP = "quark-highlights-group-";
+string QUARK_HIGHLIGHTS_CAPTURE = "quark-highlights-capture-";
 string QUARK_MARK_PREFIX = "https://quark.invalid/mark/";
 string QUARK_ACTION_REMOVE_ASK = "quark-remove-ask-";
 string QUARK_ACTION_REMOVE_DO = "quark-remove-do-";
@@ -71,7 +73,7 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "0.10.1";
+	return "0.11.0";
 }
 
 string GetDesc()
@@ -528,14 +530,6 @@ void QuarkAppendItems(array<dictionary> &ret, JsonValue &items)
 			continue;
 		}
 		ret.insertLast(row);
-		if (!(directory.isBool() && directory.asBool()) && QuarkIsVideo(name.asString()))
-		{
-			dictionary mark;
-			mark["title"] = "精彩标记：" + name.asString();
-			mark["folder"] = "1";
-			mark["PathToken"] = QUARK_ACTION_BOOKMARKS + fid.asString();
-			ret.insertLast(mark);
-		}
 	}
 }
 
@@ -727,6 +721,11 @@ void QuarkAppendSeriesRows(array<dictionary> &ret, string parent, JsonValue &roo
 	marks["folder"] = "1";
 	marks["PathToken"] = QUARK_ACTION_HIGHLIGHTS + parent;
 	ret.insertLast(marks);
+	dictionary capture;
+	capture["title"] = "标记当前时间点";
+	capture["folder"] = "1";
+	capture["PathToken"] = QUARK_HIGHLIGHTS_CAPTURE + parent;
+	ret.insertLast(capture);
 
 	JsonValue target = root["continue"];
 
@@ -1325,18 +1324,39 @@ array<dictionary> QuarkHighlightsList(string parent)
 {
 	array<dictionary> ret;
 	dictionary manage;
-	manage["title"] = "管理全部精彩标记";
+	manage["title"] = (parent.empty() || parent == "~unknown") ? "管理全部精彩标记" : "管理当前目录精彩标记";
 	manage["folder"] = "1";
 	manage["PathToken"] = "quark-highlights-manage-all";
+	if (!parent.empty() && parent != "~unknown") manage["PathToken"] = QUARK_ACTION_HIGHLIGHTS + parent;
 	ret.insertLast(manage);
 	string request = "/v1/bookmarks";
-	if (!parent.empty()) request += "?parent=" + HostUrlEncode(parent);
+	if (parent == "~unknown") request += "?unclassified=1";
+	else if (!parent.empty()) request += "?parent=" + HostUrlEncode(parent);
 	string response = QuarkRequest(request, "");
 	string message;
 	if (QuarkFailed(response, message)) return QuarkActionResult(message);
 	JsonReader reader;
 	JsonValue root;
 	if (!reader.parse(response, root) || !root.isObject()) return QuarkActionResult("读取精彩标记失败");
+	if (parent.empty())
+	{
+		JsonValue groups = root["groups"];
+		if (!groups.isArray()) return ret;
+		for (int index = 0; index < groups.size(); index++)
+		{
+			JsonValue group = groups[index];
+			JsonValue key = group["parent"];
+			JsonValue name = group["name"];
+			JsonValue count = group["count"];
+			if (!key.isString() || !name.isString() || !count.isInt()) continue;
+			dictionary folder;
+			folder["title"] = name.asString() + "（" + formatInt(count.asInt()) + " 个精彩点）";
+			folder["folder"] = "1";
+			folder["PathToken"] = QUARK_HIGHLIGHTS_GROUP + (key.asString().empty() ? "~unknown" : key.asString());
+			ret.insertLast(folder);
+		}
+		return ret;
+	}
 	JsonValue items = root["items"];
 	if (!items.isArray()) return ret;
 	int count = items.size();
@@ -1361,6 +1381,18 @@ array<dictionary> QuarkHighlightsList(string parent)
 		ret.insertLast(row);
 	}
 	return ret;
+}
+
+array<dictionary> QuarkHighlightsOpenPage(string parent, bool capture)
+{
+	if (!QuarkValidFid(parent)) return QuarkActionResult("目录标识无效");
+	string body = "{\"parent\":\"" + parent + "\"";
+	if (capture) body += ",\"action\":\"add\"";
+	body += "}";
+	string response = QuarkRequest("/v1/bookmarks/open", body);
+	string message;
+	if (QuarkFailed(response, message)) return QuarkActionResult(message);
+	return QuarkActionResult(capture ? "请在精彩标记窗口填写备注" : "已打开当前目录精彩标记窗口");
 }
 
 array<dictionary> GetCategorys()
@@ -1427,6 +1459,12 @@ array<dictionary> QuarkAccountUrlList(string Category, string Extra, string Path
 		return QuarkActionResult("已打开全部精彩标记管理窗口");
 	}
 	if (Category == "highlights" && PathToken.empty()) return QuarkHighlightsList("");
+	if (PathToken.find(QUARK_HIGHLIGHTS_GROUP) == 0)
+		return QuarkHighlightsList(PathToken.substr(QUARK_HIGHLIGHTS_GROUP.length()));
+	if (PathToken.find(QUARK_HIGHLIGHTS_CAPTURE) == 0)
+		return QuarkHighlightsOpenPage(PathToken.substr(QUARK_HIGHLIGHTS_CAPTURE.length()), true);
+	if (PathToken.find(QUARK_ACTION_HIGHLIGHTS) == 0)
+		return QuarkHighlightsOpenPage(PathToken.substr(QUARK_ACTION_HIGHLIGHTS.length()), false);
 
 	// 追剧中心根页只读本地 /v1/watch-center：登出或冷却时也能看到分组列表。
 	if (Category == "continue" && PathToken.empty()) return QuarkWatchCenterList();
@@ -1447,8 +1485,6 @@ array<dictionary> QuarkAccountUrlList(string Category, string Extra, string Path
 		return QuarkBookmarksOpenPage(PathToken.substr(QUARK_ACTION_BOOKMARKS.length()));
 
 	if (!QuarkEnsureLogin()) return QuarkStatus(QuarkLoginReason());
-	if (PathToken.find(QUARK_ACTION_HIGHLIGHTS) == 0)
-		return QuarkHighlightsList(PathToken.substr(QUARK_ACTION_HIGHLIGHTS.length()));
 
 	// 剧集分组页会远程读取一次该目录的 /v1/series，因此需要登录。
 	if (PathToken.find(QUARK_CENTER_SERIES) == 0)

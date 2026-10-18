@@ -42,6 +42,8 @@ class ManagementWindow:
                 tabs.add(frame, text=title)
                 client = client_type(self.endpoint) if self.endpoint is not None else None
                 page = page_type(client, self.endpoint)
+                if isinstance(page, HighlightsPanel):
+                    page.consume_requests = False
                 self.pages.append(page)
                 page.mount(tk, root, frame)
             def activate(_event):

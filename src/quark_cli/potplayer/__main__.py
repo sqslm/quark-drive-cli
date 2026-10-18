@@ -13,6 +13,7 @@ from .login_gui import QrLoginWindow
 from .plugin_state import credential_path
 from .service import EXIT_OK, ensure_service, run_service, stop_service
 from .status_gui import run_status_window
+from .highlights_gui import run_highlights_window
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -27,6 +28,7 @@ def _parser() -> argparse.ArgumentParser:
     action.add_argument("--stop", action="store_true", help="停止当前用户的后台服务")
     action.add_argument("--login", action="store_true", help="打开扫码窗口，登录插件自己的凭证（不改动 CLI Cookie）")
     action.add_argument("--status-window", action="store_true", help="打开播放状态与诊断窗口（不启动本地服务）")
+    action.add_argument('--highlights-window', action='store_true', help='仅打开精彩标记窗口（不启动本地服务）')
     return parser
 
 
@@ -45,6 +47,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.serve:
         return run_service()
+    if arguments.highlights_window:
+        return run_highlights_window()
     if arguments.status_window:
         # Independent GUI process only: never starts the service or a login.
         return run_status_window()

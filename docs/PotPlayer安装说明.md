@@ -10,7 +10,7 @@
 | `SHA256SUMS.txt` | 安装程序 SHA-256 |
 | `build-info.json` | 构建时间、组件版本、随包扩展脚本清单 |
 
-当前版本为 **0.10.1**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.10.1/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
+当前版本为 **0.11.0**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.11.0/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
 
 构建方式见文末“开发者构建”。
 
@@ -101,7 +101,7 @@ QuarkPotPlayer-Setup.exe --uninstall --silent [--clear-credentials]
 ## 开发者构建
 
 ```
-python packaging/potplayer/build.py --tag 0.10.1          # 读取 potplayer/*.as 生成 dist/potplayer/0.10.1/
+python packaging/potplayer/build.py --tag 0.11.0          # 读取 potplayer/*.as 生成 dist/potplayer/0.11.0/
 python packaging/potplayer/build.py --as-dir DIR --out-dir DIR   # 指定扩展脚本目录与输出目录
 python packaging/potplayer/build.py --component-only       # 只构建并打包组件
 python packaging/potplayer/build.py --skip-component       # 复用既有组件产物

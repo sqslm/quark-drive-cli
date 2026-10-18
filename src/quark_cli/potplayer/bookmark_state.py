@@ -26,8 +26,9 @@ from .plugin_state import plugin_directory
 BOOKMARK_NAME = "bookmark.json"
 #: Longest accepted note in *characters* (Chinese counts one per character).
 NOTE_LIMIT = 200
-_DOCUMENT_VERSION = 1
+_DOCUMENT_VERSION = 2
 _KEYS = frozenset({"id", "fid", "name", "size", "position_ms", "duration_ms", "note"})
+_DIRECTORY_KEYS = frozenset({'parent', 'parent_name'})
 _CORRUPT = "精彩标记库损坏，已停止；不会覆盖现有文件"
 _UNSUPPORTED = "精彩标记库版本不受支持，已停止"
 
@@ -55,13 +56,13 @@ def _count(value: Any) -> int:
 
 
 def _entry(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, dict) or set(raw) != _KEYS:
+    if not isinstance(raw, dict) or set(raw) not in (_KEYS, _KEYS | _DIRECTORY_KEYS):
         raise LocalIOError(_CORRUPT)
     try:
         fid = valid_fid(raw["fid"])
     except RemoteError:
         raise LocalIOError(_CORRUPT) from None
-    return {
+    entry = {
         "id": _text(raw["id"]),
         "fid": fid,
         "name": _text(raw["name"]),
@@ -70,13 +71,22 @@ def _entry(raw: Any) -> dict[str, Any]:
         "duration_ms": _count(raw["duration_ms"]),
         "note": _note(raw["note"]),
     }
+    if 'parent' in raw:
+        try:
+            entry['parent'] = valid_fid(raw['parent'])
+        except RemoteError:
+            raise LocalIOError(_CORRUPT) from None
+        if not isinstance(raw['parent_name'], str):
+            raise LocalIOError(_CORRUPT)
+        entry['parent_name'] = raw['parent_name']
+    return entry
 
 
 def _checked(document: Any) -> list[dict[str, Any]]:
     """Validate the stored document instead of silently dropping its entries."""
     if not isinstance(document, dict):
         raise LocalIOError(_CORRUPT)
-    if document.get("version") != _DOCUMENT_VERSION:
+    if document.get("version") not in (1, _DOCUMENT_VERSION):
         raise LocalIOError(_UNSUPPORTED)
     raw = document.get("bookmarks")
     if not isinstance(raw, list):
@@ -142,6 +152,9 @@ class BookmarkStore:
         position_ms: int,
         duration_ms: int,
         note: str,
+        *,
+        parent: str = '',
+        parent_name: str = '',
     ) -> dict[str, Any]:
         """Prepend one bookmark for the exact ``fid``/``size``; return the stored row.
 
@@ -158,11 +171,35 @@ class BookmarkStore:
             "duration_ms": _caller_count(duration_ms, "精彩标记时长无效"),
             "note": _caller_note(note),
         }
+        if parent:
+            if not isinstance(parent_name, str):
+                raise UsageError('精彩标记目录名称无效')
+            entry.update(parent=_caller_fid(parent), parent_name=parent_name)
         with self._lock:
             entries = self._document()
             entries.insert(0, entry)
             self._store(entries)
         return dict(entry)
+
+    def set_directories(self, directories: dict[str, tuple[str, str]]) -> None:
+        """Retain verified directory identities independently of recent history."""
+        with self._lock:
+            entries = self._document()
+            changed = False
+            for entry in entries:
+                context = directories.get(entry['fid'])
+                if context is None or not context[0]:
+                    continue
+                parent, name = context
+                parent = _caller_fid(parent)
+                if not isinstance(name, str):
+                    raise UsageError('精彩标记目录名称无效')
+                if entry.get('parent') != parent or (name and entry.get('parent_name') != name):
+                    saved_name = entry.get('parent_name', '') if entry.get('parent') == parent else ''
+                    entry.update(parent=parent, parent_name=name or saved_name)
+                    changed = True
+            if changed:
+                self._store(entries)
 
     def rename(self, bookmark_id: str, note: str) -> bool:
         """Replace one bookmark's note; ``False`` when the id is unknown."""
@@ -212,3 +249,16 @@ class BookmarkStore:
 
     def _store(self, entries: list[dict[str, Any]]) -> None:
         write_json(self.path, {"version": _DOCUMENT_VERSION, "bookmarks": entries})
+
+
+def bookmark_groups(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group by real parent FID; never merge series by their display names."""
+    groups: dict[str, dict[str, Any]] = {}
+    for entry in items:
+        parent = entry.get('parent', '')
+        name = entry.get('parent_name') or ('我的网盘' if parent == '0' else '未命名剧集' if parent else '未分类')
+        group = groups.setdefault(parent, {'parent': parent, 'name': name, 'count': 0})
+        if entry.get('parent_name'):
+            group['name'] = entry['parent_name']
+        group['count'] += 1
+    return list(groups.values())

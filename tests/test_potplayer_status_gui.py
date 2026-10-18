@@ -1064,7 +1064,7 @@ class BookmarkWindowTests(unittest.TestCase):
         window._add_bookmark()
         self.assertEqual(window._requests.get_nowait(), ("bookmark_add", 1, "F1", "第 3 分钟"))
         self.assertEqual(window._bookmark_pending, (1, "F1"))
-        self.assertEqual(dialog.calls[0][0], "添加精彩标记")
+        self.assertEqual(dialog.calls[0][0], "标记当前时间点")
 
     def test_a_cancelled_note_never_reaches_the_bridge(self):
         window = _highlights_panel(dialog=_FakeDialog(answer=None))
@@ -1539,6 +1539,9 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
         entries = [dict(BOOKMARK_ENTRY, fid="F1", name="电影.mkv"),
                    dict(BOOKMARK_ENTRY, id="b2", fid="F2", name="剧集.mp4")]
         window._handle("bookmarks", (0, "", entries))
+        self.assertEqual([row[1][0] for row in window._bookmark_tree.rows], ['📁 未分类'])
+        window._bookmark_tree.selected = ('group0',)
+        window._enter_group_or_jump()
         self.assertEqual([row[1][0] for row in window._bookmark_tree.rows], ["电影.mkv", "剧集.mp4"])
         window._bookmark_tree.selected = ("mark1",)
         window._simpledialog = _FakeDialog(answer="高光对白")

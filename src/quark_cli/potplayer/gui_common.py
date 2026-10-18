@@ -343,14 +343,21 @@ def bookmark_request_of(snapshot: Any) -> dict[str, Any] | None:
     fid = request.get("fid")
     if not isinstance(request_id, str) or not request_id:
         return None
+    action = {'action': 'add'} if request.get('action') == 'add' else {}
+    if request.get('scope') == 'parent':
+        parent = request.get('parent')
+        if not isinstance(parent, str) or not parent:
+            return None
+        return {'id': request_id, 'fid': '', 'parent': parent, 'scope': 'parent',
+                'name': request.get('name') or '当前目录', **action}
     if request.get("scope") == "all":
-        return {"id": request_id, "fid": "", "name": "全部视频", "scope": "all"}
+        return {"id": request_id, "fid": "", "name": "全部视频", "scope": "all", **action}
     if not isinstance(fid, str) or not fid:
         return None
     name = request.get("name")
     if not isinstance(name, str) or not name:
         name = fid
-    return {"id": request_id, "fid": fid, "name": name}
+    return {"id": request_id, "fid": fid, "name": name, **action}
 
 
 def external_action_target(playback: Any, fid: Any) -> tuple[int, str] | None:
