@@ -376,7 +376,7 @@ class BookmarkOpenCase(_Case):
     cookie = None
 
     def snapshot_request(self):
-        return self.api("GET", "/v1/diagnostics").json()["bookmark_request"]
+        return self.api("GET", "/v1/bookmarks/state").json()["bookmark_request"]
 
     def test_request_is_retained_named_locally_and_returned(self):
         self.save_document(recent=[self.row("v2", "第2集.mp4")])

@@ -22,14 +22,13 @@ from datetime import datetime
 
 import httpx
 
-from quark_cli.potplayer import status_gui
-from quark_cli.potplayer.status_gui import (
+from quark_cli.potplayer import gui_common
+from quark_cli.potplayer.status_gui import BridgeClient, BridgeWorker, StatusWindow, run_status_window
+from quark_cli.potplayer.highlights_gui import HighlightsClient, HighlightsWorker, HighlightsPanel
+from quark_cli.potplayer.gui_common import (
     POLL_INTERVAL,
     REQUEST_TIMEOUT,
-    BridgeClient,
-    BridgeWorker,
     Endpoint,
-    StatusWindow,
     bookmark_action_enabled,
     bookmark_enabled,
     bookmark_id_of,
@@ -44,7 +43,6 @@ from quark_cli.potplayer.status_gui import (
     match_selection,
     protection_text,
     restart_enabled,
-    run_status_window,
     selection_target,
     state_label,
     validation_label,
@@ -255,7 +253,7 @@ class ClientTests(unittest.TestCase):
         client = _client(handler)
         ok, message = client.restart(7, "FID-1")
         self.assertTrue(ok)
-        self.assertEqual(message, status_gui._RESTART_OK)
+        self.assertEqual(message, gui_common._RESTART_OK)
         self.assertEqual(seen, [{"player_pid": 7, "fid": "FID-1"}])
 
     def test_restart_failures_use_fixed_messages_without_echoing_upstream_text(self):
@@ -278,7 +276,7 @@ class ClientTests(unittest.TestCase):
 
         ok, message = _client(handler).restart(1, "F")
         self.assertFalse(ok)
-        self.assertEqual(message, status_gui._RESTART_FAILED)
+        self.assertEqual(message, gui_common._RESTART_FAILED)
 
     def test_restart_transport_failure_is_bounded_and_fixed(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -286,7 +284,7 @@ class ClientTests(unittest.TestCase):
 
         ok, message = _client(handler).restart(1, "F")
         self.assertFalse(ok)
-        self.assertEqual(message, status_gui._RESTART_FAILED)
+        self.assertEqual(message, gui_common._RESTART_FAILED)
 
 
 class WorkerTests(unittest.TestCase):
@@ -364,7 +362,7 @@ class WorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "report.json")
             worker._serve(("export", path))
-            self.assertEqual(events.get_nowait(), ("export_failed", status_gui._EXPORT_FAILED_REPORT))
+            self.assertEqual(events.get_nowait(), ("export_failed", gui_common._EXPORT_FAILED_REPORT))
             self.assertFalse(os.path.exists(path))
 
     def test_export_to_an_unwritable_path_is_a_fixed_note(self):
@@ -376,7 +374,7 @@ class WorkerTests(unittest.TestCase):
         _, worker, events, _ = _worker(handler)
         target = os.path.join(tempfile.gettempdir(), "quark-missing-dir-xyz", "report.json")
         worker._serve(("export", target))
-        self.assertEqual(events.get_nowait(), ("export_failed", status_gui._EXPORT_FAILED_WRITE))
+        self.assertEqual(events.get_nowait(), ("export_failed", gui_common._EXPORT_FAILED_WRITE))
 
     def test_restart_command_returns_a_fixed_result(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -638,9 +636,9 @@ BOOKMARK_ENTRY = {
 }
 
 
-def _status_window(rows=None, selected=(1, "F1"), connected=True, dialog=None) -> StatusWindow:
-    """A StatusWindow wired to fake widgets: no Tk object is ever created."""
-    window = StatusWindow(None, None)
+def _highlights_panel(rows=None, selected=(1, "F1"), connected=True, dialog=None) -> HighlightsPanel:
+    """A HighlightsPanel wired to fake widgets: no Tk object is ever created."""
+    window = HighlightsPanel(None, None)
     window._root = object()
     window._connected = connected
     window._playback = list(BOOKMARK_ROWS if rows is None else rows)
@@ -676,7 +674,7 @@ class BookmarkClientTests(unittest.TestCase):
             seen.append(request)
             return handler(request)
 
-        client = BridgeClient(_endpoint(), transport=httpx.MockTransport(wrapped))
+        client = HighlightsClient(_endpoint(), transport=httpx.MockTransport(wrapped))
         client.seen = seen
         return client
 
@@ -792,11 +790,11 @@ class BookmarkWorkerTests(unittest.TestCase):
             seen.append(request)
             return handler(request)
 
-        client = BridgeClient(_endpoint(), transport=httpx.MockTransport(wrapped))
+        client = HighlightsClient(_endpoint(), transport=httpx.MockTransport(wrapped))
         events: queue.Queue = queue.Queue()
         requests: queue.Queue = queue.Queue()
         client.seen = seen
-        return client, BridgeWorker(client, events, requests), events, requests
+        return client, HighlightsWorker(client, events, requests), events, requests
 
     def test_every_bookmark_command_is_served_with_its_binding_echoed(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -929,21 +927,21 @@ class BookmarkSelectionTests(unittest.TestCase):
 
 class BookmarkWindowTests(unittest.TestCase):
     def test_opening_reads_only_the_selected_binding(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._open_bookmarks()
         self.assertEqual(window._requests.get_nowait(), ("bookmarks", 1, "F1"))
         self.assertEqual(window._bookmark_pending, (1, "F1"))
-        self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_LOADING)
+        self.assertEqual(window._bookmark_notice_var.value, gui_common._BOOKMARK_LOADING)
         self.assertTrue(window._requests.empty())
 
     def test_opening_without_a_matched_row_never_asks_the_bridge(self):
         for selected in (None, (9, "F9")):
-            window = _status_window(selected=selected)
+            window = _highlights_panel(selected=selected)
             window._open_bookmarks()
             self.assertTrue(window._requests.empty())
 
     def test_a_snapshot_rebuild_keeps_the_selection_and_never_rereads(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmark_window = _FakeToplevel()
         window._refresh_playback()
         self.assertEqual(window._selected, (1, "F1"))
@@ -951,7 +949,7 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertTrue(window._requests.empty())
 
     def test_a_binding_that_disappeared_from_the_snapshot_drops_the_list(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmarks = [dict(BOOKMARK_ENTRY)]
         window._render_bookmarks()
         window._playback = [dict(BOOKMARK_ROWS[1])]
@@ -963,7 +961,7 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertTrue(window._requests.empty())
 
     def test_selecting_another_row_clears_and_rereads_once(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmarks = [dict(BOOKMARK_ENTRY)]
         window._render_bookmarks()
         window._rows = {"row0": (1, "F1"), "row1": (2, "F2")}
@@ -977,7 +975,7 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertTrue(window._requests.empty())
 
     def test_a_late_list_for_another_binding_is_dropped(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmark_pending = (1, "F1")
         window._handle("bookmarks", (2, "F2", [{"id": "b9", "position_ms": 0, "note": "别的"}]))
         self.assertEqual(window._bookmarks, [])
@@ -989,44 +987,44 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertIn("精彩标记：1 条", window._bookmark_header_var.value)
 
     def test_a_failed_list_is_one_fixed_message(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmark_pending = (1, "F1")
         window._handle("bookmarks", (1, "F1", None))
-        self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_LOAD_FAILED)
+        self.assertEqual(window._bookmark_notice_var.value, gui_common._BOOKMARK_LOAD_FAILED)
         self.assertEqual(window._bookmark_tree.rows, [])
         self.assertIsNone(window._bookmark_pending)
 
     def test_a_loaded_list_ends_the_reading_notice(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._open_bookmarks()
-        self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_LOADING)
+        self.assertEqual(window._bookmark_notice_var.value, gui_common._BOOKMARK_LOADING)
         window._handle("bookmarks", (1, "F1", [dict(BOOKMARK_ENTRY)]))
-        self.assertNotEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_LOADING)
+        self.assertNotEqual(window._bookmark_notice_var.value, gui_common._BOOKMARK_LOADING)
         self.assertIn("已读取", window._bookmark_notice_var.value)
         self.assertIn("1", window._bookmark_notice_var.value)
         self.assertIsNone(window._bookmark_pending)
         self.assertTrue(window._bookmark_button.enabled)
 
     def test_a_command_refresh_does_not_erase_the_command_result(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmark_pending = (1, "F1")
         window._handle("bookmark_added", (1, "F1", True))
-        self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_ADDED)
+        self.assertEqual(window._bookmark_notice_var.value, gui_common._BOOKMARK_ADDED)
         # The add triggered an announce=False re-read; its answer must not
         # overwrite the command's own success message with a load message.
         window._handle("bookmarks", (1, "F1", [dict(BOOKMARK_ENTRY)]))
-        self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_ADDED)
+        self.assertEqual(window._bookmark_notice_var.value, gui_common._BOOKMARK_ADDED)
         self.assertIsNone(window._bookmark_pending)
 
     def test_a_late_command_answer_for_another_binding_is_dropped(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmark_pending = (1, "F1")
         window._handle("bookmark_added", (2, "F2", True))
         self.assertEqual(window._bookmark_pending, (1, "F1"))
         self.assertTrue(window._requests.empty())
         window._handle("bookmark_removed", (1, "F1", False))
         self.assertIsNone(window._bookmark_pending)
-        self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_REMOVE_FAILED)
+        self.assertEqual(window._bookmark_notice_var.value, gui_common._BOOKMARK_REMOVE_FAILED)
 
     def test_each_command_has_its_own_fixed_result_message(self):
         cases = (
@@ -1036,18 +1034,18 @@ class BookmarkWindowTests(unittest.TestCase):
             ("bookmark_jumped", "_BOOKMARK_JUMPED", "_BOOKMARK_JUMP_FAILED", False),
         )
         for kind, done, failed, refreshes in cases:
-            window = _status_window()
+            window = _highlights_panel()
             window._bookmark_pending = (1, "F1")
             window._handle(kind, (1, "F1", False))
-            self.assertEqual(window._bookmark_notice_var.value, getattr(status_gui, failed))
-            window = _status_window()
+            self.assertEqual(window._bookmark_notice_var.value, getattr(gui_common, failed))
+            window = _highlights_panel()
             window._bookmark_pending = (1, "F1")
             window._handle(kind, (1, "F1", True))
-            self.assertEqual(window._bookmark_notice_var.value, getattr(status_gui, done))
+            self.assertEqual(window._bookmark_notice_var.value, getattr(gui_common, done))
             self.assertEqual(window._requests.qsize(), 1 if refreshes else 0)
 
     def test_a_late_answer_never_leaks_sensitive_text(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmark_pending = (1, "F1")
         window._handle("bookmarks", (1, "F1", None))
         window._handle("bookmark_added", (1, "F1", False))
@@ -1058,18 +1056,18 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertNotIn(SECRET, rendered)
         self.assertNotIn("http", rendered)
         for name in ("_BOOKMARK_LOAD_FAILED", "_BOOKMARK_ADD_FAILED", "_BOOKMARK_RENAME_FAILED", "_BOOKMARK_REMOVE_FAILED", "_BOOKMARK_JUMP_FAILED"):
-            self.assertTrue(getattr(status_gui, name))
+            self.assertTrue(getattr(gui_common, name))
 
     def test_adding_a_note_targets_the_selected_binding_and_strips_it(self):
         dialog = _FakeDialog(answer="  第 3 分钟  ")
-        window = _status_window(dialog=dialog)
+        window = _highlights_panel(dialog=dialog)
         window._add_bookmark()
         self.assertEqual(window._requests.get_nowait(), ("bookmark_add", 1, "F1", "第 3 分钟"))
         self.assertEqual(window._bookmark_pending, (1, "F1"))
         self.assertEqual(dialog.calls[0][0], "添加精彩标记")
 
     def test_a_cancelled_note_never_reaches_the_bridge(self):
-        window = _status_window(dialog=_FakeDialog(answer=None))
+        window = _highlights_panel(dialog=_FakeDialog(answer=None))
         window._add_bookmark()
         self.assertTrue(window._requests.empty())
         self.assertIsNone(window._bookmark_pending)
@@ -1077,12 +1075,12 @@ class BookmarkWindowTests(unittest.TestCase):
     def test_an_empty_note_is_a_valid_add_and_a_valid_rename(self):
         # The bridge accepts an empty note; the window must not invent a
         # requirement of its own, so a blank answer is sent as an empty string.
-        window = _status_window(dialog=_FakeDialog(answer="   "))
+        window = _highlights_panel(dialog=_FakeDialog(answer="   "))
         window._add_bookmark()
         self.assertEqual(window._requests.get_nowait(), ("bookmark_add", 1, "F1", ""))
         self.assertEqual(window._bookmark_pending, (1, "F1"))
 
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmarks = [dict(BOOKMARK_ENTRY)]
         window._render_bookmarks()
         window._bookmark_tree.selected = ("mark0",)
@@ -1093,22 +1091,22 @@ class BookmarkWindowTests(unittest.TestCase):
         )
 
     def test_a_note_over_the_limit_is_refused_before_the_bridge(self):
-        limit = status_gui.MAX_NOTE_CHARS
+        limit = gui_common.MAX_NOTE_CHARS
         self.assertEqual(limit, 200)
         for answer in ("x" * (limit + 1), "中" * (limit + 1)):
-            window = _status_window(dialog=_FakeDialog(answer=answer))
+            window = _highlights_panel(dialog=_FakeDialog(answer=answer))
             window._add_bookmark()
             self.assertTrue(window._requests.empty())
             self.assertIsNone(window._bookmark_pending)
             self.assertEqual(
-                window._bookmark_notice_var.value, status_gui._BOOKMARK_NOTE_TOO_LONG
+                window._bookmark_notice_var.value, gui_common._BOOKMARK_NOTE_TOO_LONG
             )
 
-        window = _status_window(dialog=_FakeDialog(answer="y" * limit))  # exactly the limit
+        window = _highlights_panel(dialog=_FakeDialog(answer="y" * limit))  # exactly the limit
         window._add_bookmark()
         self.assertEqual(window._requests.get_nowait(), ("bookmark_add", 1, "F1", "y" * limit))
 
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmarks = [dict(BOOKMARK_ENTRY)]
         window._render_bookmarks()
         window._bookmark_tree.selected = ("mark0",)
@@ -1116,30 +1114,30 @@ class BookmarkWindowTests(unittest.TestCase):
         window._rename_bookmark()
         self.assertTrue(window._requests.empty())
         self.assertEqual(
-            window._bookmark_notice_var.value, status_gui._BOOKMARK_NOTE_TOO_LONG
+            window._bookmark_notice_var.value, gui_common._BOOKMARK_NOTE_TOO_LONG
         )
 
     def test_an_empty_note_row_shows_its_timestamp_as_the_default_name(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmark_pending = (1, "F1")
         blank = dict(BOOKMARK_ENTRY, id="b2", note="", position_ms=90_000)
         window._handle("bookmarks", (1, "F1", [blank]))
         self.assertEqual(window._bookmark_tree.rows, [("mark0", ("A.mkv", "00:01:30", "00:01:30"))])
 
     def test_a_dialog_error_and_an_inactive_player_never_ask_the_bridge(self):
-        window = _status_window(dialog=_FakeDialog(error=RuntimeError("窗口已销毁")))
+        window = _highlights_panel(dialog=_FakeDialog(error=RuntimeError("窗口已销毁")))
         window._add_bookmark()
         self.assertTrue(window._requests.empty())
 
         dialog = _FakeDialog(answer="备注")
-        window = _status_window(selected=(2, "F2"), dialog=dialog)  # stopped row
+        window = _highlights_panel(selected=(2, "F2"), dialog=dialog)  # stopped row
         window._add_bookmark()
         self.assertTrue(window._requests.empty())
         self.assertEqual(dialog.calls, [])
 
     def test_a_selection_change_during_the_dialog_aborts_the_operation(self):
         for replacement in ((3, "F3"), (2, "F2")):
-            window = _status_window()
+            window = _highlights_panel()
 
             def move(window=window, replacement=replacement):
                 # ``simpledialog`` re-enters mainloop: a snapshot may retarget.
@@ -1149,10 +1147,10 @@ class BookmarkWindowTests(unittest.TestCase):
             window._add_bookmark()
             self.assertTrue(window._requests.empty())
             self.assertIsNone(window._bookmark_pending)
-            self.assertEqual(window._bookmark_notice_var.value, status_gui._BOOKMARK_STALE)
+            self.assertEqual(window._bookmark_notice_var.value, gui_common._BOOKMARK_STALE)
 
     def test_rename_remove_and_jump_use_the_visible_row(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmarks = [dict(BOOKMARK_ENTRY)]
         window._render_bookmarks()
         window._bookmark_tree.selected = ("mark0",)
@@ -1172,7 +1170,7 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertEqual(window._requests.get_nowait(), ("bookmark_jump", 1, "F1", "b1"))
 
     def test_commands_without_a_selected_bookmark_row_or_a_live_player_are_ignored(self):
-        window = _status_window(dialog=_FakeDialog(answer="新备注"))
+        window = _highlights_panel(dialog=_FakeDialog(answer="新备注"))
         window._bookmarks = [dict(BOOKMARK_ENTRY)]
         window._render_bookmarks()
         window._rename_bookmark()
@@ -1180,7 +1178,7 @@ class BookmarkWindowTests(unittest.TestCase):
         window._jump_bookmark()
         self.assertTrue(window._requests.empty())
 
-        window = _status_window(selected=(2, "F2"))  # stopped binding
+        window = _highlights_panel(selected=(2, "F2"))  # stopped binding
         window._bookmarks = [dict(BOOKMARK_ENTRY)]
         window._render_bookmarks()
         window._bookmark_tree.selected = ("mark0",)
@@ -1190,7 +1188,7 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertEqual(window._requests.get_nowait(), ("bookmark_remove", 2, "F2", "b1"))
 
     def test_button_gating_follows_selection_and_pending_requests(self):
-        window = _status_window(selected=None)
+        window = _highlights_panel(selected=None)
         window._update_actions()
         self.assertFalse(window._bookmark_button.enabled)
 
@@ -1218,7 +1216,7 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertTrue(window._bookmark_jump_button.enabled)
 
     def test_a_stopped_binding_may_be_listed_but_not_bookmarked_or_jumped(self):
-        window = _status_window(selected=(2, "F2"))
+        window = _highlights_panel(selected=(2, "F2"))
         window._bookmarks = [dict(BOOKMARK_ENTRY)]
         window._render_bookmarks()
         window._bookmark_tree.selected = ("mark0",)
@@ -1230,7 +1228,7 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertEqual(window._requests.get_nowait(), ("bookmarks", 2, "F2"))
 
     def test_a_multi_instance_binding_may_be_listed_but_not_bookmarked_or_jumped(self):
-        window = _status_window(
+        window = _highlights_panel(
             rows=[{"player_pid": 1, "fid": "F1", "name": "A.mkv", "state": "suspended"}]
         )
         window._update_actions()
@@ -1240,14 +1238,14 @@ class BookmarkWindowTests(unittest.TestCase):
         window._on_bookmark_select()
         self.assertFalse(window._bookmark_add_button.enabled)
         self.assertFalse(window._bookmark_jump_button.enabled)
-        self.assertFalse(window._restart_button.enabled)
+        self.assertFalse(restart_enabled(window._connected, window._playback, window._selected))
         self.assertTrue(window._bookmark_rename_button.enabled)
         self.assertTrue(window._bookmark_remove_button.enabled)
         window._open_bookmarks()
         self.assertEqual(window._requests.get_nowait(), ("bookmarks", 1, "F1"))
 
     def test_jump_needs_a_row_of_the_attached_list(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._update_bookmark_actions()
         self.assertFalse(window._bookmark_jump_button.enabled)  # no list yet
         window._open_bookmarks()
@@ -1261,7 +1259,7 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertFalse(window._bookmark_jump_button.enabled)
 
     def test_disconnect_clears_the_list_and_says_why(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmarks = [dict(BOOKMARK_ENTRY)]
         window._render_bookmarks()
         window._bookmark_pending = (1, "F1")
@@ -1270,12 +1268,12 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertEqual(window._bookmark_tree.rows, [])
         self.assertEqual(window._bookmark_rows, {})
         self.assertIsNone(window._bookmark_pending)
-        self.assertEqual(window._bookmark_notice_var.value, status_gui._DISCONNECTED_NOTE)
+        self.assertEqual(window._bookmark_notice_var.value, gui_common._DISCONNECTED_NOTE)
         window._open_bookmarks()
         self.assertTrue(window._requests.empty())
 
     def test_closing_the_window_drops_its_state_and_ignores_late_answers(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmarks = [dict(BOOKMARK_ENTRY)]
         window._render_bookmarks()
         window._bookmark_pending = (1, "F1")
@@ -1290,7 +1288,7 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertTrue(window._requests.empty())
 
     def test_opening_a_live_window_raises_it_and_rereads(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._bookmark_window.lift()
         window._open_bookmarks()
         self.assertEqual(window._bookmark_window.lifted, 2)
@@ -1306,7 +1304,7 @@ class ExternalBookmarkRequestTests(unittest.TestCase):
 
     def test_only_a_well_formed_request_is_accepted(self):
         self.assertEqual(
-            status_gui.bookmark_request_of(
+            gui_common.bookmark_request_of(
                 {"bookmark_request": {"id": "r1", "fid": "F1", "name": "A.mkv"}}
             ),
             {"id": "r1", "fid": "F1", "name": "A.mkv"},
@@ -1315,7 +1313,7 @@ class ExternalBookmarkRequestTests(unittest.TestCase):
         for name in (None, ""):
             request = {"id": "r1", "fid": "F1", "name": name}
             self.assertEqual(
-                status_gui.bookmark_request_of({"bookmark_request": request}),
+                gui_common.bookmark_request_of({"bookmark_request": request}),
                 {"id": "r1", "fid": "F1", "name": "F1"},
             )
         for bad in (
@@ -1330,7 +1328,7 @@ class ExternalBookmarkRequestTests(unittest.TestCase):
             {"bookmark_request": {"id": "r1", "fid": ""}},
             {"bookmark_request": {"id": "r1", "fid": 7}},
         ):
-            self.assertIsNone(status_gui.bookmark_request_of(bad))
+            self.assertIsNone(gui_common.bookmark_request_of(bad))
 
     def test_the_action_target_needs_one_operable_binding(self):
         def rows(*states, pid=1, fid="F1"):
@@ -1339,21 +1337,21 @@ class ExternalBookmarkRequestTests(unittest.TestCase):
                 for i, state in enumerate(states)
             ]
 
-        self.assertEqual(status_gui.external_action_target(rows("playing"), "F1"), (1, "F1"))
-        self.assertEqual(status_gui.external_action_target(rows("paused"), "F1"), (1, "F1"))
+        self.assertEqual(gui_common.external_action_target(rows("playing"), "F1"), (1, "F1"))
+        self.assertEqual(gui_common.external_action_target(rows("paused"), "F1"), (1, "F1"))
         # A binding that is not actually playing is no action target at all.
         for state in ("waiting", "unknown", "stopped", "suspended", "mismatch", "missing"):
-            self.assertIsNone(status_gui.external_action_target(rows(state), "F1"))
+            self.assertIsNone(gui_common.external_action_target(rows(state), "F1"))
         # Only the exact FID counts and the binding must carry a real pid.
-        self.assertIsNone(status_gui.external_action_target(rows("playing"), "F2"))
-        self.assertIsNone(status_gui.external_action_target(rows("playing"), ""))
+        self.assertIsNone(gui_common.external_action_target(rows("playing"), "F2"))
+        self.assertIsNone(gui_common.external_action_target(rows("playing"), ""))
         self.assertIsNone(
-            status_gui.external_action_target(
+            gui_common.external_action_target(
                 [{"player_pid": 0, "fid": "F1", "state": "playing"}], "F1"
             )
         )
         self.assertIsNone(
-            status_gui.external_action_target(
+            gui_common.external_action_target(
                 [{"player_pid": "1", "fid": "F1", "state": "playing"}], "F1"
             )
         )
@@ -1363,12 +1361,12 @@ class ExternalBookmarkRequestTests(unittest.TestCase):
             {"player_pid": 1, "fid": "F1", "name": "A.mkv", "state": "playing"},
             {"player_pid": 3, "fid": "F1", "name": "A.mkv", "state": "playing"},
         ]
-        self.assertIsNone(status_gui.external_action_target(two, "F1"))
+        self.assertIsNone(gui_common.external_action_target(two, "F1"))
         # One operable plus a not-operable duplicate is still exactly one candidate.
         mixed = two[:1] + [
             {"player_pid": 3, "fid": "F1", "name": "A.mkv", "state": "waiting"}
         ]
-        self.assertEqual(status_gui.external_action_target(mixed, "F1"), (1, "F1"))
+        self.assertEqual(gui_common.external_action_target(mixed, "F1"), (1, "F1"))
 
     def test_a_suspended_sibling_blocks_an_operable_instance(self):
         # Two same-FID instances are really active (one playing, one suspended by
@@ -1376,10 +1374,10 @@ class ExternalBookmarkRequestTests(unittest.TestCase):
         # add/jump with 409 media_changed, so no order may enable the action.
         playing = {"player_pid": 1, "fid": "F1", "name": "A.mkv", "state": "playing"}
         suspended = {"player_pid": 2, "fid": "F1", "name": "A.mkv", "state": "suspended"}
-        self.assertIsNone(status_gui.external_action_target([playing, suspended], "F1"))
-        self.assertIsNone(status_gui.external_action_target([suspended, playing], "F1"))
+        self.assertIsNone(gui_common.external_action_target([playing, suspended], "F1"))
+        self.assertIsNone(gui_common.external_action_target([suspended, playing], "F1"))
         self.assertIsNone(
-            status_gui.external_action_target(
+            gui_common.external_action_target(
                 [playing, suspended, {"player_pid": 3, "fid": "F1", "state": "paused"}],
                 "F1",
             )
@@ -1388,20 +1386,20 @@ class ExternalBookmarkRequestTests(unittest.TestCase):
         # operable binding still acts, in either order.
         waiting = {"player_pid": 3, "fid": "F1", "name": "A.mkv", "state": "waiting"}
         self.assertEqual(
-            status_gui.external_action_target([playing, waiting], "F1"), (1, "F1")
+            gui_common.external_action_target([playing, waiting], "F1"), (1, "F1")
         )
         self.assertEqual(
-            status_gui.external_action_target([waiting, playing], "F1"), (1, "F1")
+            gui_common.external_action_target([waiting, playing], "F1"), (1, "F1")
         )
         # A suspended row for another FID, or one without a real pid, never blocks.
         self.assertEqual(
-            status_gui.external_action_target(
+            gui_common.external_action_target(
                 [playing, {"player_pid": 4, "fid": "F2", "state": "suspended"}], "F1"
             ),
             (1, "F1"),
         )
         self.assertEqual(
-            status_gui.external_action_target(
+            gui_common.external_action_target(
                 [playing, {"player_pid": 0, "fid": "F1", "state": "suspended"}], "F1"
             ),
             (1, "F1"),
@@ -1421,18 +1419,18 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
         }
 
     def test_an_external_request_opens_the_manager_without_any_playback(self):
-        window = _status_window(rows=[], selected=None)
+        window = _highlights_panel(rows=[], selected=None)
         window._apply_snapshot(self._snapshot(window))
         self.assertEqual(window._external, _external_request())
         self.assertEqual(window._requests.get_nowait(), ("bookmarks", 0, "F1"))
         self.assertIn("外部视频.mkv", window._bookmark_header_var.value)
-        self.assertIn(status_gui._BOOKMARK_EXTERNAL_REASON, window._bookmark_header_var.value)
+        self.assertIn(gui_common._BOOKMARK_EXTERNAL_REASON, window._bookmark_header_var.value)
         self.assertFalse(window._bookmark_add_button.enabled)
         self.assertFalse(window._bookmark_jump_button.enabled)
         self.assertTrue(window._requests.empty())
 
     def test_each_request_id_runs_once_and_a_new_id_runs_again(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._apply_snapshot(self._snapshot(window, "r1"))
         self.assertEqual(window._requests.get_nowait(), ("bookmarks", 0, "F1"))
         # The very same request surviving later polls must not re-read the list.
@@ -1445,7 +1443,7 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
         self.assertTrue(window._requests.empty())
 
     def test_a_queued_reselect_after_a_refresh_keeps_the_external_target(self):
-        window = _status_window(selected=(1, "F1"))
+        window = _highlights_panel(selected=(1, "F1"))
         window._external = _external_request()
         window._bookmarks = [dict(BOOKMARK_ENTRY)]
         window._render_bookmarks()
@@ -1460,7 +1458,7 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
         self.assertTrue(window._requests.empty())
 
     def test_a_periodic_snapshot_keeps_the_external_target_across_queued_events(self):
-        window = _status_window(selected=(1, "F1"))
+        window = _highlights_panel(selected=(1, "F1"))
         window._apply_snapshot(self._snapshot(window))
         self.assertEqual(window._requests.get_nowait(), ("bookmarks", 0, "F1"))
         window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
@@ -1473,7 +1471,7 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
         self.assertTrue(window._requests.empty())
 
     def test_an_explicit_different_row_leaves_external_mode(self):
-        window = _status_window(selected=(1, "F1"))
+        window = _highlights_panel(selected=(1, "F1"))
         window._external = _external_request()
         window._rows = {"row0": (1, "F1"), "row1": (2, "F2")}
         window._playback_tree.selected = ("row1",)
@@ -1483,7 +1481,7 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
         self.assertEqual(window._requests.get_nowait(), ("bookmarks", 2, "F2"))
 
     def test_external_add_and_jump_use_the_one_real_pid_never_the_sentinel(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._external = _external_request()
         window._bookmark_pending = (0, "F1")
         window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
@@ -1507,7 +1505,7 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
             [{"player_pid": 1, "fid": "F1", "name": "A.mkv", "state": "waiting"}],
         )
         for rows in cases:
-            window = _status_window(rows=rows, selected=None)
+            window = _highlights_panel(rows=rows, selected=None)
             window._external = _external_request()
             window._bookmark_pending = (0, "F1")
             window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
@@ -1517,13 +1515,13 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
             self.assertFalse(window._bookmark_jump_button.enabled)
             self.assertTrue(window._bookmark_rename_button.enabled)
             self.assertTrue(window._bookmark_remove_button.enabled)
-            self.assertIn(status_gui._BOOKMARK_EXTERNAL_REASON, window._bookmark_header_var.value)
+            self.assertIn(gui_common._BOOKMARK_EXTERNAL_REASON, window._bookmark_header_var.value)
             window._add_bookmark()
             window._jump_bookmark()
             self.assertTrue(window._requests.empty())  # no pid 0 ever reaches the bridge
 
     def test_external_mark_can_open_a_video_that_is_not_playing(self):
-        window = _status_window(rows=[], selected=None)
+        window = _highlights_panel(rows=[], selected=None)
         window._external = _external_request()
         window._bookmark_pending = (0, "F1")
         window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
@@ -1534,7 +1532,7 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
         self.assertEqual(window._requests.get_nowait(), ("bookmark_play", 0, "F1", "b1"))
 
     def test_global_manager_lists_multiple_videos_and_edits_notes_without_playback(self):
-        window = _status_window(rows=[], selected=None)
+        window = _highlights_panel(rows=[], selected=None)
         request = {"id": "all1", "scope": "all"}
         window._consume_bookmark_request({"bookmark_request": request})
         self.assertEqual(window._requests.get_nowait(), ("bookmarks", 0, ""))
@@ -1548,7 +1546,7 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
         self.assertEqual(window._requests.get_nowait(), ("bookmark_rename", 0, "", "b2", "高光对白"))
 
     def test_external_offline_rename_and_remove_use_the_sentinel(self):
-        window = _status_window(rows=[], selected=None)
+        window = _highlights_panel(rows=[], selected=None)
         window._external = _external_request()
         window._bookmark_pending = (0, "F1")
         window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
@@ -1564,7 +1562,7 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
         self.assertEqual(window._requests.get_nowait(), ("bookmark_remove", 0, "F1", "b1"))
 
     def test_late_answers_for_another_binding_are_dropped(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._external = _external_request()
         window._bookmark_pending = (0, "F1")
         window._handle("bookmarks", (1, "F1", [dict(BOOKMARK_ENTRY)]))
@@ -1577,7 +1575,7 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
         self.assertIn("精彩标记：1 条", window._bookmark_header_var.value)
 
     def test_closing_drops_external_and_the_same_id_never_reopens(self):
-        window = _status_window()
+        window = _highlights_panel()
         window._apply_snapshot(self._snapshot(window, "r1"))
         window._requests.get_nowait()
         window._close_bookmarks()

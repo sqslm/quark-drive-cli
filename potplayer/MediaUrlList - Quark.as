@@ -71,7 +71,7 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "0.10.0";
+	return "0.10.1";
 }
 
 string GetDesc()
@@ -1199,15 +1199,15 @@ array<dictionary> QuarkRecentRemovePage(string fid)
 	return QuarkActionResult("已删除本条观看记录");
 }
 
-// 诊断入口：请本地服务拉起独立的“播放状态与诊断”窗口。窗口自行读取运行时记录，
+// 诊断入口：请本地服务拉起独立的“插件管理（账号 / 精彩标记 / 诊断）”窗口。窗口自行读取运行时记录，
 // 脚本不接触令牌或地址；重复刷新时服务端复用同一个窗口，操作幂等。
-array<dictionary> QuarkDiagnosticsPage()
+array<dictionary> QuarkManagementPage()
 {
-	string response = QuarkRequest("/v1/diagnostics/open", "{\"client\":\"potplayer\"}");
+	string response = QuarkRequest("/v1/management/open", "{\"client\":\"potplayer\"}");
 	string message;
 
 	if (QuarkFailed(response, message)) return QuarkActionResult(message);
-	return QuarkActionResult("已打开播放状态与诊断窗口");
+	return QuarkActionResult("已打开插件管理（账号 / 精彩标记 / 诊断）窗口");
 }
 
 // 搜索根页面用 Query 查全网盘；进入结果目录后按 FID 浏览，不再使用 Query。
@@ -1404,7 +1404,7 @@ array<dictionary> GetCategorys()
 
 	dictionary diagnostics;
 
-	diagnostics["title"] = "{$CP936=播放状态与诊断$}{$CP950=播放狀態與診斷$}{$CP0=Playback Status$}";
+	diagnostics["title"] = "{$CP936=插件管理（账号 / 精彩标记 / 诊断）$}{$CP950=播放狀態與診斷$}{$CP0=Playback Status$}";
 	diagnostics["Category"] = "diagnostics";
 	ret.insertLast(diagnostics);
 	return ret;
@@ -1418,7 +1418,7 @@ array<dictionary> QuarkAccountUrlList(string Category, string Extra, string Path
 
 	// 诊断窗口是纯本地功能：不需要夸克登录，必须在登录检查之前处理，
 	// 否则未登录用户永远看不到诊断入口。
-	if (Category == "diagnostics") return QuarkDiagnosticsPage();
+	if (Category == "diagnostics") return QuarkManagementPage();
 	if (PathToken == "quark-highlights-manage-all")
 	{
 		string response = QuarkRequest("/v1/bookmarks/open", "{\"scope\":\"all\"}");

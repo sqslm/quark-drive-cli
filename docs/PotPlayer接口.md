@@ -63,21 +63,21 @@
 
 `auth/login`、`auth/logout`、`shutdown` 不接受请求体；若客户端仍带 `Content-Length`，服务会读完这段有界请求体后再响应，避免污染同一 keep-alive 连接上的下一次请求（无请求体的 `POST` 亦正常）。请求体上限 `64 KiB`，超出则关闭连接。
 
-## 账号管理与请求隔离（0.10.0）
+## 账号管理与请求隔离
 
-下列接口均需本地 Bearer；返回的账号列表仅含 `active` 和 `items`。每行字段为 `id`、`nickname`、`logged_in`、`current`、`capacity`；容量是缓存的 `{used_bytes,total_bytes}` 或 `null`，剩余量取 `max(0,total_bytes-used_bytes)`，从不返回 Cookie 或原始 UID。
+下列接口均需本地 Bearer；返回的账号列表含 `active`、`items`，读取接口另带 `login_state` 与 `login_message`。每行字段为 `id`、`nickname`、`logged_in`、`current`、`capacity`；容量是缓存的 `{used_bytes,total_bytes}` 或 `null`，剩余量取 `max(0,total_bytes-used_bytes)`，从不返回 Cookie 或原始 UID。
 
 | 接口 | 行为 |
 | --- | --- |
-| `GET /v1/accounts` | 读取已保存账号与当前账号，只读本地 |
+| `GET /v1/accounts` | 读取本地账号与扫码状态；可导入独立登录命令已保存的凭证 |
 | `POST /v1/accounts/switch`，`{"id":"..."}` | 切换已登录账号，保留其他凭证；已退出账号返回 400 |
 | `POST /v1/accounts/logout`，`{"id":"..."}` | 清除所选账号凭证；退出非当前账号不影响当前播放 |
 | `POST /v1/accounts/refresh`，`{}` | 读取当前昵称与容量并更新缓存；只查询当前账号 |
 | `POST /v1/auth/login` | 扫码添加或重新登录，成功后激活该账号；取消保持当前账号 |
 
-- `/v1/diagnostics` 增加本地 `account_id`、`accounts`、`login_state`，供标签页刷新；诊断导出白名单不变，不包含账号列表、昵称或容量。
+- `/v1/diagnostics` 只返回诊断、播放状态和用于操作校验的 `account_id`，不包含账号列表、扫码状态或精彩标记请求。账号页独立读取 `/v1/accounts`；精彩标记页独立读取 `/v1/bookmarks/state`。诊断导出白名单不变。
 - 目录、分页、逻辑播放链接和字幕选项携带账号标识；请求用 `X-Quark-Account` 指明来源账号。与当前账号不同返回 `409 account_changed`，提示从根目录重新打开。存在多个账号时，缺少账号归属的数据请求同样拒绝；唯一随机播放会话可用于字幕查询，返回所属 `account_id` 后绑定字幕选项。
-- 控制请求与切换互斥。旧流固定使用原客户端，迟到刷新不借用新账号凭证；切换撤销旧会话，旧观看写入被拒绝，旧客户端在最后一个流退出后关闭。
+- 数据控制请求与切换互斥；账号资料查询在锁外发起，回写时核对账号和凭证，迟到成功或失效响应不会修改、退出新账号。本地诊断与精彩标记上下文读取不等待云端操作锁。旧流固定使用原客户端，迟到刷新不借用新账号凭证；切换撤销旧会话，旧观看写入被拒绝，旧客户端在最后一个流退出后关闭。
 - 账号标识用扫码 Cookie 的 `__uid` 摘要生成；缺失 UID 时按整份凭证摘要单独建档，绝不按昵称合并。相同 UID 重新扫码仍使用原数据目录。
 - 升级时，原 `library.json` / `bookmark.json` 仅归属导入旧凭证的那个账号，继续保留原路径。没有凭证时的旧文件不自动归给新账号。
 
@@ -283,7 +283,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.10.0", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.10.1", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -293,7 +293,7 @@
 - `account.validation` 取 `no_login` / `saved_unverified` / `recently_valid` / `expired`：前两者只表示“无凭证/凭证已保存但尚未验证”，`recently_valid` 只表示最近一次普通调用成功，不能证明账号当前未被限制；组件不会为此额外联网校验。
 - `transfer.totals`/`plays` 统计的是**实际转发的字节**，重复拖动同一区间会重复计入；`speed_bytes_per_second` 为最近 5 秒平均转发速率，`last_elapsed_ms` 为最近一次上游响应头耗时。均为被动统计，不发起探针、缓冲或码率估算。
 - `errors.events` 为固定（白名单）字段与固定中文 `message`，只保留最近 20 条，不含上游原文。`playback` 是本机绑定列表（含本机 `name`，仅本接口返回）；`protection` 反映与 CLI 共用的请求冷却，本地冷却状态不可读时 `available` 为 `false` 并给出固定 `instruction`。
-- 快照带字段 `bookmark_request`：没有请求时为 `null`；单视频请求为非空 `id`/`fid` 与本机名称；全部管理请求带 `scope=all`、空 `fid` 和“全部视频”名称。随机 `id` 用于一次性消费请求；该字段不会进入导出报告。
+- 精彩标记请求通过独立的 `GET /v1/bookmarks/state` 返回，诊断快照不承载该字段。
 
 ### `GET /v1/diagnostics/report`
 
@@ -301,9 +301,15 @@
 
 报告**不包含** Cookie、令牌、任何 URL/签名地址、FID、文件名、观看进度/历史或绝对主机路径。状态窗口的“导出诊断”把它按 UTF-8 JSON 另存到用户选择的路径，由用户决定是否对外提供。
 
-### `POST /v1/diagnostics/open`
+### `POST /v1/management/open`
 
-需 Bearer；异步打开独立的 Tk 状态窗口（标题“夸克网盘播放诊断”），返回 `202`。重复调用复用当前已打开的窗口；关闭该窗口不停止播放。窗口只访问本机回环服务，每秒 GET 一次 `/v1/diagnostics`。
+需 Bearer；异步打开“夸克网盘插件管理”窗口，返回 `202`；重复调用复用窗口，关闭不停止播放。三个独立页面分别持有客户端、工作线程和队列，壳窗口不持有账号列表或精彩标记数据。`POST /v1/diagnostics/open` 保留为同一窗口入口。
+
+### `GET /v1/bookmarks/state`
+
+需 Bearer；只读本地 `{account_id, playback, bookmark_request}`，不访问夸克、不加载账号列表。`bookmark_request` 无请求时为 `null`；单视频请求带 `id/fid/name`；全部管理请求另带 `scope=all`、空 `fid`。请求 ID 用于一次性消费。该数据不进入诊断快照或导出报告。
+
+账号文件异常时，诊断和此状态接口仍正常响应；账号接口返回明确的本地存储错误并禁止写入。支持旧 `{current, accounts: [...]}` 文件迁移：先写私有备份，再保存带版本号的结构，保留全部凭证、当前选择和原账号观看记录路径。
 
 > 该接口的具体响应字段尚未最终固定，扩展只应依赖“HTTP `202` / 请求被接受”的能力语义，不应解析未约定的响应字段。
 
@@ -325,7 +331,7 @@
 
 - `GET /v1/bookmarks` 省略 `fid` 时返回所有视频的标记，最近添加在前；明确传空 `fid` 仍为 `400`。`?fid=<fid>` 继续返回指定视频；`?parent=<目录 fid>` 需登录，会读取该目录的视频清单后过滤标记，不递归扫描。
 - `POST /v1/bookmarks/open` 可传 `{"scope":"all"}` 打开全部视频管理窗口，或沿用 `{"fid":"…"}` 打开单视频窗口。
-- 全局打开请求在 `/v1/diagnostics` 的 `bookmark_request` 中表示为 `{"id":"…","scope":"all","fid":"","name":"全部视频"}`；单视频请求仍是非空 `id`/`fid`。导出报告不包含此字段。
+- 全局打开请求在 `/v1/bookmarks/state` 的 `bookmark_request` 中表示为 `{"id":"…","scope":"all","fid":"","name":"全部视频"}`；单视频请求仍是非空 `id`/`fid`。导出报告不包含此字段。
 - `POST /v1/bookmarks/play` 请求体 `{"id":"…"}`：核对本机标记存在并要求已登录，然后通过安装清单定位 PotPlayer，用 `https://quark.invalid/mark/<id>` 打开。返回 `202 {"status":"opening"}` 只表示已请求打开；未知标记 `404`，安装信息不可用为本地错误。
 - PlayParse 拦截标记链接，调用 `POST /v1/play`，请求体 `{"bookmark_id":"…","player_pid":1234}`。服务从本机标记确定真实 FID，拒绝传入不一致的 `fid`、缺少有效 PID 或已变化的文件大小。播放器实际开始读取且时长就绪后，监控线程按原生身份与标记时长核验并跳转一次；不应用普通续播的 15 秒/片尾限制，也不再回跳到旧的继续观看位置。响应仍是原来的 `url`/`title`。
 

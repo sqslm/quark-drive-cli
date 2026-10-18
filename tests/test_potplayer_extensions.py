@@ -534,7 +534,7 @@ class LibraryEntryDesignTests(unittest.TestCase):
         self.assertRegex(body, r'recent\["Category"\]\s*=\s*"recent"')
         # 0.5.0 新增：本地诊断入口，纯本地功能，不需要夸克登录。
         self.assertRegex(body, r'diagnostics\["Category"\]\s*=\s*"diagnostics"')
-        self.assertIn("播放状态与诊断", read_script(URL_LIST))
+        self.assertIn("插件管理（账号 / 精彩标记 / 诊断）", read_script(URL_LIST))
 
     def test_titles_keep_simplified_chinese_and_the_cp0_fallback(self):
         body = self.body("array<dictionary> GetCategorys()")
@@ -983,17 +983,17 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
     def test_versions_report_the_current_release(self):
         # 本任务只把 UrlList 升到 0.8.0；PlayParse/SubtitleSearch 的版本由各自的
         # 任务维护，这里只要求仍是语义化版本串。
-        self.assertIn('return "0.10.0";', self.raw_body(self.url_raw, "string GetVersion()"))
+        self.assertIn('return "0.10.1";', self.raw_body(self.url_raw, "string GetVersion()"))
         self.assertRegex(
             self.raw_body(self.play_raw, "string GetVersion()"), r'return "\d+\.\d+\.\d+";'
         )
 
     def test_diagnostics_category_posts_a_json_body_and_returns_a_back_row(self):
-        page = self.raw_body(self.url_raw, "array<dictionary> QuarkDiagnosticsPage()")
+        page = self.raw_body(self.url_raw, "array<dictionary> QuarkManagementPage()")
         self.assertIsNotNone(
-            re.search(r'"/v1/diagnostics/open"\s*,\s*"\{', page), "open must POST a JSON body"
+            re.search(r'"/v1/management/open"\s*,\s*"\{', page), "open must POST a JSON body"
         )
-        self.assertIn("已打开播放状态与诊断窗口", page)
+        self.assertIn("已打开插件管理（账号 / 精彩标记 / 诊断）窗口", page)
         self.assertIn("QuarkActionResult", page)
         # 结果是可导航的返回行，不是媒体地址。
         self.assertNotIn('row["url"]', page)

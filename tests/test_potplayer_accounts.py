@@ -18,7 +18,8 @@ from quark_cli.potplayer.accounts import Accounts, account_key
 from quark_cli.potplayer.bookmark_state import BookmarkStore
 from quark_cli.potplayer.library_state import Library
 from quark_cli.potplayer.service import Service
-from quark_cli.potplayer.status_gui import BridgeClient, BridgeWorker, Endpoint, StatusWindow
+from quark_cli.potplayer.highlights_gui import HighlightsClient, HighlightsWorker, HighlightsPanel
+from quark_cli.potplayer.gui_common import Endpoint
 from quark_cli.state import write_json
 from test_potplayer_service import _ServerCase
 from potplayer_fixture import VIDEO_BYTES
@@ -288,7 +289,7 @@ class AccountsBridgeTests(_ServerCase):
 
 class AccountWorkerTests(unittest.TestCase):
     def test_window_discards_late_result_even_if_new_account_has_same_fid(self):
-        window = StatusWindow(None, None)
+        window = HighlightsPanel(None, None)
         window._account_id = account_key(B)
         received = []
         window._apply_bookmarks = received.append
@@ -302,9 +303,9 @@ class AccountWorkerTests(unittest.TestCase):
         def handler(request):
             seen.append(request)
             return httpx.Response(409, json={'error': {'type': 'account_changed'}})
-        client = BridgeClient(Endpoint('http://127.0.0.1:12345', 'token', 'instance', 12345), transport=httpx.MockTransport(handler))
+        client = HighlightsClient(Endpoint('http://127.0.0.1:12345', 'token', 'instance', 12345), transport=httpx.MockTransport(handler))
         events = queue.Queue()
-        worker = BridgeWorker(client, events, queue.Queue())
+        worker = HighlightsWorker(client, events, queue.Queue())
         try:
             worker._serve(('scoped', account_key(A), ('bookmark_rename', 1, 'v2', 'mark', '备注')))
             self.assertEqual(seen[0].headers['X-Quark-Account'], account_key(A))

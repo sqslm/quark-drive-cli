@@ -10,7 +10,7 @@
 | `SHA256SUMS.txt` | 安装程序 SHA-256 |
 | `build-info.json` | 构建时间、组件版本、随包扩展脚本清单 |
 
-当前版本为 **0.10.0**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.10.0/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
+当前版本为 **0.10.1**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.10.1/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
 
 构建方式见文末“开发者构建”。
 
@@ -54,7 +54,7 @@
 
 1. 打开 PotPlayer，按 `Ctrl+U` 打开媒体地址列表，选择“夸克网盘”，再进入“我的网盘”目录。
 2. 未登录时插件会打开扫码窗口；用手机夸克 App 扫码。
-3. 扫码成功后刷新目录即可看到文件；直接打开视频在线播放，支持拖动进度、同目录自然排序选集，并会在下次打开同一视频时接着上次位置继续播放（见[使用指南](PotPlayer使用指南.md)）。媒体地址列表里还有“搜索网盘”“收藏目录”“最近观看”“追剧中心（继续观看）”与“播放状态与诊断”入口；“最近观看”和“追剧中心”里每条视频都有“操作：…（精彩标记、记录）”文件夹行，可打开“精彩标记”或先确认再“删除本条观看记录”（只删本机记录）。视频目录首屏另有“继续观看”和“剧集观看状态”两行，可按集标记已看/未看。是否自动播下一集取决于 PotPlayer 的“播放结束后”设置，插件不会修改用户的全局设置。
+3. 扫码成功后刷新目录即可看到文件；直接打开视频在线播放，支持拖动进度、同目录自然排序选集，并会在下次打开同一视频时接着上次位置继续播放（见[使用指南](PotPlayer使用指南.md)）。媒体地址列表里还有“搜索网盘”“收藏目录”“最近观看”“追剧中心（继续观看）”与“插件管理”入口；“最近观看”和“追剧中心”里每条视频都有“操作：…（精彩标记、记录）”文件夹行，可打开“精彩标记”或先确认再“删除本条观看记录”（只删本机记录）。视频目录首屏另有“继续观看”和“剧集观看状态”两行，可按集标记已看/未看。是否自动播下一集取决于 PotPlayer 的“播放结束后”设置，插件不会修改用户的全局设置。
 
 组件只做内存转发，不创建视频文件、分片或磁盘缓存；登录凭证保存在 `%APPDATA%\quark-drive-cli\potplayer\`（与 CLI 的 `cookie` 分开）。
 
@@ -101,7 +101,7 @@ QuarkPotPlayer-Setup.exe --uninstall --silent [--clear-credentials]
 ## 开发者构建
 
 ```
-python packaging/potplayer/build.py --tag 0.10.0          # 读取 potplayer/*.as 生成 dist/potplayer/0.10.0/
+python packaging/potplayer/build.py --tag 0.10.1          # 读取 potplayer/*.as 生成 dist/potplayer/0.10.1/
 python packaging/potplayer/build.py --as-dir DIR --out-dir DIR   # 指定扩展脚本目录与输出目录
 python packaging/potplayer/build.py --component-only       # 只构建并打包组件
 python packaging/potplayer/build.py --skip-component       # 复用既有组件产物

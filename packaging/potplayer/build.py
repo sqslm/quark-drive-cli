@@ -33,7 +33,7 @@ ROOT = HERE.parents[1]
 COMPONENT_NAME = "QuarkPotPlayer"
 LAUNCHER_NAME = "quark-potplayer"
 SETUP_NAME = "QuarkPotPlayer-Setup"
-DEFAULT_VERSION = "0.10.0"
+DEFAULT_VERSION = "0.10.1"
 
 
 class BuildError(RuntimeError):
@@ -305,6 +305,8 @@ def build_component(python: str, build_dir: Path) -> Path:
             "quark_cli.potplayer.service",
             "--hidden-import",
             "quark_cli.potplayer.status_gui",
+            "--hidden-import",
+            "quark_cli.potplayer.management_gui",
             "--hidden-import",
             "quark_cli.potplayer.native_player",
             "--hidden-import",
