@@ -127,6 +127,51 @@ class PrefetchHttpCase(_ServerCase):
         return {'transport': self.fixture.transport(), 'cookie': COOKIE,
                 'native_factory': lambda: self.player, 'monitor_start': False}
 
+    def test_loading_player_keeps_receiving_startup_bytes_before_identity_matches(self):
+        from unittest.mock import patch
+        from test_potplayer_playback import FakeSample
+        for size in (512 * 1024, 5 * 1024 ** 2):
+            with self.subTest(size=size):
+                fid = 'loading' + str(size)
+                self.fixture.records.append(record(fid, 'video.mkv', 'root-dir', size=size))
+                self.fixture.virtual[fid] = size
+                payload = self.api('POST', '/v1/play', body={'fid': fid, 'player_pid': 123}).json()
+                # PotPlayer can still report the previous/empty file while the
+                # new demuxer waits for the first response bytes.
+                self.player.feed(123, FakeSample(123, '', 0, 0, 0))
+                started = self.service.monitor.stream_started
+
+                def poll_after_first_bytes(session_id):
+                    started(session_id)
+                    self.service.monitor._poll_once()
+
+                with patch.object(self.service.monitor, 'stream_started', side_effect=poll_after_first_bytes):
+                    response = self.stream(payload['url'])
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(len(response.content), size)
+
+    def test_previously_playing_video_still_stops_when_player_switches_away(self):
+        from unittest.mock import patch
+        from test_potplayer_playback import FakeSample
+        size = 512 * 1024
+        self.fixture.records.append(record('switched', 'video.mkv', 'root-dir', size=size))
+        self.fixture.virtual['switched'] = size
+        payload = self.api('POST', '/v1/play', body={'fid': 'switched', 'player_pid': 123}).json()
+        sid = payload['url'].split('/')[3]
+        self.service.monitor.stream_started(sid)
+        self.player.feed(123, FakeSample(123, 'https://quark.invalid/video/switched', 1000, 100_000, 2))
+        self.service.monitor._poll_once()
+        self.player.feed(123, FakeSample(123, 'https://quark.invalid/video/other', 1000, 100_000, 2))
+        started = self.service.monitor.stream_started
+
+        def poll_after_first_bytes(session_id):
+            started(session_id)
+            self.service.monitor._poll_once()
+
+        with patch.object(self.service.monitor, 'stream_started', side_effect=poll_after_first_bytes):
+            with self.assertRaises(httpx.RemoteProtocolError):
+                self.stream(payload['url'])
+
     def test_paused_player_stops_upstream_requests_before_fetching_the_video(self):
         from quark_cli.potplayer.stream import Media
         from test_potplayer_playback import FakeSample

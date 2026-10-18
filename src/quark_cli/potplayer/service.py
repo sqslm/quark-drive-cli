@@ -1689,7 +1689,11 @@ class _Handler(BaseHTTPRequestHandler):
                         self.close_connection = True
                         return False
                     row = {'state': 'unavailable', 'position_ms': 0, 'duration_ms': 0}
-                if row['state'] in ('stopped', 'missing', 'mismatch'):
+                # Before the first confirmed sample PotPlayer may still report
+                # its old/empty file while waiting for demuxer startup bytes.
+                # The monitor maps a confirmed switch/stop to 'stopped'; an
+                # active mismatch must retain the bounded startup allowance.
+                if row['state'] == 'stopped':
                     self.close_connection = True
                     return False
                 if gate.allowance(offset, row) > 0:
