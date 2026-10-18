@@ -29,6 +29,9 @@ def _parser() -> argparse.ArgumentParser:
     action.add_argument("--login", action="store_true", help="打开扫码窗口，登录插件自己的凭证（不改动 CLI Cookie）")
     action.add_argument("--status-window", action="store_true", help="打开播放状态与诊断窗口（不启动本地服务）")
     action.add_argument('--highlights-window', action='store_true', help='仅打开精彩标记窗口（不启动本地服务）')
+    action.add_argument('--series-settings-window', action='store_true', help='打开独立剧集片头片尾设置窗口')
+    parser.add_argument('--series-fid')
+    parser.add_argument('--account-id')
     return parser
 
 
@@ -47,6 +50,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.serve:
         return run_service()
+    if arguments.series_settings_window:
+        from .series_gui import run_series_settings
+        return run_series_settings(arguments.series_fid, arguments.account_id)
     if arguments.highlights_window:
         return run_highlights_window()
     if arguments.status_window:

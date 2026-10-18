@@ -73,7 +73,7 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "0.12.3";
+	return "0.12.4";
 }
 
 string GetDesc()
@@ -630,7 +630,7 @@ void QuarkAppendVideoActions(array<dictionary> &ret, string fid, string title)
 
 	dictionary row;
 
-	row["title"] = "操作：" + title + "（精彩标记、记录）";
+	row["title"] = title;
 	row["folder"] = "1";
 	row["PathToken"] = QUARK_ACTION_VIDEO + fid;
 	ret.insertLast(row);
@@ -654,6 +654,11 @@ array<dictionary> QuarkWatchCenterList()
 	JsonValue items = root["items"];
 
 	if (!items.isArray() || items.size() == 0) return QuarkStatus("暂无可继续观看的视频：播放一段时间后会出现在这里");
+	dictionary manage;
+	manage["title"] = "观看管理";
+	manage["folder"] = "1";
+	manage["PathToken"] = "quark-recent-manage";
+	ret.insertLast(manage);
 
 	for (int index = 0; index < items.size(); index++)
 	{
@@ -689,14 +694,14 @@ array<dictionary> QuarkWatchCenterList()
 		}
 		else
 		{
-			// 单集（根目录或未归类）：直接播放 + 操作文件夹。
+			// 单集（根目录或未归类）：直接播放；操作集中至观看管理。
 			dictionary play;
 
 			play["title"] = title;
 			play["url"] = QUARK_PLAY_PREFIX + key.asString();
 			ret.insertLast(play);
 
-			QuarkAppendVideoActions(ret, key.asString(), title);
+
 		}
 	}
 	return ret;
@@ -752,7 +757,7 @@ void QuarkAppendSeriesRows(array<dictionary> &ret, string parent, JsonValue &roo
 		{
 			dictionary done;
 
-			done["title"] = "本目录已全部看完 · 查看剧集状态";
+			done["title"] = "本目录已全部看完 · 剧集管理";
 			done["folder"] = "1";
 			done["PathToken"] = QUARK_ACTION_SERIES + parent;
 			ret.insertLast(done);
@@ -767,7 +772,7 @@ void QuarkAppendSeriesRows(array<dictionary> &ret, string parent, JsonValue &roo
 
 	dictionary manage;
 
-	manage["title"] = "剧集观看状态" + counts;
+	manage["title"] = "剧集管理" + counts;
 	manage["folder"] = "1";
 	manage["PathToken"] = QUARK_ACTION_SERIES + parent;
 	ret.insertLast(manage);
@@ -885,6 +890,12 @@ array<dictionary> QuarkSeriesPage(string parent)
 	up["folder"] = "parent";
 	ret.insertLast(up);
 
+	dictionary settings;
+	settings["title"] = "片头片尾设置";
+	settings["folder"] = "1";
+	settings["PathToken"] = "quark-series-settings-" + parent;
+	ret.insertLast(settings);
+
 	for (int index = 0; index < episodes.size(); index++)
 	{
 		JsonValue episode = episodes[index];
@@ -900,10 +911,11 @@ array<dictionary> QuarkSeriesPage(string parent)
 		bool marked = watched.isBool() && watched.asBool();
 		dictionary row;
 
-		if (marked) row["title"] = name.asString() + " · 已看（点击标记未看）";
-		else row["title"] = name.asString() + " · 未看（点击标记已看）";
+		if (marked) row["title"] = name.asString() + " · 已看";
+		else row["title"] = name.asString() + " · 未看";
 		row["folder"] = "1";
-		row["PathToken"] = QuarkWatchToken(!marked, parent, fid.asString());
+		string flag = marked ? "0" : "1";
+		row["PathToken"] = QUARK_ACTION_VIDEO + fid.asString() + "|" + parent + "|" + flag;
 		ret.insertLast(row);
 	}
 	return ret;
@@ -994,9 +1006,9 @@ array<dictionary> QuarkCenterSeriesPage(string parent)
 	dictionary summary;
 
 	if (complete.isBool() && complete.asBool())
-		summary["title"] = "已全部看完（" + counts + "）";
+		summary["title"] = "剧集管理 · 已全部看完 · " + counts;
 	else
-		summary["title"] = "观看进度（" + counts + "）";
+		summary["title"] = "剧集管理 · " + counts;
 	summary["folder"] = "1";
 	summary["PathToken"] = QUARK_ACTION_SERIES + parent;
 	ret.insertLast(summary);
@@ -1075,8 +1087,8 @@ array<dictionary> QuarkCenterSeriesPage(string parent)
 			row["url"] = QUARK_PLAY_PREFIX + fid.asString();
 			ret.insertLast(row);
 
-			// 每一集（含已看完）都有独立操作文件夹，可打开精彩标记或删除该条记录。
-			QuarkAppendVideoActions(ret, fid.asString(), title);
+			// 单集操作集中至顶部剧集管理入口。
+
 		}
 	}
 	return ret;
@@ -1089,6 +1101,18 @@ array<dictionary> QuarkVideoActionsPage(string fid)
 {
 	array<dictionary> ret;
 
+	string parent = "";
+	string state = "";
+	int first = fid.find("|");
+	if (first >= 0)
+	{
+		int second = fid.find("|", first + 1);
+		if (second < 0) return QuarkActionResult("视频操作参数无效");
+		parent = fid.substr(first + 1, second - first - 1);
+		state = fid.substr(second + 1);
+		fid = fid.substr(0, first);
+		if (!QuarkValidFid(parent) || (state != "0" && state != "1")) return QuarkActionResult("视频操作参数无效");
+	}
 	if (!QuarkValidFid(fid)) return QuarkActionResult("视频操作缺少文件标识");
 
 	dictionary up;
@@ -1146,6 +1170,15 @@ array<dictionary> QuarkVideoActionsPage(string fid)
 	bookmarks["folder"] = "1";
 	bookmarks["PathToken"] = QUARK_ACTION_BOOKMARKS + fid;
 	ret.insertLast(bookmarks);
+
+	if (!parent.empty())
+	{
+		dictionary watched;
+		watched["title"] = state == "1" ? "标记为已看" : "标记为未看";
+		watched["folder"] = "1";
+		watched["PathToken"] = QuarkWatchToken(state == "1", parent, fid);
+		ret.insertLast(watched);
+	}
 
 	dictionary remove;
 
@@ -1266,7 +1299,7 @@ array<dictionary> QuarkFavoritesList(string PathToken, string page)
 }
 
 // 最近观看的视频行：每条的普通播放行保持直接播放（从该集开始的同目录选集），
-// 随后紧跟一条操作文件夹行（精彩标记、删除记录）。
+// 操作集中至顶部观看管理入口。
 void QuarkAppendRecentItems(array<dictionary> &ret, JsonValue &items)
 {
 	if (!items.isArray()) return;
@@ -1293,12 +1326,11 @@ void QuarkAppendRecentItems(array<dictionary> &ret, JsonValue &items)
 		play["url"] = QUARK_PLAY_PREFIX + fid.asString();
 		ret.insertLast(play);
 
-		QuarkAppendVideoActions(ret, fid.asString(), title);
+
 	}
 }
 
-// 最近观看：条目直接复用稳定播放链接，从该集开始同目录选集；每条视频再附一条
-// 操作文件夹行（精彩标记、删除）。根页面提供清空入口。操作行是导航，不是媒体地址。
+// 最近观看：条目直接复用稳定播放链接，从该集开始同目录选集；顶部仅提供一个观看管理入口。管理页集中处理精彩标记和观看记录。
 array<dictionary> QuarkRecentList()
 {
 	array<dictionary> ret;
@@ -1318,12 +1350,42 @@ array<dictionary> QuarkRecentList()
 
 	dictionary clear;
 
-	clear["title"] = "清空最近观看";
-	clear["PathToken"] = QUARK_ACTION_CLEAR_RECENT;
+	clear["title"] = "观看管理";
+	clear["PathToken"] = "quark-recent-manage";
 	clear["folder"] = "1";
 	ret.insertLast(clear);
 
 	QuarkAppendRecentItems(ret, items);
+	return ret;
+}
+
+array<dictionary> QuarkRecentManagePage()
+{
+	array<dictionary> ret;
+	dictionary up;
+	up["title"] = "..";
+	up["folder"] = "parent";
+	ret.insertLast(up);
+	dictionary clear;
+	clear["title"] = "清空最近观看";
+	clear["folder"] = "1";
+	clear["PathToken"] = "quark-recent-clear-ask";
+	ret.insertLast(clear);
+	string response = QuarkRequest("/v1/recent", "");
+	string message;
+	if (QuarkFailed(response, message)) return QuarkActionResult(message);
+	JsonReader reader;
+	JsonValue root;
+	if (!reader.parse(response, root) || !root.isObject()) return QuarkActionResult("观看记录读取失败");
+	JsonValue items = root["items"];
+	if (!items.isArray()) return ret;
+	for (int index = 0; index < items.size(); index++)
+	{
+		JsonValue fid = items[index]["fid"];
+		JsonValue name = items[index]["display"];
+		if (!name.isString()) name = items[index]["name"];
+		if (fid.isString() && name.isString()) QuarkAppendVideoActions(ret, fid.asString(), name.asString());
+	}
 	return ret;
 }
 
@@ -1402,6 +1464,8 @@ array<dictionary> QuarkHighlightsOpenPage(string parent, bool capture)
 	return QuarkActionResult(capture ? "请在精彩标记窗口填写备注" : "已打开当前目录精彩标记窗口");
 }
 
+const string QUARK_ROOT_CATEGORY = "";
+
 array<dictionary> GetCategorys()
 {
 	array<dictionary> ret;
@@ -1446,6 +1510,17 @@ array<dictionary> GetCategorys()
 	diagnostics["title"] = "{$CP936=插件管理$}{$CP950=插件管理$}{$CP0=Plugin Manager$}";
 	diagnostics["Category"] = "diagnostics";
 	ret.insertLast(diagnostics);
+	if (!QUARK_ROOT_CATEGORY.empty())
+	{
+		array<dictionary> selected;
+		for (int index = 0; index < ret.size(); index++)
+		{
+			string category;
+			ret[index].get("Category", category);
+			if (category == QUARK_ROOT_CATEGORY) selected.insertLast(ret[index]);
+		}
+		return selected;
+	}
 	return ret;
 }
 
@@ -1458,6 +1533,27 @@ array<dictionary> QuarkAccountUrlList(string Category, string Extra, string Path
 	// 诊断窗口是纯本地功能：不需要夸克登录，必须在登录检查之前处理，
 	// 否则未登录用户永远看不到诊断入口。
 	if (Category == "diagnostics") return QuarkManagementPage();
+	if (PathToken == "quark-recent-manage") return QuarkRecentManagePage();
+	if (PathToken == "quark-recent-clear-ask")
+	{
+		array<dictionary> ret = QuarkActionResult("取消清空");
+		dictionary confirm;
+		confirm["title"] = "确认清空全部观看记录";
+		confirm["folder"] = "1";
+		confirm["PathToken"] = QUARK_ACTION_CLEAR_RECENT;
+		ret.insertLast(confirm);
+		return ret;
+	}
+	if (PathToken.find("quark-series-settings-") == 0)
+	{
+		string parent = PathToken.substr(22);
+		if (!QuarkValidFid(parent)) return QuarkActionResult("剧集目录无效");
+		string response = QuarkRequest("/v1/series-settings/open", "{\"parent\":\"" + parent + "\"}");
+		string message;
+		if (QuarkFailed(response, message)) return QuarkActionResult(message);
+		return QuarkActionResult("已打开片头片尾设置窗口");
+	}
+
 	if (PathToken == "quark-highlights-manage-all")
 	{
 		string response = QuarkRequest("/v1/bookmarks/open", "{\"scope\":\"all\"}");

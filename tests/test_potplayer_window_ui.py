@@ -12,14 +12,20 @@ from potplayer_fixture import COOKIE
 
 
 class PresentationTests(unittest.TestCase):
-    def test_every_extension_has_the_same_multisize_potplayer_icon(self):
+    def test_navigation_icons_are_semantic_and_window_icon_stays_potplayer(self):
         directory = Path(__file__).resolve().parents[1] / 'potplayer'
-        icons = [script.with_suffix('.ico').read_bytes() for script in directory.glob('*.as')]
-        self.assertEqual(len(icons), 3)
-        self.assertTrue(all(icon == icons[0] for icon in icons))
-        reserved, kind, count = struct.unpack_from('<HHH', icons[0])
-        self.assertEqual((reserved, kind), (0, 1))
-        self.assertGreaterEqual(count, 2)
+        from quark_cli.potplayer.window_ui import ICON_NAME
+        self.assertEqual(ICON_NAME, 'MediaPlayParse - Quark.ico')
+        player_icon = (directory / ICON_NAME).read_bytes()
+        icons = [(directory / 'icons' / (name + '.ico')).read_bytes()
+                 for name in ('cloud', 'search', 'folder-heart', 'history', 'clapperboard', 'bookmark', 'settings')]
+        self.assertEqual(len(set(icons)), 7)
+        self.assertNotIn(player_icon, icons)
+        self.assertEqual((directory / 'MediaUrlList - Quark.ico').read_bytes(), icons[0])
+        for icon in icons + [player_icon]:
+            reserved, kind, count = struct.unpack_from('<HHH', icon)
+            self.assertEqual((reserved, kind), (0, 1))
+            self.assertGreaterEqual(count, 2)
 
     def test_root_names_have_no_parenthetical_explanations(self):
         from test_potplayer_extensions import body_raw

@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 import sys
 
-ICON_NAME = 'MediaUrlList - Quark.ico'
+ICON_NAME = 'MediaPlayParse - Quark.ico'
 
 
 @lru_cache(maxsize=1)

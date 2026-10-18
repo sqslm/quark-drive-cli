@@ -193,6 +193,8 @@ class _Binding:
     suppressed: bool = False
     storage_failed: bool = False
     restore_done: bool = False
+    intro_done: bool = False
+    outro_done: bool = False
     good: bool = False
     paused_seen: bool = False
     last_position: int = 0
@@ -240,9 +242,11 @@ class PlaybackMonitor:
         clock: Callable[[], float] = time.monotonic,
         poll_interval: float = POLL_INTERVAL,
         bookmarks: BookmarkStore | None = None,
+        series_settings=None,
         start: bool = True,
     ) -> None:
         self._library = library
+        self._series_settings = series_settings
         self._native_factory = native_factory
         self._clock = clock
         #: The local bookmark document this monitor captures and jumps through.
@@ -709,11 +713,19 @@ class PlaybackMonitor:
                     binding.paused_seen = status == 1
                     if writing and position > 0 and position != binding.last_saved_position:
                         decisions.append(("write", player_pid, generation, fid, size, position, duration))
+                    if status == 2 and not binding.intro_done:
+                        decisions.append(("intro", player_pid, generation, duration, position))
+                    if status == 2 and not binding.outro_done:
+                        decisions.append(("outro", player_pid, generation, duration, position))
         for record in flushes:
             self._apply_flush(record)
         for decision in decisions:
             if decision[0] == "restore":
                 self._restore(adapter, *decision[1:])
+            elif decision[0] == "outro":
+                self._skip_outro(adapter, *decision[1:])
+            elif decision[0] == "intro":
+                self._skip_intro(adapter, *decision[1:])
             else:
                 self._write(*decision[1:])
 
@@ -780,6 +792,7 @@ class PlaybackMonitor:
             if task.cancelled:
                 return False
             binding.restore_done = True
+            binding.intro_done = True
             binding.good = _ms(getattr(sample, "duration_ms", 0)) > 0
             binding.paused_seen = False
             binding.last_position = 0
@@ -921,6 +934,8 @@ class PlaybackMonitor:
             # to the saved resume point over this jump.
             binding.restore_done = True
             binding.good = True
+            binding.outro_done = True  # an explicit highlight must stay at the selected point
+            binding.intro_done = True
             binding.last_position = target
             binding.last_duration = duration
             # ``last_saved_position`` tracks what is really on disk, not this new
@@ -954,6 +969,7 @@ class PlaybackMonitor:
             return
         if target is None or not self._resumable(target, duration, position):
             self._finish_restore(player_pid, generation, None)
+            self._skip_intro(adapter, player_pid, generation, duration, position)
             return
         saved = target["position_ms"]
         with self._lock:
@@ -978,6 +994,84 @@ class PlaybackMonitor:
         )
         self._finish_restore(player_pid, generation, saved, MSG_RESTORED if verified else MSG_SEEK_FAILED)
 
+    def _skip_rule(self, binding, duration):
+        if self._series_settings is None or binding.session.bookmark_id is not None:
+            return 0, 0
+        series = binding.session.context.get('series_fid')
+        if not series or series == '0':
+            return 0, 0
+        rule = self._series_settings.get(series)
+        intro, outro = rule['intro_seconds'] * 1000, rule['outro_seconds'] * 1000
+        return (intro, outro) if intro + outro < duration else (0, 0)
+
+    def _skip_intro(self, adapter, pid, generation, duration, position):
+        with self._lock:
+            if self._closed or not (self._current(pid, generation) and self._fresh(pid, generation)):
+                return
+            binding = self._bindings[pid]
+            if binding.last_status != 2 or binding.intro_done:
+                return
+            binding.intro_done = True
+            if position > INITIAL_POSITION_MS:
+                return
+        try:
+            intro, _ = self._skip_rule(binding, duration)
+        except LocalIOError:
+            self._set(pid, generation, None, '片头片尾设置无法读取，请检查设置文件')
+            return
+        if intro > position:
+            self._automatic_seek(adapter, pid, generation, intro, duration, position, '已跳过片头')
+
+    def _skip_outro(self, adapter, pid, generation, duration, position):
+        with self._lock:
+            if self._closed or not (self._current(pid, generation) and self._fresh(pid, generation)):
+                return
+            binding = self._bindings[pid]
+        try:
+            _, outro = self._skip_rule(binding, duration)
+        except LocalIOError:
+            self._set(pid, generation, None, '片头片尾设置无法读取，请检查设置文件')
+            return
+        if outro <= 0 or position < duration - outro or position >= duration - 1000:
+            return
+        with self._lock:
+            if self._closed or not (self._current(pid, generation) and self._fresh(pid, generation)) or binding.outro_done:
+                return
+            binding.outro_done = True  # one attempt; never fight a manual backward seek
+        self._automatic_seek(adapter, pid, generation, duration - 1000, duration, position, '已跳过片尾')
+
+    def _automatic_seek(self, adapter, pid, generation, target, duration, position, message):
+        with self._lock:
+            if self._closed or not (self._current(pid, generation) and self._fresh(pid, generation)):
+                return
+            binding = self._bindings[pid]
+            identity_fid, url = binding.session.fid, binding.url
+        try:
+            reading = adapter.sample(pid)
+            if (reading is None or getattr(reading, 'player_pid', None) != pid
+                    or getattr(reading, 'status', None) != 2
+                    or abs(_ms(getattr(reading, 'position_ms', 0)) - position) > VERIFY_TOLERANCE_MS
+                    or _ms(getattr(reading, 'duration_ms', 0)) != duration
+                    or not _identity_matches(reading.file_name, identity_fid, url,
+                                             binding.session.bookmark_id, binding.session.account_id)):
+                return
+            with self._lock:
+                if self._closed or not (self._current(pid, generation) and self._fresh(pid, generation)):
+                    return
+            seeked = adapter.seek(pid, reading.file_name, target)
+        except Exception:
+            seeked = False
+        if not seeked:
+            self._set(pid, generation, None, MSG_SEEK_FAILED)
+            return
+        with self._lock:
+            if self._closed or not (self._current(pid, generation) and self._fresh(pid, generation)):
+                return
+            binding.last_position = target
+            binding.last_duration = duration
+            binding.message = message
+        self._write(pid, generation, identity_fid, binding.session.size, target, duration)
+
     def _resumable(self, target: dict[str, Any], duration: int, position: int) -> bool:
         saved = target["position_ms"]
         if saved < MIN_RESUME_MS or position > INITIAL_POSITION_MS:
@@ -996,6 +1090,7 @@ class PlaybackMonitor:
                 return
             binding.restore_done = True
             if restored is not None:
+                binding.intro_done = True
                 binding.last_position = restored
                 binding.last_saved_position = restored
             if message is not None:

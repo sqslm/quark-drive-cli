@@ -20,6 +20,7 @@ import installer  # noqa: E402
 import launcher_entry  # noqa: E402
 import service_entry  # noqa: E402
 import uninstall_entry  # noqa: E402
+from navigation_assets import ENTRIES, stage_navigation
 
 
 def make_payload(root: Path) -> Path:
@@ -52,6 +53,25 @@ def make_as(root: Path) -> list[core.AsFile]:
 
 
 class RoutingTests(unittest.TestCase):
+    def test_generated_navigation_entries_pair_each_category_with_its_icon(self):
+        from test_potplayer_extensions import strip_literals, HOST_CALL, DECLARATION, BUILTIN_CALLS, KEYWORDS
+        with tempfile.TemporaryDirectory(prefix='quark-nav-icons-') as temp:
+            destination = Path(temp)
+            entries = stage_navigation(ROOT / 'potplayer/MediaUrlList - Quark.as', destination)
+            self.assertEqual(len(entries), 7)
+            self.assertEqual(len(core.collect_as_files(destination)), 14)
+            for script, (category, suffix, icon) in zip(entries, ENTRIES):
+                source = script.read_text('utf-8-sig')
+                self.assertIn(f'const string QUARK_ROOT_CATEGORY = "{category}";', source)
+                self.assertIn('category == QUARK_ROOT_CATEGORY', source)
+                self.assertEqual(script.with_suffix('.ico').read_bytes(),
+                                 (ROOT / 'potplayer/icons' / (icon + '.ico')).read_bytes())
+                self.assertEqual(core.as_target_for(script.name), 'Media/UrlList')
+                code, issues = strip_literals(source)
+                self.assertEqual(issues, [])
+                unknown = set(HOST_CALL.findall(code)) - set(DECLARATION.findall(code)) - BUILTIN_CALLS - KEYWORDS
+                self.assertEqual({name for name in unknown if not name.startswith('Host')}, set())
+
     def test_standalone_uninstall_keeps_silent_flag_on_the_temporary_copy(self):
         with mock.patch.object(core, 'needs_temp_relaunch', return_value=True), \
              mock.patch.object(core, 'relaunch_uninstall_from_temp', return_value=Path('temp.exe')) as relaunch:

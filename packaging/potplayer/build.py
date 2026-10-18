@@ -33,8 +33,8 @@ ROOT = HERE.parents[1]
 COMPONENT_NAME = "QuarkPotPlayer"
 LAUNCHER_NAME = "quark-potplayer"
 SETUP_NAME = "QuarkPotPlayer-Setup"
-DEFAULT_VERSION = "0.12.3"
-ICON = ROOT / 'potplayer' / 'MediaUrlList - Quark.ico'
+DEFAULT_VERSION = "0.12.4"
+ICON = ROOT / 'potplayer' / 'MediaPlayParse - Quark.ico'
 
 
 class BuildError(RuntimeError):
@@ -261,6 +261,7 @@ def stage_licenses(component_tree: Path, python: str) -> list[str]:
         for source in dist["files"]:
             copies.append((Path(source), base / Path(source).name))
     written: list[str] = []
+    copies.append((ROOT / 'potplayer/icons/LICENSE-lucide.txt', destination / 'navigation-icons/LICENSE-lucide.txt'))
     for source, target in copies:
         relative = target.relative_to(component_tree)
         if str(relative) in written:
@@ -384,8 +385,14 @@ def stage_payload(
     shutil.copyfile(launcher_exe, launcher_dir / f"{LAUNCHER_NAME}.exe")
     as_dir = payload / "as"
     as_dir.mkdir()
+    from navigation_assets import stage_navigation
+    staged_scripts = []
     for script in scripts:
+        if script.name == 'MediaUrlList - Quark.as':
+            staged_scripts.extend(stage_navigation(script, as_dir))
+            continue
         shutil.copyfile(script, as_dir / script.name)
+        staged_scripts.append(as_dir / script.name)
         icon = script.with_suffix(".ico")
         if icon.is_file():
             shutil.copyfile(icon, as_dir / icon.name)
@@ -394,7 +401,7 @@ def stage_payload(
         "version": version,
         "component_subsystem": console,
         "launcher_bytes": (launcher_dir / f"{LAUNCHER_NAME}.exe").stat().st_size,
-        "as_files": sorted(path.name for path in scripts),
+        "as_files": sorted(path.name for path in staged_scripts),
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "python": sys.version.split()[0],
         "bits": 64 if sys.maxsize > 2**32 else 32,
@@ -485,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
     setup = build_installer(arguments.python, build_dir, payload, out_dir)
     components.append(setup)
     print(f"安装程序：{setup}")
-    return _write_sums(out_dir, components, arguments.version, scripts)
+    return _write_sums(out_dir, components, arguments.version, sorted((payload / 'as').glob('*.as')))
 
 
 def _write_sums(out_dir: Path, artifacts: list[Path], version: str, scripts: list[Path]) -> int:

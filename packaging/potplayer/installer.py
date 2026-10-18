@@ -428,7 +428,7 @@ def run_gui(args: argparse.Namespace, payload: Payload) -> int:
     from tkinter import Tk
 
     root = Tk()
-    icon = payload.as_dir / 'MediaUrlList - Quark.ico'
+    icon = payload.as_dir / 'MediaPlayParse - Quark.ico'
     if icon.is_file():
         root.iconbitmap(default=str(icon))
         root.iconbitmap(str(icon))

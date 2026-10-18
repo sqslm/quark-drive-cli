@@ -283,7 +283,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.12.3", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.12.4", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -433,3 +433,15 @@
 - 原生有效播放采样超过 90% 后写入既有 `marks`，FID/size 隔离、存储代次屏障和手动操作校验不变；下次采样触发，不等待原先 10 秒进度周期。
 - Content-Length、Range、Content-Range 不变，仍按最大 4 MiB 范围顺序读取；媒体字节不设下载速率上限。前方预缓存按视频总大小计算，达到 20% 后暂停，剩余降到 10% 或以下恢复，补到 20% 再暂停；依据可信播放时钟估算已消费字节。未知时钟先按网络原速提供最多 20%，等待有效播放进度后再补充，不设按秒增长预算。连续、并发 Range 和索引读取共用上限，重叠范围不重复计数；拖动后按新位置核算，未使用的预留额度在断连时释放。no-store 与无视频磁盘缓存策略不变。
 - 安装默认 `<PotPlayer>/Plugin/QuarkPotPlayer`；独立 `Uninstall.exe` 不含组件压缩包。根管理窗口增加“安装管理”，日常管理不依赖下载的安装包。
+
+
+## 按剧集跳过片头片尾
+
+以下接口要求 Bearer token 和当前账号 `X-Quark-Account` 归属校验。规则单独存于当前账号的 `series-settings.json`（version 1，series 字典以真实剧集 FID 为键），不属于诊断或精彩标记数据。
+
+- `POST /v1/series-settings/open`，JSON `{"parent":"目录FID"}`：按已有祖先解析规则定位剧集，必要时只取缺失祖先。返回 202 `{"status":"opened"}`；同账号同剧集窗口已打开时返回 `already_open` 并置前。根目录和无法识别的剧集不支持设置。
+- `GET /v1/series-settings?series=剧集或版本目录FID`：本地读取，返回 `{"series":"真实剧集FID","name":"蒸蒸日上","intro_seconds":90,"outro_seconds":120}`，未设置时两项为 0。
+- `POST /v1/series-settings`，JSON `{"series":"剧集FID","intro_seconds":90,"outro_seconds":120}`：两项须为 0–3600 整数秒，0 关闭；返回 200 和实际剧集 FID、规则。损坏的配置拒绝覆盖，旧账号窗口请求返回 409。
+- `--series-settings-window --series-fid <FID> --account-id <账号标识>`：独立设置窗口，仅连接已运行本地服务；复用现有 Tk 工作线程和窗口图标/置前逻辑。
+
+监控只在原生播放器 PID、完整文件身份、实际时间和时长匹配后自动 seek。有效续播、显式精彩标记优先；同文件多实例冲突、暂停、无时长或片头与片尾覆盖整片时不自动跳过。片尾 seek 到结束前 1000ms，后续结束行为由 PotPlayer 控制，不更改全局播放器设置。

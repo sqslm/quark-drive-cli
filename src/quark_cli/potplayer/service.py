@@ -47,6 +47,7 @@ from .bookmark_state import NOTE_LIMIT, BookmarkStore, bookmark_groups
 from .accounts import Accounts, account_key
 from .diagnostics import Diagnostics
 from .directory_state import Directories
+from .series_settings import SeriesSettings
 from .buffering import ReadAhead
 from .window_ui import foreground_process
 from .library import (
@@ -112,6 +113,7 @@ WATCH_UNNAMED = "来源目录未命名"
 BOOKMARK_FALLBACK_NAME = "所选视频"
 
 _CONTROL_ROUTES = frozenset({
+    '/v1/series-settings', '/v1/series-settings/open',
     '/v1/bookmarks/state', '/v1/management/open',
     "/v1/accounts", "/v1/accounts/switch", "/v1/accounts/logout", "/v1/accounts/refresh",
     "/v1/auth", "/v1/auth/login", "/v1/auth/logout",
@@ -607,6 +609,7 @@ class Service:
         self.sessions = Sessions(clock)
         self.library = Library(self.accounts.data_path('library.json'))
         self.directories = Directories(self.accounts.data_path('directories.json'))
+        self.series_settings = SeriesSettings(self.accounts.data_path('series-settings.json'))
         self.diagnostics = Diagnostics()
         # The native receiver is created lazily on the monitor's own worker, so
         # no HTTP request thread ever touches it.
@@ -617,6 +620,7 @@ class Service:
             poll_interval=monitor_poll_interval,
             start=monitor_start,
             bookmarks=BookmarkStore(self.accounts.data_path('bookmark.json')),
+            series_settings=self.series_settings,
         )
         self._transport = transport
         self._cookie = None if self.accounts.error is not None else self.accounts.cookie()
@@ -647,6 +651,7 @@ class Service:
         self._highlight_process: Any = None
         self._player_launcher = player_launcher or (lambda bookmark_id: _spawn_bookmark_player(bookmark_id, self.accounts.active))
         self._status_process: Any = None
+        self._series_processes = {}
         self._status_lock = threading.Lock()
         # One-shot target consumed only by the independent highlight window.
         self._bookmark_lock = threading.Lock()
@@ -807,7 +812,9 @@ class Service:
         self.sessions = Sessions(self._clock)
         self.library = Library(self.accounts.data_path('library.json'))
         self.directories = Directories(self.accounts.data_path('directories.json'))
+        self.series_settings = SeriesSettings(self.accounts.data_path('series-settings.json'))
         self.monitor = PlaybackMonitor(self.library, bookmarks=BookmarkStore(self.accounts.data_path('bookmark.json')),
+                                       series_settings=self.series_settings,
                                        **self._monitor_options)
         self.diagnostics = Diagnostics()
         with self._parent_lock:
@@ -998,6 +1005,35 @@ class Service:
     def open_plain_status_window(self) -> str:
         """Open management independently of pending highlight actions."""
         return self.open_status_window()
+
+    def series_context(self, parent, *, fetch=False):
+        if parent == '0':
+            raise UsageError('请进入具体剧集目录后设置片头片尾')
+        if fetch:
+            self.directories.chain(parent, self.files().info)
+        context = self.directories.context(parent)
+        if context['series_name'] == '未命名剧集' or not context['parent_name']:
+            raise UsageError('未能识别剧集目录，请先从我的网盘打开该剧集')
+        return context
+
+    def open_series_settings(self, parent):
+        context = self.series_context(parent, fetch=True)
+        series = context['series_fid']
+        key = (self.accounts.active, series)
+        with self._status_lock:
+            self._series_processes = {key: process for key, process in self._series_processes.items()
+                                      if process.poll() is None}
+            process = self._series_processes.get(key)
+            if process is not None:
+                foreground_process(process.pid)
+                return 'already_open'
+            try:
+                self._series_processes[key] = subprocess.Popen(
+                    [sys.executable or 'python', '-m', 'quark_cli.potplayer', '--series-settings-window',
+                     '--series-fid', series, '--account-id', self.accounts.active], **_detached_options())
+            except OSError:
+                raise LocalIOError('无法打开片头片尾设置窗口') from None
+        return 'opened'
 
     def bookmark_request(self) -> dict[str, str] | None:
         """A copy of the pending bookmark-window request, or ``None``."""
@@ -1478,6 +1514,24 @@ class _Handler(BaseHTTPRequestHandler):
             resolved, videos = playlist(service.files(), parent, None)
             service.note_directory(resolved, videos)
             return self._json(200, _series_payload(service.library.snapshot(), resolved, videos))
+        if route == '/v1/series-settings/open':
+            if method != 'POST':
+                return self._json(405, _failure('method_not_allowed', '该接口只接受 POST'))
+            service.require_login()
+            parent = require_fid(self._body(raw).get('parent'), label='parent')
+            return self._json(202, {'status': service.open_series_settings(parent)})
+        if route == '/v1/series-settings':
+            if method in ('GET', 'HEAD'):
+                series = require_fid(_first(query, 'series', None), label='series')
+                context = service.series_context(series)
+                return self._json(200, {'series': context['series_fid'], 'name': context['series_name'],
+                                        **service.series_settings.get(context['series_fid'])})
+            if method == 'POST':
+                body = self._body(raw)
+                series = require_fid(body.get('series'), label='series')
+                context = service.series_context(series)
+                rule = service.series_settings.save(context['series_fid'], body.get('intro_seconds'), body.get('outro_seconds'))
+                return self._json(200, {'series': context['series_fid'], **rule})
         if route == "/v1/mark":
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))

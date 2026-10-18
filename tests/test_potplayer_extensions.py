@@ -607,13 +607,14 @@ class LibraryEntryDesignTests(unittest.TestCase):
     def test_recent_list_reuses_stable_play_links_and_clears_idempotently(self):
         body = self.body("array<dictionary> QuarkRecentList()")
         self.assertIn('QuarkRequest("/v1/recent", "")', body)
-        self.assertIn("QUARK_ACTION_CLEAR_RECENT", body)
+        self.assertIn("quark-recent-manage", body)
         self.assertIn("最近没有播放记录", body)
         self.assertIn("QuarkAppendRecentItems(ret, items)", body)
         # 条目走最近记录专用构造：视频复用 QUARK_PLAY_PREFIX，且每条附一条操作文件夹行。
         rows = self.body("void QuarkAppendRecentItems(array<dictionary> &ret, JsonValue &items)")
         self.assertIn('play["url"] = QUARK_PLAY_PREFIX + fid.asString()', rows)
-        self.assertIn("QuarkAppendVideoActions(ret, fid.asString(), title)", rows)
+        self.assertNotIn("QuarkAppendVideoActions", rows)
+        self.assertIn("QuarkAppendVideoActions", self.body("array<dictionary> QuarkRecentManagePage()"))
 
         clear = body_raw(self.url_raw, "array<dictionary> QuarkRecentClearPage()")
         self.assertIsNotNone(re.search(r'"/v1/recent/clear"\s*,\s*"\{', clear), "clear must POST a JSON body")
@@ -654,7 +655,7 @@ class LibraryEntryDesignTests(unittest.TestCase):
         action = self.body("void QuarkAppendFavoriteAction(array<dictionary> &ret, string fid, bool saved)")
         self.assertIn('row["title"] = "收藏当前目录"', action)
         self.assertIn('row["title"] = "取消收藏当前目录"', action)
-        self.assertIn('clear["title"] = "清空最近观看"', self.body("array<dictionary> QuarkRecentList()"))
+        self.assertIn('clear["title"] = "清空最近观看"', self.body("array<dictionary> QuarkRecentManagePage()"))
         self.assertIn("已清空最近观看", self.body("array<dictionary> QuarkRecentClearPage()"))
 
     def test_get_url_list_dispatches_without_a_generic_router(self):
@@ -739,9 +740,11 @@ class SeriesEntryDesignTests(unittest.TestCase):
     def test_series_page_lists_every_episode_with_a_toggle_token(self):
         body = self.body("array<dictionary> QuarkSeriesPage(string parent)")
         self.assertIn('"/v1/series?parent=" + HostUrlEncode(parent)', body)
-        self.assertIn("QuarkWatchToken(!marked, parent, fid.asString())", body)
-        self.assertIn("已看（点击标记未看）", body)
-        self.assertIn("未看（点击标记已看）", body)
+        self.assertIn('QUARK_ACTION_VIDEO + fid.asString() + "|" + parent + "|" + flag', body)
+        self.assertIn("片头片尾设置", body)
+        self.assertIn("QuarkWatchToken(state == \"1\", parent, fid)", self.body("array<dictionary> QuarkVideoActionsPage(string fid)"))
+        self.assertIn(" · 已看", body)
+        self.assertIn(" · 未看", body)
         # 管理页是纯导航：没有媒体地址。
         self.assertNotIn('row["url"]', body)
 
@@ -802,7 +805,8 @@ class WatchCenterDesignTests(unittest.TestCase):
     def test_root_single_video_gets_play_and_actions(self):
         root = self.body("array<dictionary> QuarkWatchCenterList()")
         self.assertIn('play["url"] = QUARK_PLAY_PREFIX + key.asString()', root)
-        self.assertIn("QuarkAppendVideoActions(ret, key.asString(), title)", root)
+        self.assertNotIn("QuarkAppendVideoActions", root)
+        self.assertEqual(root.count('manage["title"] = "观看管理"'), 1)
 
     def test_group_page_reads_series_once_and_lays_out_the_contract(self):
         page = self.body("array<dictionary> QuarkCenterSeriesPage(string parent)")
@@ -846,7 +850,8 @@ class WatchCenterDesignTests(unittest.TestCase):
         self.assertNotIn("QUARK_PLAY_PREFIX + episodes[0]", page)
         # 自然顺序的剧集：每集可播放，并附一个操作文件夹行（精彩标记、删除）。
         self.assertIn('root["episodes"]', page)
-        self.assertIn("QuarkAppendVideoActions(ret, fid.asString(), title)", page)
+        self.assertNotIn("QuarkAppendVideoActions", page)
+        self.assertIn("剧集管理", page)
 
 
 class VideoActionsDesignTests(unittest.TestCase):
@@ -869,7 +874,8 @@ class VideoActionsDesignTests(unittest.TestCase):
         self.assertIn('row["folder"] = "1"', row)
         self.assertIn("QUARK_ACTION_VIDEO + fid", row)
         self.assertIn("QuarkValidFid(fid)", row)
-        self.assertIn("（精彩标记、记录）", row)
+        self.assertNotIn("操作：", row)
+        self.assertNotIn("（精彩标记、记录）", row)
         self.assertNotIn('row["url"]', row)
 
     def test_actions_page_offers_play_bookmarks_and_delete(self):
@@ -986,7 +992,7 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
     def test_versions_report_the_current_release(self):
         # 本任务只把 UrlList 升到 0.8.0；PlayParse/SubtitleSearch 的版本由各自的
         # 任务维护，这里只要求仍是语义化版本串。
-        self.assertIn('return "0.12.3";', self.raw_body(self.url_raw, "string GetVersion()"))
+        self.assertIn('return "0.12.4";', self.raw_body(self.url_raw, "string GetVersion()"))
         self.assertRegex(
             self.raw_body(self.play_raw, "string GetVersion()"), r'return "\d+\.\d+\.\d+";'
         )

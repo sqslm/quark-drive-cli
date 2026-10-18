@@ -33,7 +33,7 @@ def _run(argv=None):
         import tkinter as tk
         from tkinter import messagebox
         root = tk.Tk()
-        icon = args.install_dir / 'app' / '_internal' / 'quark_cli' / 'potplayer' / 'MediaUrlList - Quark.ico'
+        icon = args.install_dir / 'app' / '_internal' / 'quark_cli' / 'potplayer' / 'MediaPlayParse - Quark.ico'
         if icon.is_file():
             root.iconbitmap(default=str(icon))
         root.withdraw()
