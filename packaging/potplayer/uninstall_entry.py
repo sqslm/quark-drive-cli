@@ -33,6 +33,9 @@ def _run(argv=None):
         import tkinter as tk
         from tkinter import messagebox
         root = tk.Tk()
+        icon = args.install_dir / 'app' / '_internal' / 'quark_cli' / 'potplayer' / 'MediaUrlList - Quark.ico'
+        if icon.is_file():
+            root.iconbitmap(default=str(icon))
         root.withdraw()
         if not args.confirmed and not messagebox.askyesno('卸载夸克网盘插件', '请先关闭 PotPlayer。确定卸载插件？\n默认保留账号及观看记录。', parent=root):
             root.destroy()

@@ -139,10 +139,10 @@ class FormattingTests(unittest.TestCase):
     def test_saved_credential_is_pending_not_normal(self):
         label = validation_label("saved_unverified")
         self.assertNotIn("正常", label)
-        self.assertIn("待验证", label)
+        self.assertIn("等待连接确认", label)
         self.assertEqual(validation_label("no_login"), "未登录")
         self.assertEqual(validation_label("expired"), "登录已失效")
-        self.assertEqual(validation_label("recently_valid"), "最近调用成功")
+        self.assertEqual(validation_label("recently_valid"), "上次网盘连接正常")
         self.assertEqual(validation_label("bogus"), "未知状态")
 
     def test_state_labels_are_chinese_and_bounded(self):
@@ -159,13 +159,13 @@ class FormattingTests(unittest.TestCase):
             "instruction": "固定说明",
         }
         self.assertEqual(protection_text(stopped), "固定说明")
-        self.assertIn("冷却中", protection_text(
+        self.assertIn("请等待", protection_text(
             {"available": True, "active": True, "reason": "rate_limited", "remaining_seconds": 9.6}
         ))
         self.assertIn("00:00:09", protection_text(
             {"available": True, "active": True, "reason": "rate_limited", "remaining_seconds": 9.6}
         ))
-        self.assertEqual(protection_text({"available": True, "active": False, "reason": None}), "无冷却")
+        self.assertEqual(protection_text({"available": True, "active": False, "reason": None}), "未触发限制")
         self.assertIn("不可用", protection_text({"available": False, "reason": "unavailable"}))
         self.assertIn("不可用", protection_text(None))
 
@@ -554,6 +554,18 @@ class _FakeToplevel:
     def lift(self) -> None:
         self.lifted += 1
 
+    def deiconify(self):
+        pass
+
+    def update_idletasks(self):
+        pass
+
+    def winfo_id(self):
+        return 0
+
+    def focus_force(self):
+        pass
+
 
 class _FakeDialog:
     """Stand-in for ``tkinter.simpledialog``; may mutate state mid-dialog."""
@@ -590,8 +602,8 @@ class TransferRenderTests(unittest.TestCase):
             }
         }
         window = self._window(snapshot)
-        self.assertIn("整体速度（5 秒）：5.0 MiB/s", window._transfer_var.value)
-        self.assertIn("累计传输：3.00 GiB", window._transfer_var.value)
+        self.assertIn("下载速度：5.0 MiB/s", window._transfer_var.value)
+        self.assertIn("本次已下载：3.00 GiB", window._transfer_var.value)
         self.assertNotIn("ms", window._transfer_var.value)
         self.assertEqual(window._transfer_tree.rows, [])
 

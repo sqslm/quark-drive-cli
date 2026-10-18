@@ -9,7 +9,6 @@ from .gui_common import (
     REPORT_PATH,
     RESTART_PATH,
     SNAPSHOT_PATH,
-    TRANSFER_ROWS,
     _DISCONNECTED_NOTE,
     _EXPORT_FAILED_REPORT,
     _EXPORT_FAILED_WRITE,
@@ -31,6 +30,29 @@ from .gui_common import (
 )
 from . import plugin_state
 from .gui_transport import LocalClient, LocalWorker, LocalPanel
+
+
+def diagnostic_summary(snapshot):
+    account = snapshot.get('account') or {}
+    protection = snapshot.get('protection') or {}
+    if account.get('validation') == 'expired':
+        return '账号登录已失效\n请到“账号管理”重新扫码登录。'
+    if not account.get('credential_present'):
+        return '尚未登录网盘\n请先到“账号管理”添加或选择一个已登录的账号。'
+    if protection.get('active'):
+        return '网盘暂时限制了访问\n请等待下方显示的时间结束后，再重新打开视频。'
+    if protection.get('available') is False:
+        return '暂时无法读取插件的连接状态\n请查看下方的问题说明，修复后重新打开插件。'
+    states = {row.get('state') for row in snapshot.get('playback', []) if isinstance(row, dict)}
+    if 'playing' in states:
+        return '视频正在播放\n下载速度为 0 也可能是已有足够缓存，不一定是故障。'
+    if 'paused' in states:
+        return '视频已暂停\n暂停时下载也可能停止，继续播放后会按需要补充缓存。'
+    if 'waiting' in states:
+        return '正在打开视频\n请稍等；如果长时间没有画面，可以关闭后重新打开该视频。'
+    if states - {'stopped'}:
+        return '暂时无法读取播放进度\n请查看播放器是否仍在播放；下方可以保存排查信息。'
+    return '当前没有正在播放的视频\n从网盘打开视频后，这里会显示播放和下载情况。'
 
 
 class BridgeClient(LocalClient):
@@ -92,6 +114,7 @@ class StatusWindow(LocalPanel):
         self._restart_pending = self._export_pending = self._rebuilding = False
         self._filedialog = None
         self._transfer_var = self._account_var = self._protection_var = self._notice_var = None
+        self._summary_var = None
         self._transfer_tree = self._playback_tree = self._errors_tree = None
         self._restart_button = self._export_button = None
     def _build(self, tk: Any, root: Any) -> None:
@@ -99,6 +122,7 @@ class StatusWindow(LocalPanel):
 
         self._filedialog = filedialog
         self._transfer_var = tk.StringVar(value="—")
+        self._summary_var = tk.StringVar(value='正在检查播放情况……')
         self._account_var = tk.StringVar(value="—")
         self._protection_var = tk.StringVar(value="—")
         self._notice_var = tk.StringVar(value="正在连接本地服务……")
@@ -106,41 +130,44 @@ class StatusWindow(LocalPanel):
         outer = ttk.Frame(root, padding=10)
         outer.pack(fill='both', expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(3, weight=3)
-        outer.rowconfigure(4, weight=2)
+        outer.rowconfigure(3, weight=1)
+        outer.rowconfigure(4, weight=1)
 
-        summary = ttk.LabelFrame(outer, text="传输概览", padding=8)
+        summary = ttk.LabelFrame(outer, text="当前情况", padding=8)
         summary.grid(row=0, column=0, sticky="ew")
+        ttk.Label(summary, textvariable=self._summary_var, anchor='w', justify='left',
+                  wraplength=730).pack(fill='x', pady=(0, 6))
         ttk.Label(summary, textvariable=self._transfer_var, anchor="w", justify="left").pack(
             fill="x"
         )
 
-        transfer = ttk.LabelFrame(outer, text="各会话传输（本机逐会话统计）", padding=8)
-        transfer.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        transfer = ttk.LabelFrame(outer, text="本次打开过的视频 · 下载情况", padding=8)
+        transfer.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
         transfer.columnconfigure(0, weight=1)
+        transfer.rowconfigure(0, weight=1)
         self._transfer_tree = ttk.Treeview(
             transfer,
             columns=("name", "bytes", "speed", "rtt"),
             show="headings",
             selectmode="browse",
-            height=TRANSFER_ROWS,
+            height=3,
         )
         for column, title, width in (
-            ("name", "名称", 320),
-            ("bytes", "本次累计传输", 140),
-            ("speed", "5 秒速率", 130),
-            ("rtt", "上游响应", 110),
+            ("name", "视频", 320),
+            ("bytes", "已下载", 140),
+            ("speed", "下载速度", 130),
+            ("rtt", "网盘响应时间", 110),
         ):
             self._transfer_tree.heading(column, text=title)
             self._transfer_tree.column(column, width=width, anchor="w", stretch=(column == "name"))
-        self._transfer_tree.grid(row=0, column=0, sticky="ew")
+        self._transfer_tree.grid(row=0, column=0, sticky="nsew")
         transfer_scroll = ttk.Scrollbar(
             transfer, orient="vertical", command=self._transfer_tree.yview
         )
         self._transfer_tree.configure(yscrollcommand=transfer_scroll.set)
         transfer_scroll.grid(row=0, column=1, sticky="ns")
 
-        state = ttk.LabelFrame(outer, text="账号与本地保护", padding=8)
+        state = ttk.LabelFrame(outer, text="网盘连接", padding=8)
         state.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(state, textvariable=self._account_var, anchor="w", justify="left").pack(
             fill="x"
@@ -149,8 +176,9 @@ class StatusWindow(LocalPanel):
             state, textvariable=self._protection_var, anchor="w", justify="left", wraplength=740
         ).pack(fill="x", pady=(4, 0))
 
-        playback = ttk.LabelFrame(outer, text="播放会话（选择一行后可从头开始）", padding=8)
-        playback.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        playback = ttk.LabelFrame(outer, text="正在播放的视频 · 选中后可从头播放", padding=8)
+        playback.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        outer.rowconfigure(1, weight=2)
         playback.columnconfigure(0, weight=1)
         playback.rowconfigure(0, weight=1)
         self._playback_tree = ttk.Treeview(
@@ -158,6 +186,7 @@ class StatusWindow(LocalPanel):
             columns=("name", "position", "duration", "state"),
             show="headings",
             selectmode="browse",
+            height=3,
         )
         for column, title, width in (
             ("name", "名称", 320),
@@ -175,16 +204,16 @@ class StatusWindow(LocalPanel):
         playback_scroll.grid(row=0, column=1, sticky="ns")
         self._playback_tree.bind("<<TreeviewSelect>>", self._on_select)
 
-        errors = ttk.LabelFrame(outer, text="最近错误（最多 20 条）", padding=8)
+        errors = ttk.LabelFrame(outer, text="最近遇到的问题", padding=8)
         errors.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
         errors.columnconfigure(0, weight=1)
         errors.rowconfigure(0, weight=1)
         self._errors_tree = ttk.Treeview(
-            errors, columns=("time", "phase", "message"), show="headings", selectmode="browse"
+            errors, columns=("time", "phase", "message"), show="headings", selectmode="browse", height=3
         )
         for column, title, width in (
             ("time", "时间", 90),
-            ("phase", "阶段", 90),
+            ("phase", "问题位置", 90),
             ("message", "说明", 560),
         ):
             self._errors_tree.heading(column, text=title)
@@ -201,11 +230,11 @@ class StatusWindow(LocalPanel):
         )
         ttk.Button(actions, text="关闭", width=10, command=self._close).pack(side="right")
         self._restart_button = ttk.Button(
-            actions, text="从头开始", width=12, command=self._restart
+            actions, text="从头播放", width=12, command=self._restart
         )
         self._restart_button.pack(side="right", padx=6)
         self._export_button = ttk.Button(
-            actions, text="导出诊断", width=12, command=self._export
+            actions, text="保存排查信息", width=12, command=self._export
         )
         self._export_button.pack(side="right")
     def _handle(self, kind, value):
@@ -237,6 +266,7 @@ class StatusWindow(LocalPanel):
             self._selected = None
         self._account_id = account_id
         self._snapshot = snapshot
+        self._summary_var.set(diagnostic_summary(snapshot))
         self._playback = snapshot.get('playback', [])
         self._refresh_transfer(snapshot)
         self._refresh_account(snapshot)
@@ -248,6 +278,7 @@ class StatusWindow(LocalPanel):
     def _show_disconnected(self):
         self._connected = False
         self._notice_var.set(_DISCONNECTED_NOTE)
+        self._summary_var.set('暂时无法连接插件\n请关闭此窗口，从 PotPlayer 重新打开“插件管理”。')
         self._playback = []
         self._refresh_playback()
         self._update_actions()
@@ -261,8 +292,8 @@ class StatusWindow(LocalPanel):
         # The totals row is the bridge-wide aggregate; no selected-playback RTT
         # is guessed here because per-play rows carry no player_pid/fid.
         self._transfer_var.set(
-            f"整体速度（5 秒）：{format_speed(totals.get('speed_bytes_per_second'))}"
-            f"　累计传输：{format_bytes(totals.get('bytes'))}"
+            f"下载速度：{format_speed(totals.get('speed_bytes_per_second'))}"
+            f"　本次已下载：{format_bytes(totals.get('bytes'))}"
         )
         tree = self._transfer_tree
         tree.delete(*tree.get_children())
@@ -284,21 +315,22 @@ class StatusWindow(LocalPanel):
     def _refresh_account(self, snapshot: dict[str, Any]) -> None:
         account = snapshot.get("account")
         account = account if isinstance(account, dict) else {}
-        credential = "已保存" if account.get("credential_present") else "未保存"
+        credential = "已保存登录信息" if account.get("credential_present") else "请到账号管理登录"
         last_success = format_timestamp(account.get("last_success_at"))
         self._account_var.set(
-            f"账号状态：{validation_label(account.get('validation'))}"
-            f"　凭证：{credential}　最近成功：{last_success}"
+            f"{validation_label(account.get('validation'))}　{credential}"
+            f"　上次连接成功：{last_success}"
         )
         protection = snapshot.get("protection")
-        self._protection_var.set(f"本地保护：{protection_text(protection)}")
+        self._protection_var.set(f"请求限制：{protection_text(protection)}")
 
     def _refresh_errors(self, snapshot: dict[str, Any]) -> None:
         tree = self._errors_tree
         tree.delete(*tree.get_children())
         errors = snapshot.get("errors")
         events = errors.get("events") if isinstance(errors, dict) else None
-        if not isinstance(events, list):
+        if not isinstance(events, list) or not events:
+            tree.insert('', 'end', values=('—', '—', '暂无问题记录；如果播放异常，可保存排查信息。'))
             return
         for event in list(reversed(events))[:MAX_ERROR_ROWS]:
             if not isinstance(event, dict):
@@ -308,7 +340,8 @@ class StatusWindow(LocalPanel):
                 "end",
                 values=(
                     format_timestamp(event.get("at")),
-                    event.get("phase") or "—",
+                    {'源站': '视频下载', '凭证': '登录信息', '本地': '电脑文件', '请求': '连接网盘'}.get(
+                        event.get('phase'), event.get('phase') or '—'),
                     event.get("message") or "—",
                 ),
             )
@@ -332,7 +365,7 @@ class StatusWindow(LocalPanel):
             return
         path = self._filedialog.asksaveasfilename(
             parent=self._root,
-            title="导出诊断报告",
+            title="保存排查信息 · 播放有问题时可发给开发者",
             defaultextension=".json",
             initialfile=default_export_name(),
             filetypes=(("JSON 文件", "*.json"), ("所有文件", "*.*")),

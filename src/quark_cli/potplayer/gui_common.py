@@ -62,8 +62,8 @@ _GIB = 1024 * 1024 * 1024
 
 _VALIDATION_LABELS = {
     "no_login": "未登录",
-    "saved_unverified": "凭证已保存，待验证",
-    "recently_valid": "最近调用成功",
+    "saved_unverified": "登录信息已保存，等待连接确认",
+    "recently_valid": "上次网盘连接正常",
     "expired": "登录已失效",
 }
 
@@ -93,9 +93,9 @@ _INACTIVE_STATES = frozenset(
 _OPERABLE_STATES = frozenset({"playing", "paused"})
 
 _COOLDOWN_LABELS = {
-    "rate_limited": "上游限流",
-    "access_restricted": "上游拒绝访问",
-    "service_unavailable": "上游暂时不可用",
+    "rate_limited": "网盘请求过多",
+    "access_restricted": "网盘暂时拒绝访问",
+    "service_unavailable": "网盘暂时不可用",
 }
 
 # Fixed messages for the restart request; the upstream error text is never kept.
@@ -227,8 +227,8 @@ def protection_text(protection: Any) -> str:
     if protection.get("active"):
         label = _COOLDOWN_LABELS.get(reason, "上游限流")
         remaining = format_duration_seconds(protection.get("remaining_seconds"))
-        return f"冷却中：{label}，剩余 {remaining}"
-    return "无冷却"
+        return f"{label}，请等待 {remaining} 后再试"
+    return "未触发限制"
 
 
 # -- endpoint / client --------------------------------------------------

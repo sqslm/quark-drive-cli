@@ -9,6 +9,7 @@ from .accounts_gui import AccountClient, AccountsPanel
 from .highlights_gui import HighlightsClient, HighlightsPanel
 from .installation_gui import InstallationPanel
 from .status_gui import BridgeClient, StatusWindow
+from .window_ui import configure_window
 from .gui_common import (
     EXIT_OK, EXIT_UNAVAILABLE, WINDOW_WIDTH, WINDOW_HEIGHT, MIN_WIDTH, MIN_HEIGHT,
     _apply_font, _tkinter, _widgets, load_endpoint,
@@ -35,9 +36,9 @@ class ManagementWindow:
         tabs.pack(fill='both', expand=True)
         try:
             for title, page_type, client_type in (
-                ('播放诊断', StatusWindow, BridgeClient),
                 ('账号管理', AccountsPanel, AccountClient),
                 ('精彩标记', HighlightsPanel, HighlightsClient),
+                ('播放诊断', StatusWindow, BridgeClient),
                 ('安装管理', InstallationPanel, None),
             ):
                 frame = ttk.Frame(tabs)
@@ -49,9 +50,12 @@ class ManagementWindow:
                 self.pages.append(page)
                 page.mount(tk, root, frame)
             def activate(_event):
-                if tabs.index(tabs.select()) == 1:
-                    self.pages[1].activate()
+                if tabs.index(tabs.select()) == 0:
+                    self.pages[0].activate()
             tabs.bind('<<NotebookTabChanged>>', activate)
+            tabs.select(0)
+            self.pages[0].activate()
+            configure_window(root)
             root.mainloop()
         finally:
             for page in self.pages:

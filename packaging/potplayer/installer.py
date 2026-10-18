@@ -428,6 +428,10 @@ def run_gui(args: argparse.Namespace, payload: Payload) -> int:
     from tkinter import Tk
 
     root = Tk()
+    icon = payload.as_dir / 'MediaUrlList - Quark.ico'
+    if icon.is_file():
+        root.iconbitmap(default=str(icon))
+        root.iconbitmap(str(icon))
     try:
         root.call("tk", "scaling", 1.2)
     except Exception:  # noqa: BLE001 - cosmetic only

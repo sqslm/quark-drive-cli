@@ -43,6 +43,7 @@ class AccountsPanel(LocalPanel):
         self._accounts_tree = self._accounts_notice = self._current_account_var = None
         self._account_buttons = {}
         self._failed = False
+        self._activated = False
 
     def _build(self, tk, root):
         from tkinter import ttk
@@ -73,6 +74,8 @@ class AccountsPanel(LocalPanel):
                 self._account_pending = False
             self._account_id = account_id
             self._refresh_accounts({'accounts': value, 'login_state': value.get('login_state')})
+            if self._activated:
+                self.activate()
         elif kind in ('failed', 'disconnected'):
             self._show_disconnected()
 
@@ -82,6 +85,7 @@ class AccountsPanel(LocalPanel):
         self._update_account_buttons()
 
     def activate(self):
+        self._activated = True
         if not self._account_tab_seen and self._connected and self._account_id and not self._failed:
             self._account_tab_seen = True
             self._account_command('refresh')

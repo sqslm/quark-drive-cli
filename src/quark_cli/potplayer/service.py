@@ -48,6 +48,7 @@ from .accounts import Accounts, account_key
 from .diagnostics import Diagnostics
 from .directory_state import Directories
 from .buffering import ReadAhead
+from .window_ui import foreground_process
 from .library import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
@@ -895,6 +896,8 @@ class Service:
         self._guard.check_active_cooldown()
         with self._login_lock:
             if self._login_thread is not None and self._login_thread.is_alive():
+                if isinstance(self._login_window, QrLoginWindow):
+                    self._login_window.request_present()
                 return self._login_payload_locked()
             self.login_state = "waiting"
             self.login_message = None
@@ -983,6 +986,7 @@ class Service:
         with self._status_lock:
             process = self._status_process
             if process is not None and process.poll() is None:
+                foreground_process(getattr(process, 'pid', None))
                 return "already_open"
             launcher = self._status_launcher or _spawn_status_window
             try:
@@ -1020,6 +1024,7 @@ class Service:
             self._bookmark_request = request
             try:
                 if self._highlight_process is not None and self._highlight_process.poll() is None:
+                    foreground_process(getattr(self._highlight_process, 'pid', None))
                     return 'already_open'
                 self._highlight_process = (self._highlight_launcher or _spawn_highlights_window)()
                 return 'opened'

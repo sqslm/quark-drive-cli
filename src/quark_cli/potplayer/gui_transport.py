@@ -6,6 +6,7 @@ import httpx
 import queue
 import threading
 import time
+from .window_ui import configure_window
 from .gui_common import (
     EXIT_OK,
     Endpoint,
@@ -182,6 +183,7 @@ class LocalPanel:
         root.protocol('WM_DELETE_WINDOW', self._close)
         try:
             self.mount(tk, root, root)
+            configure_window(root)
             root.mainloop()
         finally:
             self._shutdown()

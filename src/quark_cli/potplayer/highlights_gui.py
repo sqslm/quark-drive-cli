@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Any
 import contextlib
+from .window_ui import configure_window, present_window
 from urllib.parse import quote
 from .gui_common import (
     BOOKMARKS_ADD_PATH,
@@ -249,7 +250,7 @@ class HighlightsPanel(LocalPanel):
             return
         if self._bookmark_live():
             with contextlib.suppress(Exception):
-                self._root.lift()
+                present_window(self._root)
         else:
             self._build_bookmarks()
         # Drop any list or pending answer of the previous target, then read the
@@ -462,7 +463,7 @@ class HighlightsPanel(LocalPanel):
             return
         if self._bookmark_live():
             with contextlib.suppress(Exception):
-                self._bookmark_window.lift()
+                present_window(self._bookmark_window)
         else:
             self._build_bookmarks()
         # Only a selection change and an explicit operator action re-read the
@@ -485,6 +486,7 @@ class HighlightsPanel(LocalPanel):
             window.minsize(BOOKMARK_MIN_WIDTH, BOOKMARK_MIN_HEIGHT)
             window.transient(root)
             window.protocol("WM_DELETE_WINDOW", self._close_bookmarks)
+            configure_window(window)
 
         self._bookmark_header_var = self._tk.StringVar(value="—")
         self._bookmark_notice_var = self._tk.StringVar(value="")

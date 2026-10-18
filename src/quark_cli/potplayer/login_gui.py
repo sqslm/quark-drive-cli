@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 from ..auth import LoginCancelled, QRExpired, QRLogin
 from ..errors import LocalIOError, QuarkError
+from .window_ui import configure_window, present_window
 
 # A code that keeps expiring is retried a few times, then reported as failed
 # instead of requesting a new one forever.
@@ -155,6 +156,7 @@ class QrLoginWindow:
             tk.Label(root, text="请用手机夸克 App 扫码，并在手机上确认登录", fg="#444444").pack(padx=18)
             tk.Button(root, text="关闭", width=10, command=self.close).pack(pady=14)
             root.protocol("WM_DELETE_WINDOW", self.close)
+            configure_window(root)
 
             self._on_qr_ready = on_qr_ready
             self._runner = LoginRunner(self._new_login, self._post)
@@ -199,6 +201,10 @@ class QrLoginWindow:
     def request_close(self) -> None:
         """Ask the Tk thread to close the window; safe from any other thread."""
         self._events.put(("stop", None))
+
+    def request_present(self) -> None:
+        """Bring an existing QR window forward on its own Tk thread."""
+        self._events.put(('present', None))
 
     def _teardown(self) -> None:
         """Release every Tk object on the thread that created the window."""
@@ -261,7 +267,10 @@ class QrLoginWindow:
             self._pump_id = root.after(120, self._pump)
 
     def _handle(self, kind: str, value: Any) -> None:
-        if kind == "qr":
+        if kind == 'present':
+            if self._root is not None:
+                present_window(self._root)
+        elif kind == "qr":
             tk, image, status = self._tk, self._image, self._status
             try:
                 photo = tk.PhotoImage(file=value)

@@ -536,7 +536,7 @@ class LibraryEntryDesignTests(unittest.TestCase):
         self.assertRegex(body, r'recent\["Category"\]\s*=\s*"recent"')
         # 0.5.0 新增：本地诊断入口，纯本地功能，不需要夸克登录。
         self.assertRegex(body, r'diagnostics\["Category"\]\s*=\s*"diagnostics"')
-        self.assertIn("插件管理（账号 / 精彩标记 / 诊断）", read_script(URL_LIST))
+        self.assertIn("插件管理", read_script(URL_LIST))
 
     def test_titles_keep_simplified_chinese_and_the_cp0_fallback(self):
         body = self.body("array<dictionary> GetCategorys()")
@@ -780,7 +780,7 @@ class WatchCenterDesignTests(unittest.TestCase):
 
     def test_continue_category_title_names_the_watch_center(self):
         categories = self.body("array<dictionary> GetCategorys()")
-        self.assertIn("追剧中心（继续观看）", categories)
+        self.assertIn("追剧中心", categories)
         self.assertRegex(categories, r'resume\["Category"\]\s*=\s*"continue"')
 
     def test_root_groups_series_and_never_scans_series_per_group(self):
@@ -986,7 +986,7 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
     def test_versions_report_the_current_release(self):
         # 本任务只把 UrlList 升到 0.8.0；PlayParse/SubtitleSearch 的版本由各自的
         # 任务维护，这里只要求仍是语义化版本串。
-        self.assertIn('return "0.12.2";', self.raw_body(self.url_raw, "string GetVersion()"))
+        self.assertIn('return "0.12.3";', self.raw_body(self.url_raw, "string GetVersion()"))
         self.assertRegex(
             self.raw_body(self.play_raw, "string GetVersion()"), r'return "\d+\.\d+\.\d+";'
         )
@@ -996,7 +996,7 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
         self.assertIsNotNone(
             re.search(r'"/v1/management/open"\s*,\s*"\{', page), "open must POST a JSON body"
         )
-        self.assertIn("已打开插件管理（账号 / 精彩标记 / 诊断）窗口", page)
+        self.assertIn("已打开插件管理窗口", page)
         self.assertIn("QuarkActionResult", page)
         # 结果是可导航的返回行，不是媒体地址。
         self.assertNotIn('row["url"]', page)

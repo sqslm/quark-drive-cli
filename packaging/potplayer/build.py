@@ -33,7 +33,8 @@ ROOT = HERE.parents[1]
 COMPONENT_NAME = "QuarkPotPlayer"
 LAUNCHER_NAME = "quark-potplayer"
 SETUP_NAME = "QuarkPotPlayer-Setup"
-DEFAULT_VERSION = "0.12.2"
+DEFAULT_VERSION = "0.12.3"
+ICON = ROOT / 'potplayer' / 'MediaUrlList - Quark.ico'
 
 
 class BuildError(RuntimeError):
@@ -297,6 +298,8 @@ def build_component(python: str, build_dir: Path) -> Path:
             "--windowed",
             "--name",
             COMPONENT_NAME,
+            "--icon", str(ICON),
+            "--add-data", f"{ICON};quark_cli/potplayer",
             "--paths",
             str(ROOT / "src"),
             "--hidden-import",
@@ -347,6 +350,7 @@ def build_launcher(python: str, build_dir: Path) -> Path:
             "--windowed",
             "--name",
             LAUNCHER_NAME,
+            "--icon", str(ICON),
             "--distpath",
             str(dist),
             "--workpath",
@@ -418,6 +422,7 @@ def build_installer(python: str, build_dir: Path, payload: Path, out_dir: Path) 
             "--windowed",
             "--name",
             SETUP_NAME,
+            "--icon", str(ICON),
             "--paths",
             str(HERE),
             *add,

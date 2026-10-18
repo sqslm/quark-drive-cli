@@ -126,7 +126,7 @@
 
 ## 搜索、收藏、最近与继续观看
 
-扩展开关在根页面选择类别：`drive`（我的网盘）、`search`（`type=search`，用 Query 输入关键词）、`favorites`、`recent`、`continue`（追剧中心（继续观看））、`highlights`（精彩标记）。搜索只在根页面消费 `Query`；进入结果目录后按 `PathToken` 里的 FID 正常浏览，不再使用 `Query`。
+扩展开关在根页面选择类别：`drive`（我的网盘）、`search`（`type=search`，用 Query 输入关键词）、`favorites`、`recent`、`continue`（追剧中心）、`highlights`（精彩标记）。搜索只在根页面消费 `Query`；进入结果目录后按 `PathToken` 里的 FID 正常浏览，不再使用 `Query`。
 
 ### `GET /v1/search?q=<keyword>&page=<n>&size=<n>`
 
@@ -179,7 +179,7 @@
 
 ### `GET /v1/watch-center`
 
-本机观看记录的分组视图，供扩展的“追剧中心（继续观看）”根页使用。**不需要**夸克登录，纯本地读取，不向上游发请求。返回：
+本机观看记录的分组视图，供扩展的“追剧中心”根页使用。**不需要**夸克登录，纯本地读取，不向上游发请求。返回：
 
 ```json
 {"items":[{"kind":"series","key":"...","parent":"...","name":"剧集","display":"剧集 · 上次：第9集.mp4 · 已看5%",
@@ -283,7 +283,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.12.2", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.12.3", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -299,7 +299,7 @@
 
 需 Bearer；返回一份严格白名单的 JSON 报告，**不写盘、不上传**（导出动作由状态窗口发起，见下）。顶层字段为：`schema_version`（`1`）、`generated_at`（真实墙钟 UTC ISO 时刻）、`release`、`protocol`、`python`、`os`、`account`、聚合后的 `transfer`、`cooldown`、`errors`。
 
-报告**不包含** Cookie、令牌、任何 URL/签名地址、FID、文件名、观看进度/历史或绝对主机路径。状态窗口的“导出诊断”把它按 UTF-8 JSON 另存到用户选择的路径，由用户决定是否对外提供。
+报告**不包含** Cookie、令牌、任何 URL/签名地址、FID、文件名、观看进度/历史或绝对主机路径。状态窗口的“保存排查信息”把它按 UTF-8 JSON 另存到用户选择的路径，由用户决定是否对外提供。
 
 ### `POST /v1/management/open`
 

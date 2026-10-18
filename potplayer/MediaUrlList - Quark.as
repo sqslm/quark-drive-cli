@@ -73,7 +73,7 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "0.12.2";
+	return "0.12.3";
 }
 
 string GetDesc()
@@ -1205,7 +1205,7 @@ array<dictionary> QuarkRecentRemovePage(string fid)
 	return QuarkActionResult("已删除本条观看记录");
 }
 
-// 诊断入口：请本地服务拉起独立的“插件管理（账号 / 精彩标记 / 诊断）”窗口。窗口自行读取运行时记录，
+// 诊断入口：请本地服务拉起独立的“插件管理”窗口。窗口自行读取运行时记录，
 // 脚本不接触令牌或地址；重复刷新时服务端复用同一个窗口，操作幂等。
 array<dictionary> QuarkManagementPage()
 {
@@ -1213,7 +1213,7 @@ array<dictionary> QuarkManagementPage()
 	string message;
 
 	if (QuarkFailed(response, message)) return QuarkActionResult(message);
-	return QuarkActionResult("已打开插件管理（账号 / 精彩标记 / 诊断）窗口");
+	return QuarkActionResult("已打开插件管理窗口");
 }
 
 // 搜索根页面用 Query 查全网盘；进入结果目录后按 FID 浏览，不再使用 Query。
@@ -1433,7 +1433,7 @@ array<dictionary> GetCategorys()
 
 	dictionary resume;
 
-	resume["title"] = "{$CP936=追剧中心（继续观看）$}{$CP950=追劇中心（繼續觀看）$}{$CP0=Continue Watching$}";
+	resume["title"] = "{$CP936=追剧中心$}{$CP950=追劇中心$}{$CP0=Continue Watching$}";
 	resume["Category"] = "continue";
 	ret.insertLast(resume);
 	dictionary highlights;
@@ -1443,7 +1443,7 @@ array<dictionary> GetCategorys()
 
 	dictionary diagnostics;
 
-	diagnostics["title"] = "{$CP936=插件管理（账号 / 精彩标记 / 诊断）$}{$CP950=播放狀態與診斷$}{$CP0=Playback Status$}";
+	diagnostics["title"] = "{$CP936=插件管理$}{$CP950=插件管理$}{$CP0=Plugin Manager$}";
 	diagnostics["Category"] = "diagnostics";
 	ret.insertLast(diagnostics);
 	return ret;
