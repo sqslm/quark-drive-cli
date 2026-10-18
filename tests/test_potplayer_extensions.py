@@ -269,10 +269,12 @@ class _StartedBridge:
         self.previous_config = os.environ.get("QUARK_CONFIG_DIR")
         os.environ["QUARK_CONFIG_DIR"] = str(self.directory)
         if login_factory is None:
-            login_factory = lambda: FakeLogin(self.directory / "qr.png")
+            def login_factory():
+                return FakeLogin(self.directory / "qr.png")
         self.fixture = DriveFixture(records)
         self.service = Service(
-            transport=self.fixture.transport(), cookie=cookie, login_factory=login_factory
+            transport=self.fixture.transport(), cookie=cookie, login_factory=login_factory,
+            status_launcher=lambda: _StatusProcess(),
         )
         self.server = self.service.build_server()
         self.thread = threading.Thread(
@@ -294,6 +296,11 @@ class _StartedBridge:
         else:
             os.environ["QUARK_CONFIG_DIR"] = self.previous_config
         shutil.rmtree(self.directory, ignore_errors=True)
+
+
+class _StatusProcess:
+    def poll(self):
+        return None
 
 
 class ScriptSyntaxTests(unittest.TestCase):
@@ -569,7 +576,8 @@ class LibraryEntryDesignTests(unittest.TestCase):
         )
         self.assertIn('bool first = page == "1"', body)
         self.assertRegex(body, r"if \(!PathToken\.empty\(\) && first\)")
-        self.assertIn("QuarkIsFavorite(PathToken)", body)
+        self.assertIn('root["favorite"]', body)
+        self.assertNotIn("QuarkIsFavorite(PathToken)", body)
         # 收藏状态取自本地收藏列表，而不是远端目录数据。
         status = self.body("bool QuarkIsFavorite(string fid)")
         self.assertIn('QuarkRequest("/v1/favorites", "")', status)
@@ -689,9 +697,12 @@ class SeriesEntryDesignTests(unittest.TestCase):
         listing = self.body(
             "array<dictionary> QuarkDirectoryList(string PathToken, string page, bool favorite_action)"
         )
-        self.assertIn("QuarkAppendSeriesRows(ret, PathToken)", listing)
-        rows = self.body("void QuarkAppendSeriesRows(array<dictionary> &ret, string parent)")
-        self.assertIn('"/v1/series?parent=" + HostUrlEncode(parent)', rows)
+        self.assertIn("QuarkAppendSeriesRows(ret, parent, series)", listing)
+        self.assertIn("&include_series=1", listing)
+        self.assertIn('if (!PathToken.empty() && page == "1") request += "&include_series=1"', listing)
+        rows = self.body("void QuarkAppendSeriesRows(array<dictionary> &ret, string parent, JsonValue &root)")
+        self.assertNotIn("QuarkRequest", rows)
+        self.assertLess(rows.index("total.asInt() == 0"), rows.index("QUARK_ACTION_HIGHLIGHTS"))
         self.assertIn("QUARK_PLAY_PREFIX + fid.asString()", rows)
         self.assertIn("QUARK_ACTION_SERIES + parent", rows)
         # “继续观看”必须是媒体行（唯一带 url 的行）；管理行是可导航动作行。
@@ -699,8 +710,25 @@ class SeriesEntryDesignTests(unittest.TestCase):
         self.assertIn('manage["folder"] = "1"', rows)
         self.assertNotIn('manage["url"]', rows)
 
+    def test_highlights_root_and_video_entries_use_real_playback_links(self):
+        categories = self.body("array<dictionary> GetCategorys()")
+        self.assertIn('highlights["Category"] = "highlights"', categories)
+        self.assertIn("精彩标记", categories)
+        rows = self.body("array<dictionary> QuarkHighlightsList(string parent)")
+        self.assertIn('"/v1/bookmarks"', rows)
+        self.assertIn('row["url"] = QUARK_MARK_PREFIX + id.asString()', rows)
+        self.assertIn('item["note"]', rows)
+        items = self.body("void QuarkAppendItems(array<dictionary> &ret, JsonValue &items)")
+        self.assertIn('QuarkIsVideo(name.asString())', items)
+        self.assertIn('mark["PathToken"] = QUARK_ACTION_BOOKMARKS + fid.asString()', items)
+        parse = read_script(PLAY_PARSE)
+        self.assertIn('"https://quark.invalid/mark/"', parse)
+        self.assertIn('bookmark_id', body_raw(parse, "string PlayitemParse(const string &in path, dictionary &MetaData, array<dictionary> &QualityList)"))
+        check = body_raw(parse, "bool PlaylistCheck(const string &in path)")
+        self.assertNotIn("QUARK_MARK_PREFIX", check)
+
     def test_all_watched_directory_shows_a_navigation_row_not_a_restart(self):
-        rows = self.body("void QuarkAppendSeriesRows(array<dictionary> &ret, string parent)")
+        rows = self.body("void QuarkAppendSeriesRows(array<dictionary> &ret, string parent, JsonValue &root)")
         self.assertIn("本目录已全部看完", rows)
         self.assertNotIn('done["url"]', rows)
         self.assertIn('done["PathToken"] = QUARK_ACTION_SERIES + parent', rows)
@@ -813,7 +841,7 @@ class WatchCenterDesignTests(unittest.TestCase):
         self.assertIn("已到最后一集 · 返回", page)
         self.assertIn('hint["folder"] = "parent"', page)
         self.assertNotIn("QUARK_PLAY_PREFIX + episodes[0]", page)
-        # 自然顺序的剧集：每集可播放，并附一个操作文件夹行（书签、删除）。
+        # 自然顺序的剧集：每集可播放，并附一个操作文件夹行（精彩标记、删除）。
         self.assertIn('root["episodes"]', page)
         self.assertIn("QuarkAppendVideoActions(ret, fid.asString(), title)", page)
 
@@ -838,7 +866,7 @@ class VideoActionsDesignTests(unittest.TestCase):
         self.assertIn('row["folder"] = "1"', row)
         self.assertIn("QUARK_ACTION_VIDEO + fid", row)
         self.assertIn("QuarkValidFid(fid)", row)
-        self.assertIn("（书签、记录）", row)
+        self.assertIn("（精彩标记、记录）", row)
         self.assertNotIn('row["url"]', row)
 
     def test_actions_page_offers_play_bookmarks_and_delete(self):
@@ -847,7 +875,7 @@ class VideoActionsDesignTests(unittest.TestCase):
         self.assertIn('up["title"] = ".."', page)
         self.assertIn('up["folder"] = "parent"', page)
         self.assertIn('play["url"] = QUARK_PLAY_PREFIX + fid', page)
-        self.assertIn("播放书签", page)
+        self.assertIn("精彩标记", page)
         self.assertIn("QUARK_ACTION_BOOKMARKS + fid", page)
         self.assertIn("删除本条观看记录", page)
         self.assertIn("QUARK_ACTION_REMOVE_ASK + fid", page)
@@ -867,7 +895,7 @@ class VideoActionsDesignTests(unittest.TestCase):
         self.assertIsNotNone(re.search(r'"/v1/bookmarks/open"\s*,\s*"\{', body))
         self.assertIn("QuarkValidFid(fid)", body)
         self.assertRegex(body, r'"\{\\"fid\\":\\""\s*\+\s*fid\s*\+\s*"\\"\}"')
-        self.assertIn("已打开播放书签窗口", body)
+        self.assertIn("已打开精彩标记窗口", body)
 
     def test_delete_needs_an_explicit_confirmation_then_is_idempotent(self):
         ask = self.raw("array<dictionary> QuarkRecentRemoveAskPage(string fid)")
@@ -955,7 +983,7 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
     def test_versions_report_the_current_release(self):
         # 本任务只把 UrlList 升到 0.8.0；PlayParse/SubtitleSearch 的版本由各自的
         # 任务维护，这里只要求仍是语义化版本串。
-        self.assertIn('return "0.8.0";', self.raw_body(self.url_raw, "string GetVersion()"))
+        self.assertIn('return "0.9.0";', self.raw_body(self.url_raw, "string GetVersion()"))
         self.assertRegex(
             self.raw_body(self.play_raw, "string GetVersion()"), r'return "\d+\.\d+\.\d+";'
         )

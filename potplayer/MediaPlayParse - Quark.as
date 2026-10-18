@@ -22,6 +22,7 @@
 // array<dictionary> PlaylistParse(const string &in)			-> parse playlist
 
 string QUARK_VIDEO_PREFIX = "https://quark.invalid/video/";
+string QUARK_MARK_PREFIX = "https://quark.invalid/mark/";
 string QUARK_PLAY_PREFIX = "https://quark.invalid/play/";
 string QUARK_FOLDER_PREFIX = "https://quark.invalid/folder/";
 
@@ -36,7 +37,7 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "0.8.0";
+	return "0.9.0";
 }
 
 string GetDesc()
@@ -431,15 +432,16 @@ string QuarkExtension(string name)
 
 bool PlayitemCheck(const string &in path)
 {
-	return path.find(QUARK_VIDEO_PREFIX) == 0 || path.find(QUARK_PLAY_PREFIX) == 0;
+	return path.find(QUARK_VIDEO_PREFIX) == 0 || path.find(QUARK_PLAY_PREFIX) == 0 || path.find(QUARK_MARK_PREFIX) == 0;
 }
 
 string PlayitemParse(const string &in path, dictionary &MetaData, array<dictionary> &QualityList)
 {
 	string fid = QuarkFid(path, QUARK_PLAY_PREFIX);
+	string bookmark_id = QuarkFid(path, QUARK_MARK_PREFIX);
 
 	if (fid.empty()) fid = QuarkFid(path, QUARK_VIDEO_PREFIX);
-	if (fid.empty()) return "";
+	if (fid.empty() && bookmark_id.empty()) return "";
 
 	if (!QuarkEnsureLogin())
 	{
@@ -453,6 +455,15 @@ string PlayitemParse(const string &in path, dictionary &MetaData, array<dictiona
 	int player_pid = QuarkPlayerPid();
 
 	if (player_pid > 0) body = "{\"fid\":\"" + fid + "\",\"player_pid\":" + formatInt(player_pid) + "}";
+	if (!bookmark_id.empty())
+	{
+		if (player_pid <= 0)
+		{
+			if (@MetaData !is null) MetaData["errorMessage"] = "无法读取当前播放器，不能跳转精彩标记";
+			return "";
+		}
+		body = "{\"bookmark_id\":\"" + bookmark_id + "\",\"player_pid\":" + formatInt(player_pid) + "}";
+	}
 
 	string response = QuarkRequest("/v1/play", body);
 	string message;

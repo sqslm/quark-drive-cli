@@ -33,7 +33,7 @@ ROOT = HERE.parents[1]
 COMPONENT_NAME = "QuarkPotPlayer"
 LAUNCHER_NAME = "quark-potplayer"
 SETUP_NAME = "QuarkPotPlayer-Setup"
-DEFAULT_VERSION = "0.8.0"
+DEFAULT_VERSION = "0.9.0"
 
 
 class BuildError(RuntimeError):
@@ -48,7 +48,13 @@ def run(command: list[str], *, cwd: Path | None = None) -> None:
 
 
 def pyinstaller(python: str, arguments: list[str]) -> None:
-    run([python, "-m", "PyInstaller", *arguments])
+    # Optional notebook/plotting integrations in the build host's Pillow stack
+    # are not reachable in this Tk/HTTP app and can drag in entire Qt runtimes.
+    excluded = [arg for name in (
+        "IPython", "numpy", "matplotlib", "PyQt5", "PyQt6", "PySide2", "PySide6",
+        "rich", "pygments", "zmq",
+    ) for arg in ("--exclude-module", name)]
+    run([python, "-m", "PyInstaller", *excluded, *arguments])
 
 
 def sha256(path: Path) -> str:

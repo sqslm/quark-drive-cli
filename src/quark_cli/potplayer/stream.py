@@ -89,6 +89,7 @@ class PlaySession:
     #: FID's history, so a later range GET on the *same* session cannot record it
     #: again. A brand-new session (a new explicit ``/v1/play``) starts ``False``.
     history_removed: bool = False
+    bookmark_id: str | None = None
 
 
 @dataclass(frozen=True)

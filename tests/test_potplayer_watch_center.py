@@ -14,10 +14,11 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
-from quark_cli.potplayer.service import BOOKMARK_FALLBACK_NAME, WATCH_UNNAMED, Service
+from quark_cli.potplayer.service import BOOKMARK_FALLBACK_NAME, WATCH_UNNAMED, Service, _spawn_bookmark_player
 from quark_cli.state import write_json
 
 from potplayer_fixture import COOKIE, VIDEO_BYTES, DriveFixture, record
@@ -116,6 +117,89 @@ class _Case(unittest.TestCase):
 
 
 # -- watch-center grouping ----------------------------------------------
+
+
+class HighlightsCase(_Case):
+    def test_launcher_uses_the_installed_player_and_a_marker_url_without_a_shell(self):
+        player_dir = self.directory / "player"
+        player_dir.mkdir()
+        executable = player_dir / "PotPlayerMini64.exe"
+        executable.write_bytes(b"test")
+        import json
+        manifest = self.directory / "QuarkPotPlayer" / "install.json"
+        manifest.parent.mkdir()
+        manifest.write_text(json.dumps({"potplayer_dir": str(player_dir)}), "utf-8")
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.directory)}), patch("quark_cli.potplayer.service.subprocess.Popen") as launch:
+            _spawn_bookmark_player("b1")
+        launch.assert_called_once_with([str(executable), "https://quark.invalid/mark/b1"], close_fds=True)
+    def test_directory_first_page_combines_series_with_one_upstream_read(self):
+        self.api("GET", "/v1/files?parent=root-dir")
+        self.api("GET", "/v1/series?parent=root-dir")
+        self.assertEqual(len(self.fixture.requests), 2)
+        self.fixture.requests.clear()
+        response = self.api("GET", "/v1/files?parent=root-dir&include_series=1")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["series"]["total"], 3)
+        self.assertEqual(payload["series"]["continue"]["fid"], "v2")
+        self.assertFalse(payload["favorite"])
+        reads = [r for r in self.fixture.requests if r.url.path.endswith("/file/sort")]
+        self.assertEqual(len(reads), 1)
+
+    def test_combined_page_counts_videos_beyond_the_visible_page(self):
+        self.fixture.records = [record("folder", "剧集", directory=True)] + [
+            record(f"episode-{index}", f"第{index}集.mp4", "folder") for index in range(205)
+        ]
+        payload = self.api("GET", "/v1/files?parent=folder&size=50&include_series=1").json()
+        self.assertEqual(len(payload["items"]), 50)
+        self.assertTrue(payload["has_more"])
+        self.assertEqual(payload["series"]["total"], 205)
+        self.assertEqual(len(self.fixture.requests), 3)
+
+    def test_marker_play_resolves_saved_video_and_binds_the_requested_point(self):
+        entry = self.service.monitor.bookmarks.add("v2", "第2集.mp4", self.SIZE, 60_000, 1_800_000, "对白")
+        response = self.api("POST", "/v1/play", body={"bookmark_id": entry["id"], "player_pid": 123})
+        self.assertEqual(response.status_code, 200, response.text)
+        bound = self.service.monitor._bindings[123].session
+        self.assertEqual((bound.fid, bound.bookmark_id), ("v2", entry["id"]))
+        self.assertNotIn(entry["id"], response.text)
+
+    def test_marker_play_refuses_unknown_missing_pid_or_changed_size(self):
+        entry = self.service.monitor.bookmarks.add("v2", "第2集.mp4", self.SIZE + 1, 60_000, 1_800_000, "")
+        for body, status in (({"bookmark_id": "missing", "player_pid": 123}, 404),
+                             ({"bookmark_id": entry["id"]}, 400),
+                             ({"bookmark_id": entry["id"], "player_pid": 123}, 409)):
+            response = self.api("POST", "/v1/play", body=body)
+            self.assertEqual(response.status_code, status, response.text)
+        self.assertEqual(self.service.monitor.snapshot(), [])
+
+    def test_cold_play_launches_only_a_known_marker(self):
+        launched = []
+        self.service._player_launcher = launched.append
+        entry = self.service.monitor.bookmarks.add("v2", "第2集.mp4", self.SIZE, 60_000, 1_800_000, "")
+        response = self.api("POST", "/v1/bookmarks/play", body={"id": entry["id"]})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(launched, [entry["id"]])
+        self.assertEqual(self.fixture.requests, [])
+        self.assertEqual(self.api("POST", "/v1/bookmarks/play", body={"id": "missing"}).status_code, 404)
+        self.assertEqual(launched, [entry["id"]])
+
+    def test_empty_directory_has_no_video_actions(self):
+        payload = self.api("GET", "/v1/files?parent=empty-dir&include_series=1").json()
+        self.assertEqual(payload["series"]["total"], 0)
+        self.assertIsNone(payload["series"]["continue"])
+
+    def test_global_mark_list_and_open_are_local_and_keep_old_data(self):
+        store = self.service.monitor.bookmarks
+        first = store.add("v2", "第2集.mp4", self.SIZE, 60_000, 1_800_000, "精彩对白")
+        second = store.add("movie", "电影.mp4", self.SIZE, 90_000, 1_800_000, "结尾")
+        response = self.api("GET", "/v1/bookmarks")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row["id"] for row in response.json()["items"]], [second["id"], first["id"]])
+        opened = self.api("POST", "/v1/bookmarks/open", body={"scope": "all"})
+        self.assertEqual(opened.status_code, 202)
+        self.assertEqual(self.service.bookmark_request()["scope"], "all")
+        self.assertEqual(self.fixture.requests, [])
 
 
 class WatchCenterCase(_Case):

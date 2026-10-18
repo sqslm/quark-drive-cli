@@ -28,8 +28,8 @@ BOOKMARK_NAME = "bookmark.json"
 NOTE_LIMIT = 200
 _DOCUMENT_VERSION = 1
 _KEYS = frozenset({"id", "fid", "name", "size", "position_ms", "duration_ms", "note"})
-_CORRUPT = "播放书签库损坏，已停止；不会覆盖现有文件"
-_UNSUPPORTED = "播放书签库版本不受支持，已停止"
+_CORRUPT = "精彩标记库损坏，已停止；不会覆盖现有文件"
+_UNSUPPORTED = "精彩标记库版本不受支持，已停止"
 
 
 def bookmark_path() -> Path:
@@ -88,7 +88,7 @@ def _caller_fid(value: Any) -> str:
     try:
         return valid_fid(value)
     except RemoteError:
-        raise UsageError("书签的文件标识无效") from None
+        raise UsageError("精彩标记的文件标识无效") from None
 
 
 def _caller_text(value: Any, message: str) -> str:
@@ -105,9 +105,9 @@ def _caller_count(value: Any, message: str) -> int:
 
 def _caller_note(value: Any) -> str:
     if not isinstance(value, str):
-        raise UsageError("书签备注无效")
+        raise UsageError("精彩标记备注无效")
     if len(value) > NOTE_LIMIT:
-        raise UsageError(f"书签备注过长（最多 {NOTE_LIMIT} 字）")
+        raise UsageError(f"精彩标记备注过长（最多 {NOTE_LIMIT} 字）")
     return value
 
 
@@ -127,10 +127,10 @@ class BookmarkStore:
 
     # -- reads -----------------------------------------------------------
 
-    def list(self, fid: str) -> list[dict[str, Any]]:
-        """Every bookmark recorded for ``fid``, newest first (read-only copies)."""
+    def list(self, fid: str | None = None) -> list[dict[str, Any]]:
+        """One video's marks, or all marks when omitted; newest first, copied."""
         with self._lock:
-            return [dict(entry) for entry in self._document() if entry["fid"] == fid]
+            return [dict(entry) for entry in self._document() if fid is None or entry["fid"] == fid]
 
     # -- writes ----------------------------------------------------------
 
@@ -150,12 +150,12 @@ class BookmarkStore:
         :class:`UsageError`; a broken document raises :class:`LocalIOError`.
         """
         entry = {
-            "id": _caller_text(self._new_id(), "书签标识无效"),
+            "id": _caller_text(self._new_id(), "精彩标记标识无效"),
             "fid": _caller_fid(fid),
-            "name": _caller_text(name, "书签文件名无效"),
-            "size": _caller_count(size, "书签文件大小无效"),
-            "position_ms": _caller_count(position_ms, "书签位置无效"),
-            "duration_ms": _caller_count(duration_ms, "书签时长无效"),
+            "name": _caller_text(name, "精彩标记文件名无效"),
+            "size": _caller_count(size, "精彩标记文件大小无效"),
+            "position_ms": _caller_count(position_ms, "精彩标记位置无效"),
+            "duration_ms": _caller_count(duration_ms, "精彩标记时长无效"),
             "note": _caller_note(note),
         }
         with self._lock:
@@ -199,7 +199,7 @@ class BookmarkStore:
             except FileNotFoundError:
                 pass
             except OSError:
-                raise LocalIOError("无法清空播放书签，请检查本地状态目录") from None
+                raise LocalIOError("无法清空精彩标记，请检查本地状态目录") from None
 
     # -- document --------------------------------------------------------
 

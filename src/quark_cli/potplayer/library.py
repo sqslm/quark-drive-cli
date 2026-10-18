@@ -65,6 +65,14 @@ def page(files: Files, parent: str, page_number: int, size: int) -> dict[str, An
     return {"items": items, "page": page_number, "has_more": has_more}
 
 
+def directory_page(files: Files, parent: str, size: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Read the first page and its complete video list from one snapshot."""
+    snapshot = files.list_all(parent, 1, PLAYLIST_PAGE_SIZE)
+    items = [_record(item) for item in snapshot["data"]["list"]]
+    videos = sorted((item for item in items if not item["is_dir"] and is_video(item["name"])), key=order_key)
+    return {"items": items[:size], "page": 1, "has_more": len(items) > size}, videos
+
+
 def search(files: Files, query: str, page_number: int, size: int) -> dict[str, Any]:
     """Return one remote-wide name search page reduced to directories and videos.
 

@@ -695,6 +695,16 @@ class BookmarkClientTests(unittest.TestCase):
         self.assertEqual(client.bookmarks("F 1/2?x#y"), [])
         self.assertEqual(client.seen[0].url.params["fid"], "F 1/2?x#y")
 
+    def test_global_list_and_cold_play_keep_their_distinct_contracts(self):
+        client = self._client(lambda request: httpx.Response(200, json={"items": []}))
+        self.addCleanup(client.close)
+        self.assertEqual(client.bookmarks(""), [])
+        self.assertEqual(client.seen[-1].url.query, b"")
+        self.assertTrue(client.play_bookmark("b1"))
+        request = client.seen[-1]
+        self.assertEqual(request.url.path, "/v1/bookmarks/play")
+        self.assertEqual(json.loads(request.content), {"id": "b1"})
+
     def test_empty_list_is_a_valid_answer_while_failures_are_none(self):
         empty = self._client(lambda request: httpx.Response(200, json={"items": []}))
         self.assertEqual(empty.bookmarks("F1"), [])
@@ -815,6 +825,13 @@ class BookmarkWorkerTests(unittest.TestCase):
                 "/v1/bookmarks/jump",
             ],
         )
+
+    def test_cold_play_echoes_the_global_list_scope_for_the_result(self):
+        client, worker, events, _ = self._worker(lambda request: httpx.Response(202, json={"status": "opening"}))
+        self.addCleanup(client.close)
+        worker._serve(("bookmark_play", 0, "", "b1"))
+        self.assertEqual(events.get_nowait(), ("bookmark_jumped", (0, "", True)))
+        self.assertEqual(json.loads(client.seen[-1].content), {"id": "b1"})
 
     def test_failed_or_dead_requests_become_fixed_false_events(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -967,9 +984,9 @@ class BookmarkWindowTests(unittest.TestCase):
         self.assertEqual(window._bookmark_pending, (1, "F1"))
         window._handle("bookmarks", (1, "F1", [dict(BOOKMARK_ENTRY), "junk", {"note": "无 id"}]))
         self.assertIsNone(window._bookmark_pending)
-        self.assertEqual(window._bookmark_tree.rows, [("mark0", ("01:01:01", "第 3 分钟"))])
+        self.assertEqual(window._bookmark_tree.rows, [("mark0", ("A.mkv", "01:01:01", "第 3 分钟"))])
         self.assertEqual(window._bookmark_rows, {"mark0": "b1"})
-        self.assertIn("书签：1 条", window._bookmark_header_var.value)
+        self.assertIn("精彩标记：1 条", window._bookmark_header_var.value)
 
     def test_a_failed_list_is_one_fixed_message(self):
         window = _status_window()
@@ -1049,7 +1066,7 @@ class BookmarkWindowTests(unittest.TestCase):
         window._add_bookmark()
         self.assertEqual(window._requests.get_nowait(), ("bookmark_add", 1, "F1", "第 3 分钟"))
         self.assertEqual(window._bookmark_pending, (1, "F1"))
-        self.assertEqual(dialog.calls[0][0], "添加书签")
+        self.assertEqual(dialog.calls[0][0], "添加精彩标记")
 
     def test_a_cancelled_note_never_reaches_the_bridge(self):
         window = _status_window(dialog=_FakeDialog(answer=None))
@@ -1107,7 +1124,7 @@ class BookmarkWindowTests(unittest.TestCase):
         window._bookmark_pending = (1, "F1")
         blank = dict(BOOKMARK_ENTRY, id="b2", note="", position_ms=90_000)
         window._handle("bookmarks", (1, "F1", [blank]))
-        self.assertEqual(window._bookmark_tree.rows, [("mark0", ("00:01:30", "00:01:30"))])
+        self.assertEqual(window._bookmark_tree.rows, [("mark0", ("A.mkv", "00:01:30", "00:01:30"))])
 
     def test_a_dialog_error_and_an_inactive_player_never_ask_the_bridge(self):
         window = _status_window(dialog=_FakeDialog(error=RuntimeError("窗口已销毁")))
@@ -1481,9 +1498,8 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
         window._jump_bookmark()
         self.assertEqual(window._requests.get_nowait(), ("bookmark_jump", 1, "F1", "b1"))
 
-    def test_external_mismatch_or_multi_instance_disables_add_and_jump(self):
+    def test_external_loading_or_multi_instance_disables_add_and_jump(self):
         cases = (
-            [{"player_pid": 1, "fid": "F2", "name": "B.mkv", "state": "playing"}],
             [
                 {"player_pid": 1, "fid": "F1", "name": "A.mkv", "state": "playing"},
                 {"player_pid": 3, "fid": "F1", "name": "A.mkv", "state": "playing"},
@@ -1505,6 +1521,31 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
             window._add_bookmark()
             window._jump_bookmark()
             self.assertTrue(window._requests.empty())  # no pid 0 ever reaches the bridge
+
+    def test_external_mark_can_open_a_video_that_is_not_playing(self):
+        window = _status_window(rows=[], selected=None)
+        window._external = _external_request()
+        window._bookmark_pending = (0, "F1")
+        window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
+        window._bookmark_tree.selected = ("mark0",)
+        window._on_bookmark_select()
+        self.assertTrue(window._bookmark_jump_button.enabled)
+        window._jump_bookmark()
+        self.assertEqual(window._requests.get_nowait(), ("bookmark_play", 0, "F1", "b1"))
+
+    def test_global_manager_lists_multiple_videos_and_edits_notes_without_playback(self):
+        window = _status_window(rows=[], selected=None)
+        request = {"id": "all1", "scope": "all"}
+        window._consume_bookmark_request({"bookmark_request": request})
+        self.assertEqual(window._requests.get_nowait(), ("bookmarks", 0, ""))
+        entries = [dict(BOOKMARK_ENTRY, fid="F1", name="电影.mkv"),
+                   dict(BOOKMARK_ENTRY, id="b2", fid="F2", name="剧集.mp4")]
+        window._handle("bookmarks", (0, "", entries))
+        self.assertEqual([row[1][0] for row in window._bookmark_tree.rows], ["电影.mkv", "剧集.mp4"])
+        window._bookmark_tree.selected = ("mark1",)
+        window._simpledialog = _FakeDialog(answer="高光对白")
+        window._rename_bookmark()
+        self.assertEqual(window._requests.get_nowait(), ("bookmark_rename", 0, "", "b2", "高光对白"))
 
     def test_external_offline_rename_and_remove_use_the_sentinel(self):
         window = _status_window(rows=[], selected=None)
@@ -1533,7 +1574,7 @@ class ExternalBookmarkWindowTests(unittest.TestCase):
         self.assertEqual(window._bookmark_pending, (0, "F1"))
         window._handle("bookmarks", (0, "F1", [dict(BOOKMARK_ENTRY)]))
         self.assertIsNone(window._bookmark_pending)
-        self.assertIn("书签：1 条", window._bookmark_header_var.value)
+        self.assertIn("精彩标记：1 条", window._bookmark_header_var.value)
 
     def test_closing_drops_external_and_the_same_id_never_reopens(self):
         window = _status_window()

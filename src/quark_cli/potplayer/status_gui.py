@@ -1,4 +1,4 @@
-"""Standalone Tk status window for the PotPlayer bridge (release 0.8.0).
+"""Standalone Tk status window for the PotPlayer bridge (release 0.9.0).
 
 The service owns the bridge; this module only *observes* it. It loads the
 bridge's private runtime record (``plugin_state.read_runtime``), confirms that
@@ -20,10 +20,10 @@ A diagnostics snapshot may also carry one *external* bookmark request
 (``bookmark_request``: ``{id, fid, name}``) that ``POST /v1/bookmarks/open``
 recorded for this window. Each request id is consumed exactly once and binds the
 bookmark manager to that FID even while nothing is playing: the list, a rename
-and a remove are local file operations, so they work offline. Adding or jumping
-needs one unambiguous live player, which is resolved from the snapshot by FID
-alone -- never by a title guess -- and only when exactly one operable binding
-matches; otherwise the two buttons stay disabled with the fixed on-screen reason.
+and a remove are local file operations, so they work offline. A scope=all request
+opens the same manager for every stored video. Adding needs one unambiguous live
+player; jumping reuses that video's live binding or asks the bridge to open it
+with a marker URL so the monitor can seek after the media is ready.
 
 Nothing else is ever fetched, no host other than ``127.0.0.1`` is ever
 contacted, and no Cookie, token, URL or raw upstream text is shown or logged.
@@ -88,9 +88,9 @@ TRANSFER_ROWS = 5
 
 # The bookmark manager is a separate top-level window: the status window is
 # already full, and bookmark work must never hide the diagnostics tables.
-BOOKMARK_WIDTH = 560
+BOOKMARK_WIDTH = 820
 BOOKMARK_HEIGHT = 360
-BOOKMARK_MIN_WIDTH = 420
+BOOKMARK_MIN_WIDTH = 640
 BOOKMARK_MIN_HEIGHT = 260
 BOOKMARK_NOTICE_WRAP = 500
 
@@ -169,22 +169,22 @@ _EXPORT_FAILED_WRITE = "导出失败：无法写入所选文件，请检查路�
 
 # Fixed bookmark messages: every failure is one of these, never a transport
 # error, a URL, a token or any other upstream text.
-_BOOKMARK_LOADING = "正在读取书签……"
-_BOOKMARK_WORKING = "正在处理书签操作……"
-_BOOKMARK_LOAD_FAILED = "读取书签失败，请稍后重试"
-_BOOKMARK_ADD_FAILED = "添加书签失败，请稍后重试"
-_BOOKMARK_RENAME_FAILED = "重命名书签失败，请稍后重试"
-_BOOKMARK_REMOVE_FAILED = "删除书签失败，请稍后重试"
+_BOOKMARK_LOADING = "正在读取精彩标记……"
+_BOOKMARK_WORKING = "正在处理精彩标记操作……"
+_BOOKMARK_LOAD_FAILED = "读取精彩标记失败，请稍后重试"
+_BOOKMARK_ADD_FAILED = "添加精彩标记失败，请稍后重试"
+_BOOKMARK_RENAME_FAILED = "编辑精彩标记备注失败，请稍后重试"
+_BOOKMARK_REMOVE_FAILED = "删除精彩标记失败，请稍后重试"
 _BOOKMARK_JUMP_FAILED = "跳转失败，请稍后重试"
-_BOOKMARK_ADDED = "已添加书签"
-_BOOKMARK_RENAMED = "已重命名书签"
-_BOOKMARK_REMOVED = "已删除书签"
+_BOOKMARK_ADDED = "已添加精彩标记"
+_BOOKMARK_RENAMED = "已编辑精彩标记备注"
+_BOOKMARK_REMOVED = "已删除精彩标记"
 _BOOKMARK_JUMPED = "已请求跳转"
 _BOOKMARK_NOTE_TOO_LONG = "备注过长，请控制在 200 个字符以内"
 _BOOKMARK_STALE = "当前选择已变更，请重新操作"
 # Shown while the manager is bound to an external FID with no single live
 # binding to add a bookmark from or jump to; the list/rename/remove stay usable.
-_BOOKMARK_EXTERNAL_REASON = "先播放同一视频后才能添加或跳转书签"
+_BOOKMARK_EXTERNAL_REASON = "添加需正在播放；选择标记后可自动打开视频并跳转"
 
 
 # -- formatting ---------------------------------------------------------
@@ -390,7 +390,8 @@ class BridgeClient:
         The fid is always the binding's own identifier, never a title guess, and
         an empty list is a valid answer (the video simply has no bookmark yet).
         """
-        payload = self._get_object(f"{BOOKMARKS_PATH}?fid={quote(fid, safe='')}")
+        path = f"{BOOKMARKS_PATH}?fid={quote(fid, safe='')}" if fid else BOOKMARKS_PATH
+        payload = self._get_object(path)
         items = payload.get("items") if payload is not None else None
         if not isinstance(items, list):
             return None
@@ -412,6 +413,9 @@ class BridgeClient:
         return self._post_accepted(
             BOOKMARKS_JUMP_PATH, {"player_pid": player_pid, "fid": fid, "id": bookmark_id}
         )
+
+    def play_bookmark(self, bookmark_id: Any) -> bool:
+        return self._post_accepted("/v1/bookmarks/play", {"id": bookmark_id})
 
     def _post_accepted(self, path: str, body: dict[str, Any]) -> bool:
         """One JSON POST: any 2xx means the local bridge accepted the request.
@@ -519,6 +523,10 @@ class BridgeWorker:
             _, player_pid, fid, bookmark_id = request
             ok = self._client.jump_bookmark(player_pid, fid, bookmark_id)
             self._events.put(("bookmark_jumped", (player_pid, fid, ok)))
+        elif kind == "bookmark_play":
+            _, player_pid, fid, bookmark_id = request
+            ok = self._client.play_bookmark(bookmark_id)
+            self._events.put(("bookmark_jumped", (player_pid, fid, ok)))
 
     def _export(self, path: str) -> None:
         report = self._client.report()
@@ -602,10 +610,8 @@ def bookmark_id_of(entry: Any) -> Any:
 def bookmark_request_of(snapshot: Any) -> dict[str, Any] | None:
     """The validated external bookmark request in a snapshot, or ``None``.
 
-    Only ``{id, fid, name}`` is read: the id and the FID must be non-empty
-    strings, and a missing/blank name falls back to the FID (never a title from
-    anywhere else). A malformed request is ignored entirely so a tampered
-    snapshot cannot steer the window at an unvalidated identifier.
+    A single-video request has a non-empty id/FID; scope=all selects the global
+    list with an empty FID. Missing names fall back to the FID for a single video.
     """
     if not isinstance(snapshot, dict):
         return None
@@ -616,6 +622,8 @@ def bookmark_request_of(snapshot: Any) -> dict[str, Any] | None:
     fid = request.get("fid")
     if not isinstance(request_id, str) or not request_id:
         return None
+    if request.get("scope") == "all":
+        return {"id": request_id, "fid": "", "name": "全部视频", "scope": "all"}
     if not isinstance(fid, str) or not fid:
         return None
     name = request.get("name")
@@ -962,7 +970,7 @@ class StatusWindow:
         )
         self._export_button.pack(side="right")
         self._bookmark_button = ttk.Button(
-            actions, text="播放书签", width=12, command=self._open_bookmarks
+            actions, text="精彩标记", width=12, command=self._open_bookmarks
         )
         self._bookmark_button.pack(side="right", padx=(0, 6))
 
@@ -1308,6 +1316,14 @@ class StatusWindow:
         """The one live binding for the external FID, else ``None``."""
         if self._external is None or not self._connected:
             return None
+        if self._external.get("scope") == "all":
+            selected = selection_target(self._playback, self._selected)
+            if selected is not None:
+                return external_action_target(self._playback, selected[1])
+            live = [row for row in self._playback if row.get("state") in _OPERABLE_STATES]
+            if len(live) != 1:
+                return None
+            return external_action_target(self._playback, live[0].get("fid"))
         return external_action_target(self._playback, self._external["fid"])
 
     def _list_target(self) -> tuple[int, str] | None:
@@ -1349,6 +1365,21 @@ class StatusWindow:
             return None
         selection = tree.selection()
         return self._bookmark_rows.get(selection[0]) if selection else None
+
+    def _selected_bookmark_entry(self) -> dict[str, Any] | None:
+        selected = self._selected_bookmark()
+        return next((entry for entry in self._bookmarks if bookmark_id_of(entry) == selected), None)
+
+    def _can_open_bookmark(self) -> bool:
+        """Only open a fresh play when this FID has no loading/active player."""
+        entry = self._selected_bookmark_entry()
+        if self._external is None or entry is None or not self._connected or self._bookmark_pending is not None:
+            return False
+        fid = entry.get("fid", self._external["fid"])
+        return bool(fid) and not any(
+            row.get("fid") == fid and row.get("state") in (_OPERABLE_STATES | {"waiting", "suspended"})
+            for row in self._playback
+        )
 
     def _bookmark_notice(self, text: str) -> None:
         if self._bookmark_notice_var is not None:
@@ -1393,7 +1424,7 @@ class StatusWindow:
         self._simpledialog = simpledialog
         window = self._tk.Toplevel(root)
         self._bookmark_window = window
-        window.title("播放书签")
+        window.title("精彩标记")
         window.geometry(f"{BOOKMARK_WIDTH}x{BOOKMARK_HEIGHT}")
         window.minsize(BOOKMARK_MIN_WIDTH, BOOKMARK_MIN_HEIGHT)
         window.transient(root)
@@ -1414,9 +1445,9 @@ class StatusWindow:
         table.columnconfigure(0, weight=1)
         table.rowconfigure(0, weight=1)
         self._bookmark_tree = ttk.Treeview(
-            table, columns=("time", "note"), show="headings", selectmode="browse"
+            table, columns=("video", "time", "note"), show="headings", selectmode="browse"
         )
-        for column, title, width in (("time", "时间", 110), ("note", "备注", 360)):
+        for column, title, width in (("video", "视频", 220), ("time", "时间", 100), ("note", "备注", 280)):
             self._bookmark_tree.heading(column, text=title)
             self._bookmark_tree.column(column, width=width, anchor="w", stretch=(column == "note"))
         self._bookmark_tree.grid(row=0, column=0, sticky="nsew")
@@ -1430,13 +1461,13 @@ class StatusWindow:
         actions = ttk.Frame(outer)
         actions.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self._bookmark_add_button = ttk.Button(
-            actions, text="添加书签", width=10, command=self._add_bookmark
+            actions, text="添加精彩标记", width=10, command=self._add_bookmark
         )
         self._bookmark_jump_button = ttk.Button(
             actions, text="跳转", width=8, command=self._jump_bookmark
         )
         self._bookmark_rename_button = ttk.Button(
-            actions, text="重命名", width=10, command=self._rename_bookmark
+            actions, text="编辑备注", width=10, command=self._rename_bookmark
         )
         self._bookmark_remove_button = ttk.Button(
             actions, text="删除", width=8, command=self._remove_bookmark
@@ -1540,7 +1571,7 @@ class StatusWindow:
 
     def _load_notice(self) -> str:
         """The list-load result, with the fixed reason when add/jump are offline."""
-        loaded = f"已读取 {len(self._bookmarks)} 条书签"
+        loaded = f"已读取 {len(self._bookmarks)} 条精彩标记"
         if self._external is not None and self._external_action_target() is None:
             return f"{loaded}　{_BOOKMARK_EXTERNAL_REASON}"
         return loaded
@@ -1584,7 +1615,7 @@ class StatusWindow:
                 iid=iid,
                 # An empty note is valid; the bookmark's own time point stands in
                 # as its default name.
-                values=(position, note if isinstance(note, str) and note else position),
+                values=(entry.get("name") or self._binding_name(), position, note if isinstance(note, str) and note else position),
             )
             self._bookmark_rows[iid] = bookmark_id
         self._refresh_bookmark_header()
@@ -1593,7 +1624,8 @@ class StatusWindow:
     def _refresh_bookmark_header(self) -> None:
         if self._bookmark_header_var is None:
             return
-        header = f"当前视频：{self._binding_name()}　书签：{len(self._bookmarks)} 条"
+        prefix = "全部视频" if self._external is not None and self._external.get("scope") == "all" else f"当前视频：{self._binding_name()}"
+        header = f"{prefix}　精彩标记：{len(self._bookmarks)} 条"
         if self._external is not None and self._external_action_target() is None:
             # The list/rename/remove work offline; add/jump cannot, so say so
             # right where the operator looks for the video.
@@ -1617,8 +1649,13 @@ class StatusWindow:
         # that list has arrived -- or after it was dropped -- nothing can be
         # selected, so jump stays disabled exactly like rename and remove.
         chosen = self._selected_bookmark() is not None
+        jumpable = acting
+        if self._external is not None:
+            entry = self._selected_bookmark_entry()
+            fid = entry.get("fid", self._external["fid"]) if entry else ""
+            jumpable = not busy and (external_action_target(self._playback, fid) is not None or self._can_open_bookmark())
         _toggle(self._bookmark_add_button, acting)
-        _toggle(self._bookmark_jump_button, acting and chosen)
+        _toggle(self._bookmark_jump_button, listing and chosen and jumpable)
         _toggle(self._bookmark_rename_button, listing and chosen)
         _toggle(self._bookmark_remove_button, listing and chosen)
         _toggle(self._bookmark_refresh_button, listing)
@@ -1646,7 +1683,7 @@ class StatusWindow:
         target = self._action_target()
         if target is None:
             return
-        note = self._ask_note("添加书签", "请输入书签备注（可留空，最多 200 字）：")
+        note = self._ask_note("添加精彩标记", "请输入精彩标记备注（可留空，最多 200 字）：")
         if note is None:
             return
         if len(note) > MAX_NOTE_CHARS:
@@ -1667,7 +1704,7 @@ class StatusWindow:
         bookmark_id = self._selected_bookmark()
         if target is None or bookmark_id is None:
             return
-        note = self._ask_note("重命名书签", "请输入新的备注（可留空，最多 200 字）：", self._note_of(bookmark_id))
+        note = self._ask_note("编辑精彩标记备注", "请输入新的备注（可留空，最多 200 字）：", self._note_of(bookmark_id))
         if note is None:
             return
         if len(note) > MAX_NOTE_CHARS:
@@ -1696,9 +1733,26 @@ class StatusWindow:
 
     def _jump_bookmark(self) -> None:
         """Ask the player to seek to the selected bookmark."""
-        target = self._action_target()
+        list_target = self._list_target()
+        if list_target is None:
+            return
         bookmark_id = self._selected_bookmark()
-        if target is None or bookmark_id is None:
+        target = self._action_target()
+        entry = next((row for row in self._bookmarks if bookmark_id_of(row) == bookmark_id), None)
+        if entry is None or bookmark_id is None:
+            return
+        if self._external is not None:
+            target = external_action_target(self._playback, entry.get("fid", self._external["fid"]))
+            if target is None:
+                if not self._can_open_bookmark():
+                    return
+                target = list_target
+                self._bookmark_pending = target
+                self._bookmark_notice(_BOOKMARK_WORKING)
+                self._update_bookmark_actions()
+                self._requests.put(("bookmark_play", target[0], target[1], bookmark_id))
+                return
+        if target is None:
             return
         self._bookmark_pending = target
         self._bookmark_notice(_BOOKMARK_WORKING)

@@ -1574,7 +1574,6 @@ class BookmarksLocalCase(_ServerCase):
             ("POST", "/v1/bookmarks/jump", {"player_pid": 1, "fid": "v2"}),
             ("POST", "/v1/bookmarks/jump", {"player_pid": 1, "id": seeded["id"]}),
             ("POST", "/v1/bookmarks/jump", {"fid": "v2", "id": seeded["id"]}),
-            ("GET", "/v1/bookmarks", None),
             ("GET", "/v1/bookmarks?fid=", None),
             ("GET", "/v1/bookmarks?fid=0", None),
         )

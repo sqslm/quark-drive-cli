@@ -210,7 +210,7 @@ def _ms(value: Any) -> int:
     return 0
 
 
-def _identity_matches(value: Any, fid: str, stream_url: str | None) -> bool:
+def _identity_matches(value: Any, fid: str, stream_url: str | None, bookmark_id: str | None = None) -> bool:
     """True only for the exact logical URL of ``fid`` or the exact registered URL.
 
     The player reports the address the extension handed it: one of the logical
@@ -221,6 +221,8 @@ def _identity_matches(value: Any, fid: str, stream_url: str | None) -> bool:
     if not isinstance(value, str) or not value:
         return False
     if value == LOGICAL_PREFIXES[0] + fid or value == LOGICAL_PREFIXES[1] + fid:
+        return True
+    if bookmark_id is not None and value == "https://quark.invalid/mark/" + bookmark_id:
         return True
     return stream_url is not None and value == stream_url
 
@@ -623,7 +625,7 @@ class PlaybackMonitor:
                         flushes.append(record)
                     self._bindings.pop(player_pid, None)
                     continue
-                if not _identity_matches(getattr(sample, "file_name", None), binding.session.fid, binding.url):
+                if not _identity_matches(getattr(sample, "file_name", None), binding.session.fid, binding.url, binding.session.bookmark_id):
                     # A binding that never matched may simply still be
                     # transitioning to the expected file; only a previously
                     # matched video that really switched away is dropped.
@@ -740,7 +742,7 @@ class PlaybackMonitor:
             self._set(task.player_pid, task.generation, STATE_MISSING, MSG_MISSING)
             return False
         identity = getattr(sample, "file_name", None)
-        if not _identity_matches(identity, fid, url):
+        if not _identity_matches(identity, fid, url, binding.session.bookmark_id):
             self._set(task.player_pid, task.generation, STATE_MISMATCH, MSG_MISMATCH)
             return False
         with self._lock:
@@ -792,7 +794,7 @@ class PlaybackMonitor:
         if sample is None or getattr(sample, "player_pid", None) != task.player_pid:
             self._set(task.player_pid, task.generation, STATE_MISSING, MSG_MISSING)
             return None
-        if not _identity_matches(getattr(sample, "file_name", None), fid, url):
+        if not _identity_matches(getattr(sample, "file_name", None), fid, url, binding.session.bookmark_id):
             self._set(task.player_pid, task.generation, STATE_MISMATCH, MSG_MISMATCH)
             return None
         with self._lock:
@@ -855,7 +857,7 @@ class PlaybackMonitor:
             self._set(task.player_pid, task.generation, STATE_MISSING, MSG_MISSING)
             return False
         identity = getattr(sample, "file_name", None)
-        if not _identity_matches(identity, fid, url):
+        if not _identity_matches(identity, fid, url, binding.session.bookmark_id):
             self._set(task.player_pid, task.generation, STATE_MISMATCH, MSG_MISMATCH)
             return False
         duration = _ms(getattr(sample, "duration_ms", 0))
@@ -892,7 +894,7 @@ class PlaybackMonitor:
         if not (
             verify is not None
             and getattr(verify, "player_pid", None) == task.player_pid
-            and _identity_matches(getattr(verify, "file_name", None), fid, url)
+            and _identity_matches(getattr(verify, "file_name", None), fid, url, binding.session.bookmark_id)
             and abs(_ms(getattr(verify, "position_ms", 0)) - target) <= VERIFY_TOLERANCE_MS
         ):
             self._set(task.player_pid, task.generation, None, MSG_SEEK_FAILED)
@@ -922,6 +924,16 @@ class PlaybackMonitor:
         self, adapter: NativeAdapter, player_pid: int, generation: int,
         fid: str, size: int, identity: Any, url: str | None, duration: int, position: int,
     ) -> None:
+        with self._lock:
+            binding = self._bindings.get(player_pid)
+            if binding is None or binding.generation != generation:
+                return
+            bookmark_id = binding.session.bookmark_id
+        if bookmark_id is not None:
+            task = _JumpBookmark(player_pid, generation, fid, bookmark_id)
+            if not self._apply_jump_bookmark(adapter, task):
+                self._finish_restore(player_pid, generation, None, "精彩标记与当前视频不匹配或跳转失败")
+            return
         try:
             target = self._library.progress(fid, size)
         except LocalIOError:

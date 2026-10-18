@@ -169,6 +169,38 @@ class BookmarkCase(unittest.TestCase):
 
     # -- store: list / add / rename / remove / clear ---------------------
 
+    def test_opened_marker_waits_for_playback_then_seeks_even_near_the_start(self):
+        player = SeekingPlayer()
+        monitor = self.monitor(player=player)
+        self.addCleanup(monitor.close)
+        entry = self.store.add("v1", "a.mp4", 100, 1_000, 1_800_000, "开场")
+        media = session()
+        media.bookmark_id = entry["id"]
+        monitor.bind(media, 100)
+        identity = "https://quark.invalid/mark/" + entry["id"]
+        player.feed(100, sample(100, identity, 0, 0))
+        monitor.stream_started(media.session)
+        monitor._poll_once()
+        self.assertEqual(player.seeks, [])
+        player.feed(100, sample(100, identity, 0, 1_800_000))
+        monitor._poll_once()
+        self.assertEqual(player.seeks, [(100, identity, 1_000)])
+        monitor._poll_once()
+        self.assertEqual(len(player.seeks), 1)
+
+    def test_opened_marker_rejects_changed_duration_without_falling_back_to_resume(self):
+        monitor = self.monitor()
+        self.addCleanup(monitor.close)
+        entry = self.store.add("v1", "a.mp4", 100, 60_000, 1_800_000, "")
+        media = session()
+        media.bookmark_id = entry["id"]
+        monitor.bind(media, 100)
+        monitor.stream_started(media.session)
+        self.player.feed(100, sample(100, position_ms=1_000, duration_ms=900_000))
+        monitor._poll_once()
+        self.assertEqual(self.player.seeks, [])
+        self.assertIn("精彩标记", monitor.snapshot()[0]["message"])
+
     def test_store_add_list_rename_remove_clear(self):
         first = self.store.add("v1", "a.mp4", 100, 30_000, 1_800_000, "开场")
         second = self.store.add("v1", "a.mp4", 100, 90_000, 1_800_000, "高潮")
