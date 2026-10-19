@@ -40,7 +40,7 @@ from ..errors import (
     UsageError,
 )
 from ..files import Files
-from ..paths import is_directory
+from ..paths import is_directory, valid_fid
 from ..request_guard import RequestGuard
 from . import SERVICE_VERSION
 from .bookmark_state import NOTE_LIMIT, BookmarkStore, bookmark_groups
@@ -234,19 +234,23 @@ def _episode_view(entry: Mapping[str, Any], watched: bool, dir_name: str = "") -
     }
 
 
-def _favorite_items(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _favorite_items(snapshot: Mapping[str, Any], names: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
     """Favorites in stored order, each with its last known episode from recent."""
     marks = _mark_keys(snapshot)
     items = []
     for entry in snapshot["favorites"]:
         last = next((row for row in snapshot["recent"] if row["parent"] == entry["fid"]), None)
-        items.append({
+        item = {
             "fid": entry["fid"],
             "name": entry["name"],
             "is_dir": True,
             "size": 0,
-            "last_episode": None if last is None else _episode_view(last, _watched(last, marks)),
-        })
+            "last_episode": None if last is None else _episode_view(last, _watched(last, marks), (names or {}).get(entry['fid'], '')),
+        }
+        label = (names or {}).get(entry['fid'], entry['name'])
+        if label != entry['name']:
+            item['display'] = label
+        items.append(item)
     return items
 
 
@@ -340,7 +344,7 @@ def _watch_center_items(snapshot: Mapping[str, Any], names: Mapping[str, str]) -
             "display": _watch_display(
                 title, watched, latest["position_ms"], latest["duration_ms"]
             ),
-            "latest": _episode_view(latest, watched),
+            "latest": _episode_view(latest, watched, name if bucket['kind'] == 'series' else ''),
             "unfinished_count": sum(
                 1 for row in rows
                 if not _watched(row, marks) and unfinished(row["position_ms"], row["duration_ms"])
@@ -394,7 +398,7 @@ def _series_next(
     )
 
 
-def _series_payload(snapshot: Mapping[str, Any], parent: str, videos: list[dict[str, Any]]) -> dict[str, Any]:
+def _series_payload(snapshot: Mapping[str, Any], parent: str, videos: list[dict[str, Any]], label: str = '') -> dict[str, Any]:
     """Continue target, last-watched pair, and per-episode status for one listing.
 
     The trusted listing is the only source of a video's name, size, and parent:
@@ -423,7 +427,7 @@ def _series_payload(snapshot: Mapping[str, Any], parent: str, videos: list[dict[
             "duration_ms": duration,
         }
         watched = _watched(entry, marks)
-        view = _episode_view(entry, watched)
+        view = _episode_view(entry, watched, label)
         view["progress_at"] = record["progress_at"] if record is not None else 0
         view["unfinished"] = not watched and unfinished(position, duration)
         episodes.append(view)
@@ -756,6 +760,35 @@ class Service:
         if not parent or parent == ROOT_FID:
             return ""
         return self.directory_names().get(parent, "")
+
+    def content_labels(self, snapshot, kind):
+        """One content/version label per real parent; hydrate only missing ancestors."""
+        names = self.directory_names()
+        parents = dict.fromkeys([row['fid'] for row in snapshot['favorites']] if kind == 'favorites'
+                                else [row['parent'] for row in snapshot['recent'] if row['parent']])
+        notice = ''
+        for parent in parents:
+            if parent == ROOT_FID:
+                continue
+            if self.authenticated():
+                try:
+                    self.directories.chain(parent, self.files().info)
+                except (RemoteError, AuthenticationError):
+                    notice = '部分影片名称尚未补全，请检查网盘连接后刷新；已保留本机记录。'
+            context = self.directories.context(parent)
+            if context['series_name'] != '未命名剧集':
+                names[parent] = context['video_prefix']
+        return names, notice
+
+    def library_view(self, kind):
+        snapshot = self.library.snapshot()
+        labels, notice = self.content_labels(snapshot, kind)
+        builders = {'recent': _recent_items, 'continue': _continue_items,
+                    'watch-center': _watch_center_items, 'favorites': _favorite_items}
+        payload = {'items': builders[kind](snapshot, labels)}
+        if notice:
+            payload['metadata_notice'] = notice
+        return payload
 
     def require_login(self) -> None:
         """Reject a control call whose data belongs to a signed-in plugin."""
@@ -1350,6 +1383,9 @@ class _Handler(BaseHTTPRequestHandler):
                 chain = service.directories.chain(parent, service.files().info)
                 payload['up'] = chain[-1]['parent'] if chain else '0'
                 payload['path'] = chain
+                if include_series and number == 1:
+                    label = service.directories.context(parent)["video_prefix"] if parent != ROOT_FID else ""
+                    payload["series"] = _series_payload(snapshot, parent, videos, label)
             except (RateLimitError, AccessRestrictedError):
                 raise
             except RemoteError:
@@ -1469,7 +1505,7 @@ class _Handler(BaseHTTPRequestHandler):
         if route == "/v1/favorites":
             if method in ("GET", "HEAD"):
                 service.require_login()
-                return self._json(200, {"items": _favorite_items(service.library.snapshot())})
+                return self._json(200, service.library_view("favorites"))
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET 或 POST"))
             service.require_login()
@@ -1481,31 +1517,32 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(name, str) or not name:
                 raise RemoteError("目录详情缺少有效名称")
             service.library.add_favorite(fid, name)
-            return self._json(200, {"items": _favorite_items(service.library.snapshot())})
+            if info.get('pdir_fid') is not None:
+                service.directories.note(valid_fid(info['pdir_fid']), [{'fid': fid, 'name': name, 'is_dir': True}])
+            return self._json(200, service.library_view("favorites"))
         if route == "/v1/favorites/remove":
             if method != "POST":
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 POST"))
             service.require_login()
             fid = require_fid(self._body(raw).get("fid"), label="fid")
             service.library.remove_favorite(fid)
-            return self._json(200, {"items": _favorite_items(service.library.snapshot())})
+            return self._json(200, service.library_view("favorites"))
         if route == "/v1/recent":
             if method not in ("GET", "HEAD"):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
             service.require_login()
-            return self._json(200, {"items": _recent_items(service.library.snapshot(), service.directory_names())})
+            return self._json(200, service.library_view("recent"))
         if route == "/v1/continue":
             if method not in ("GET", "HEAD"):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
             service.require_login()
-            return self._json(200, {"items": _continue_items(service.library.snapshot(), service.directory_names())})
+            return self._json(200, service.library_view("continue"))
         if route == "/v1/watch-center":
             if method not in ("GET", "HEAD"):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
             # Local-only: the watch center is built from the private document and
             # already-verified directory names; it needs no login and no request.
-            snapshot = service.library.snapshot()
-            return self._json(200, {"items": _watch_center_items(snapshot, service.directory_names())})
+            return self._json(200, service.library_view("watch-center"))
         if route == "/v1/series":
             if method not in ("GET", "HEAD"):
                 return self._json(405, _failure("method_not_allowed", "该接口只接受 GET"))
@@ -1513,7 +1550,9 @@ class _Handler(BaseHTTPRequestHandler):
             parent = require_fid(_first(query, "parent", None), label="parent", allow_root=True)
             resolved, videos = playlist(service.files(), parent, None)
             service.note_directory(resolved, videos)
-            return self._json(200, _series_payload(service.library.snapshot(), resolved, videos))
+            service.directories.chain(resolved, service.files().info)
+            label = service.directories.context(resolved)["video_prefix"] if resolved != ROOT_FID else ""
+            return self._json(200, _series_payload(service.library.snapshot(), resolved, videos, label))
         if route == '/v1/series-settings/open':
             if method != 'POST':
                 return self._json(405, _failure('method_not_allowed', '该接口只接受 POST'))

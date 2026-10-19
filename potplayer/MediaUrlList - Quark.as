@@ -73,7 +73,7 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "0.12.4";
+	return "0.12.5";
 }
 
 string GetDesc()
@@ -513,7 +513,11 @@ void QuarkAppendItems(array<dictionary> &ret, JsonValue &items)
 				JsonValue last_name = last["name"];
 
 				if (last_name.isString() && !last_name.asString().empty())
-					row["title"] = name.asString() + " · 上次观看：" + last_name.asString();
+					{
+					string title;
+					row.get("title", title);
+					row["title"] = title + " · 上次观看：" + last_name.asString();
+				}
 			}
 			row["url"] = QUARK_FOLDER_PREFIX + fid.asString();
 			row["folder"] = "1";
@@ -613,6 +617,31 @@ array<dictionary> QuarkActionResult(string message)
 	return ret;
 }
 
+// A successful external window must leave its originating list visible.
+array<dictionary> QuarkWindowResult(string message)
+{
+	array<dictionary> ret = QuarkActionResult(message);
+	ret[0]["QuarkRestore"] = "1";
+	return ret;
+}
+
+array<dictionary> QuarkRestoreOrigin(string Category, string Extra, string origin, string Query, string page)
+{
+	if (!origin.empty() && origin.find("quark-") != 0 && QuarkValidFid(origin)) return QuarkDirectoryList(origin, page, true);
+	return QuarkAccountUrlList(Category, Extra, origin, Query, page);
+}
+
+void QuarkAppendMetadataNotice(array<dictionary> &ret, JsonValue &root)
+{
+	JsonValue notice = root["metadata_notice"];
+	if (!notice.isString() || notice.asString().empty()) return;
+	dictionary row;
+	row["title"] = notice.asString();
+	row["folder"] = "1";
+	row["PathToken"] = "quark-refresh-view";
+	ret.insertLast(row);
+}
+
 // 单集观看状态动作记号：目标状态(1=已看/0=未看)、目录 fid、视频 fid 用“|”分隔。
 // 三段都不含“|”（QuarkValidFid 拒绝），记号带目标状态，刷新重放同一动作即幂等。
 string QuarkWatchToken(bool watched, string parent, string fid)
@@ -636,7 +665,7 @@ void QuarkAppendVideoActions(array<dictionary> &ret, string fid, string title)
 	ret.insertLast(row);
 }
 
-// 追剧中心根页：只读本地 /v1/watch-center。剧集按真实父目录分组，点进去才远程
+// 追剧中心根页：按本机记录的真实父目录分组，补缺失祖先但不扫描目录；进入后才
 // 读取一次该目录的 /v1/series；根目录或未归类视频作为单集直接给播放与操作行。
 array<dictionary> QuarkWatchCenterList()
 {
@@ -651,6 +680,7 @@ array<dictionary> QuarkWatchCenterList()
 
 	if (!reader.parse(response, root) || !root.isObject()) return QuarkStatus("本地网盘组件返回了无法解析的追剧中心");
 
+	QuarkAppendMetadataNotice(ret, root);
 	JsonValue items = root["items"];
 
 	if (!items.isArray() || items.size() == 0) return QuarkStatus("暂无可继续观看的视频：播放一段时间后会出现在这里");
@@ -1199,7 +1229,7 @@ array<dictionary> QuarkBookmarksOpenPage(string fid)
 	string message;
 
 	if (QuarkFailed(response, message)) return QuarkActionResult(message);
-	return QuarkActionResult("已打开精彩标记窗口");
+	return QuarkWindowResult("已打开精彩标记窗口");
 }
 
 // 删除确认页：只返回导航行，不执行任何请求。确认行进入幂等删除动作页；
@@ -1290,6 +1320,7 @@ array<dictionary> QuarkFavoritesList(string PathToken, string page)
 
 	if (!reader.parse(response, root) || !root.isObject()) return QuarkStatus("本地网盘组件返回了无法解析的收藏列表");
 
+	QuarkAppendMetadataNotice(ret, root);
 	JsonValue items = root["items"];
 
 	if (!items.isArray() || items.size() == 0) return QuarkStatus("收藏列表为空：进入目录后选“收藏当前目录”即可添加");
@@ -1344,6 +1375,7 @@ array<dictionary> QuarkRecentList()
 
 	if (!reader.parse(response, root) || !root.isObject()) return QuarkStatus("本地网盘组件返回了无法解析的最近记录");
 
+	QuarkAppendMetadataNotice(ret, root);
 	JsonValue items = root["items"];
 
 	if (!items.isArray() || items.size() == 0) return QuarkStatus("最近没有播放记录：打开一个视频后会出现在这里");
@@ -1377,6 +1409,7 @@ array<dictionary> QuarkRecentManagePage()
 	JsonReader reader;
 	JsonValue root;
 	if (!reader.parse(response, root) || !root.isObject()) return QuarkActionResult("观看记录读取失败");
+	QuarkAppendMetadataNotice(ret, root);
 	JsonValue items = root["items"];
 	if (!items.isArray()) return ret;
 	for (int index = 0; index < items.size(); index++)
@@ -1461,7 +1494,7 @@ array<dictionary> QuarkHighlightsOpenPage(string parent, bool capture)
 	string response = QuarkRequest("/v1/bookmarks/open", body);
 	string message;
 	if (QuarkFailed(response, message)) return QuarkActionResult(message);
-	return QuarkActionResult(capture ? "请在精彩标记窗口填写备注" : "已打开当前目录精彩标记窗口");
+	return QuarkWindowResult(capture ? "请在精彩标记窗口填写备注" : "已打开当前目录精彩标记窗口");
 }
 
 const string QUARK_ROOT_CATEGORY = "";
@@ -1551,7 +1584,7 @@ array<dictionary> QuarkAccountUrlList(string Category, string Extra, string Path
 		string response = QuarkRequest("/v1/series-settings/open", "{\"parent\":\"" + parent + "\"}");
 		string message;
 		if (QuarkFailed(response, message)) return QuarkActionResult(message);
-		return QuarkActionResult("已打开片头片尾设置窗口");
+		return QuarkWindowResult("已打开片头片尾设置窗口");
 	}
 
 	if (PathToken == "quark-highlights-manage-all")
@@ -1559,7 +1592,7 @@ array<dictionary> QuarkAccountUrlList(string Category, string Extra, string Path
 		string response = QuarkRequest("/v1/bookmarks/open", "{\"scope\":\"all\"}");
 		string message;
 		if (QuarkFailed(response, message)) return QuarkActionResult(message);
-		return QuarkActionResult("已打开全部精彩标记管理窗口");
+		return QuarkWindowResult("已打开全部精彩标记管理窗口");
 	}
 	if (Category == "highlights" && PathToken.empty()) return QuarkHighlightsList("");
 	if (PathToken.find(QUARK_HIGHLIGHTS_GROUP) == 0)
@@ -1569,7 +1602,7 @@ array<dictionary> QuarkAccountUrlList(string Category, string Extra, string Path
 	if (PathToken.find(QUARK_ACTION_HIGHLIGHTS) == 0)
 		return QuarkHighlightsOpenPage(PathToken.substr(QUARK_ACTION_HIGHLIGHTS.length()), false);
 
-	// 追剧中心根页只读本地 /v1/watch-center：登出或冷却时也能看到分组列表。
+	// 追剧中心以本地记录为基础：登出或冷却时仍能看到分组列表。
 	if (Category == "continue" && PathToken.empty()) return QuarkWatchCenterList();
 
 	// 单集操作、精彩标记窗口与删除记录都是本地动作：同样在登录检查之前处理，
@@ -1608,6 +1641,7 @@ array<dictionary> QuarkAccountUrlList(string Category, string Extra, string Path
 	if (PathToken.find(QUARK_ACTION_WATCH) == 0)
 		return QuarkWatchActionPage(PathToken.substr(QUARK_ACTION_WATCH.length()));
 
+	if (!PathToken.empty() && QuarkValidFid(PathToken)) return QuarkDirectoryList(PathToken, page, true);
 	if (Category == "search") return QuarkSearchList(Query, PathToken, page);
 	if (Category == "favorites") return QuarkFavoritesList(PathToken, page);
 	if (Category == "recent") return QuarkRecentList();
@@ -1654,15 +1688,79 @@ array<dictionary> GetUrlList(string Category, string Extra, string PathToken, st
     if (!QUARK_ACCOUNT_BOUND && !PathToken.empty())
         return QuarkStatus("旧目录已失效，请从根目录重新打开");
     if (!QUARK_ACCOUNT_BOUND) QuarkAuthenticated();
+    // Origin travels with the action, through every management submenu.
+    // It is inside the account envelope: another account cannot reuse it.
+    string origin = PathToken;
+    string originPage = PageToken.empty() ? "1" : PageToken;
+    string navigation = "quark-origin:";
+    if (PathToken.find(navigation) == 0)
+    {
+        int first = PathToken.find("|", navigation.length());
+        int second = PathToken.find("|", first + 1);
+        if (first < 0 || second < 0) return QuarkStatus("导航来源无效，请重新打开所在目录");
+        origin = HostUrlDecode(PathToken.substr(navigation.length(), first - navigation.length()));
+        originPage = HostUrlDecode(PathToken.substr(first + 1, second - first - 1));
+        PathToken = HostUrlDecode(PathToken.substr(second + 1));
+    }
+    else if (PathToken.find("quark-series-settings-") == 0)
+        origin = PathToken.substr(22);
+    else if (PathToken.find(QUARK_ACTION_HIGHLIGHTS) == 0)
+        origin = PathToken.substr(QUARK_ACTION_HIGHLIGHTS.length());
+    else if (PathToken.find(QUARK_HIGHLIGHTS_CAPTURE) == 0)
+        origin = PathToken.substr(QUARK_HIGHLIGHTS_CAPTURE.length());
+    else if (PathToken.find(QUARK_ACTION_SERIES) == 0)
+        origin = PathToken.substr(QUARK_ACTION_SERIES.length());
+    else if (PathToken.find("quark-") == 0)
+        origin = "";
+    if (PageToken.find("quark-page:") == 0)
+    {
+        int split = PageToken.find("|", 11);
+        if (split < 0) return QuarkStatus("分页来源无效，请重新打开所在目录");
+        PathToken = HostUrlDecode(PageToken.substr(11, split - 11));
+        PageToken = PageToken.substr(split + 1);
+        origin = PathToken;
+        originPage = PageToken;
+    }
+    if (PathToken.find(QUARK_CENTER_SERIES) == 0)
+        origin = PathToken.substr(QUARK_CENTER_SERIES.length());
+    if (PathToken.find(QUARK_HIGHLIGHTS_GROUP) == 0)
+        origin = PathToken;
+    if (PathToken == "quark-back" || PathToken == "quark-home")
+    {
+        PathToken = origin;
+        PageToken = originPage;
+    }
+    if (PathToken == "quark-refresh-view")
+    {
+        PathToken = origin;
+        PageToken = originPage;
+    }
     array<dictionary> ret = QuarkAccountUrlList(Category, Extra, PathToken, Query, PageToken);
+    string restore;
+    if (ret.size() > 0 && ret[0].get("QuarkRestore", restore))
+    {
+        ret = QuarkRestoreOrigin(Category, Extra, origin, Query, originPage);
+        PathToken = origin;
+        PageToken = originPage;
+    }
     if (QUARK_ACCOUNT_SCOPE.empty()) return ret;
     for (int index = 0; index < ret.size(); index++)
     {
         string value;
+        string folder;
+        if (Category != "diagnostics" && ret[index].get("folder", folder) && folder == "parent")
+        {
+            ret[index]["folder"] = "1";
+            ret[index]["PathToken"] = "quark-back";
+        }
         if (ret[index].get("PathToken", value))
+        {
+            if (value.find("quark-") == 0)
+                value = navigation + HostUrlEncode(origin) + "|" + HostUrlEncode(originPage) + "|" + HostUrlEncode(value);
             ret[index]["PathToken"] = tag + QUARK_ACCOUNT_SCOPE + "|" + value;
+        }
         if (ret[index].get("PageToken", value))
-            ret[index]["PageToken"] = tag + QUARK_ACCOUNT_SCOPE + "|" + value;
+            ret[index]["PageToken"] = tag + QUARK_ACCOUNT_SCOPE + "|quark-page:" + HostUrlEncode(PathToken) + "|" + value;
         if (ret[index].get("url", value) && value.find("https://quark.invalid/") == 0)
             ret[index]["url"] = value + "?account=" + QUARK_ACCOUNT_SCOPE;
     }

@@ -1057,6 +1057,7 @@ class SeriesCase(_ServerCase):
             self.recent_row("v10", "第10集.mp4", position_ms=1_790_000, duration_ms=1_800_000, progress_at=10),
             self.recent_row("zero", "未播.mp4", position_ms=0, duration_ms=0, progress_at=5),
         ])
+        self.service.directories.chain("root-dir", self.service.files().info)
         before = len(self.fixture.requests)
         payload = self.api("GET", "/v1/continue").json()
         self.assertEqual([item["fid"] for item in payload["items"]], ["v2"])
@@ -1089,7 +1090,7 @@ class SeriesCase(_ServerCase):
         )
         items = {item["fid"]: item for item in self.api("GET", "/v1/recent").json()["items"]}
         self.assertTrue(items["v2"]["watched"])
-        self.assertEqual(items["v2"]["display"], "第2集.mp4 · 已看")
+        self.assertEqual(items["v2"]["display"], "剧集 / 第2集.mp4 · 已看")
         self.assertFalse(items["v9"]["watched"])
         self.assertTrue(items["v10"]["watched"])
 
@@ -1126,8 +1127,9 @@ class SeriesCase(_ServerCase):
         self.assertFalse(payload["complete"])
         self.assertEqual(payload["continue"]["fid"], "v2")
         added = self.fixture.requests[before:]
-        self.assertEqual(len(added), 1)
+        self.assertEqual(len(added), 2)
         self.assertTrue(added[0].url.path.endswith("/file/sort"))
+        self.assertTrue(added[1].url.path.endswith("/file/info"))
 
     def test_series_continues_the_latest_unfinished_episode(self):
         self.save_document(recent=[
@@ -1249,6 +1251,7 @@ class SeriesCase(_ServerCase):
         self.save_document(recent=[
             self.recent_row("v2", "第2集.mp4", position_ms=60_000, duration_ms=1_800_000, progress_at=1)
         ])
+        self.service.directories.chain("root-dir", self.service.files().info)
         before = len(self.fixture.requests)
         self.api("GET", "/v1/continue")
         self.api("GET", "/v1/recent")
@@ -1273,7 +1276,7 @@ class SeriesCase(_ServerCase):
         self.assertEqual(stored["recent"][0]["parent"], "root-dir")
         self.assertEqual(stored["recent"][0]["parent_name"], "剧集")
 
-    def test_stored_directory_name_is_used_without_any_request(self):
+    def test_stored_name_is_preserved_when_missing_ancestors_cannot_be_fetched(self):
         write_json(self.service.library.path, {
             "version": 4,
             "favorites": [],
@@ -1287,7 +1290,8 @@ class SeriesCase(_ServerCase):
         before = len(self.fixture.requests)
         item = self.api("GET", "/v1/continue").json()["items"][0]
         self.assertEqual(item["display"], "剧集 / 01.mkv · 已看 27%")
-        self.assertEqual(len(self.fixture.requests), before)
+        self.assertEqual(len(self.fixture.requests), before + 1)
+        self.assertTrue(self.fixture.requests[-1].url.path.endswith("/file/info"))
 
     def test_a_renamed_directory_shows_the_fresh_name_without_a_new_request(self):
         # The row still carries the old directory name, but browsing the
@@ -1310,9 +1314,9 @@ class SeriesCase(_ServerCase):
         self.assertEqual(item["display"], "剧集 / 01.mkv · 已看 27%")
         self.assertEqual(len(self.fixture.requests), before)
 
-    def test_favorites_complete_an_older_record_without_a_probe(self):
+    def test_favorites_and_cached_ancestors_complete_an_older_record_without_a_scan(self):
         # A version-3 record has the parent FID but never the name; the favorite
-        # already carries the verified name, so no cloud request is needed.
+        # already carries the verified name, and missing ancestors are fetched once, without scanning videos.
         self.save_document(
             favorites=[{"fid": "root-dir", "name": "剧集", "added_at": 1}],
             recent=[self.recent_row("v2", "第2集.mp4", position_ms=60_000, duration_ms=1_800_000, progress_at=5)],
@@ -1322,7 +1326,10 @@ class SeriesCase(_ServerCase):
                          "剧集 / 第2集.mp4 · 已看 3%")
         self.assertEqual(self.api("GET", "/v1/recent").json()["items"][0]["display"],
                          "剧集 / 第2集.mp4 · 已看 3%")
-        self.assertEqual(len(self.fixture.requests), before)
+        self.assertEqual(len(self.fixture.requests), before + 1)
+        self.assertTrue(self.fixture.requests[-1].url.path.endswith("/file/info"))
+        self.api("GET", "/v1/continue")
+        self.assertEqual(len(self.fixture.requests), before + 1)
 
     def test_a_browsed_directory_completes_an_older_record_without_a_probe(self):
         self.api("GET", "/v1/files?parent=0")
@@ -1345,16 +1352,15 @@ class SeriesCase(_ServerCase):
         self.assertEqual(items["v2"]["display"], "第2集.mp4 · 已看 3%")
         self.assertEqual(items["v9"]["display"], "电影.mkv · 已看 3%")
 
-    def test_series_episode_rows_stay_unprefixed(self):
-        # A series listing is already grouped by its directory, so its episode
-        # rows keep the plain name even when the directory name is known.
+    def test_series_episode_rows_include_the_content_title(self):
+        # All video surfaces carry the content title, including the series page.
         self.api("GET", "/v1/files?parent=0")
         self.save_document(recent=[
             self.recent_row("v2", "第2集.mp4", position_ms=60_000, duration_ms=1_800_000, progress_at=5)
         ])
         episodes = {episode["fid"]: episode for episode in
                     self.api("GET", "/v1/series?parent=root-dir").json()["episodes"]}
-        self.assertEqual(episodes["v2"]["display"], "第2集.mp4 · 已看 3%")
+        self.assertEqual(episodes["v2"]["display"], "剧集 / 第2集.mp4 · 已看 3%")
 
 
 class PersistenceCase(_ServerCase):

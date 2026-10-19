@@ -75,7 +75,13 @@ class Directories:
     def context(self, parent: str):
         chain = self.chain(parent)
         category = next((row['name'] for row in reversed(chain) if row['name'] in _CATEGORIES), '未分类')
-        chosen = next((index for index in reversed(range(len(chain)))
+        category_index = next((index for index in reversed(range(len(chain)))
+                               if chain[index]['name'] in _CATEGORIES), None)
+        # Under a classified library the first content folder owns the title.
+        # Every descendant is a version/season, including names not in a codec list.
+        candidates = (range(category_index + 1, len(chain)) if category_index is not None
+                      else reversed(range(len(chain))))
+        chosen = next((index for index in candidates
                        if chain[index]['name'] not in _CONTAINERS and not _VERSION.match(chain[index]['name'])), None)
         if chosen is None:
             title = '我的网盘' if parent == '0' else '未命名剧集'

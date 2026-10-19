@@ -173,27 +173,27 @@
 
 ### `GET /v1/continue`
 
-本机历史里**可续播且尚未看完**的视频，最近有进度者在前。过滤规则与播放器的续播判断一致：续播点至少 15 秒，且距结尾仍超过 `min(30 秒, 时长的 2%)`；手动标记为已看或已看完的视频不出现。返回与 `/v1/recent` 相同的行结构（不含 `played_at`）。纯本地读取，不向上游发请求。
+本机历史里**可续播且尚未看完**的视频，最近有进度者在前。过滤规则与播放器的续播判断一致：续播点至少 15 秒，且距结尾仍超过 `min(30 秒, 时长的 2%)`；手动标记为已看或已看完的视频不出现。返回与 `/v1/recent` 相同的行结构（不含 `played_at`）。已有祖先缓存时只读本机；旧记录缺少目录链时仅补查缺失祖先并缓存。
 
 该接口保持原有扁平结构不变（0.8.0 未改动）；追剧中心根页用的是下面的 `/v1/watch-center`。
 
 ### `GET /v1/watch-center`
 
-本机观看记录的分组视图，供扩展的“追剧中心”根页使用。**不需要**夸克登录，纯本地读取，不向上游发请求。返回：
+本机观看记录的分组视图，供扩展的“追剧中心”根页使用。**不需要**夸克登录，已有祖先缓存时只读本机；旧记录缺少目录链时仅补查缺失祖先并缓存。返回：
 
 ```json
 {"items":[{"kind":"series","key":"...","parent":"...","name":"剧集","display":"剧集 · 上次：第9集.mp4 · 已看5%",
   "latest":{"fid":"...","name":"第9集.mp4","is_dir":false,"size":123,"parent":"...","watched":false,
-    "position_ms":90000,"duration_ms":1800000,"display":"第9集.mp4 · 已看 5%"},
+    "position_ms":90000,"duration_ms":1800000,"display":"剧集 / 第9集.mp4 · 已看 5%"},
   "unfinished_count":2}]}
 ```
 
 - 按最近观看记录中**真实的非根父目录 FID** 分组：同一目录的视频合成一条 `kind` 为 `series` 的条目；同名但 FID 不同的目录**分开**成多条，不按名字合并。分组按各自最近一集的时间从新到旧排列。
 - 根目录（存储的 `parent` 为 `0`）或无法确认所属目录的视频各自单列一条 `kind` 为 `video` 的条目，用原文件名，不猜测剧名或类型。
-- `key` 为分组标识（剧集分组为目录 FID，单集为视频 FID）；`parent` 为该分组视频真实所在目录的 FID（根/无法确认时为空串）。`name`：单集为该文件自己的名字；剧集分组为**已验证**的目录名（组件已经拉取过的目录清单，或记录里存的目录名），都确认不了时用固定占位“来源目录未命名”——它从不使用窗口标题、不猜剧名，也不为此新增任何云端请求。
+- `key` 为分组标识（剧集分组为目录 FID，单集为视频 FID）；`parent` 为该分组视频真实所在目录的 FID（根/无法确认时为空串）。`name`：单集为该文件自己的名字；剧集分组为**已验证**的目录名（组件已经拉取过的目录清单，或记录里存的目录名），都确认不了时用固定占位“来源目录未命名”——它从不使用窗口标题、不猜剧名，缺失的祖先在有登录时按需补查，已知信息复用本机缓存。
 - `display` 是给列表用的标题：剧集分组为“目录名 · 上次：<最近一集名>”再加那一集自己的进度（“ · 已看”或“ · 已看<百分比>”，此处进度紧接百分号，如“ · 已看5%”）；单集为文件名加同样的进度。它只反映**那一条最近记录**的进度，不代表目录总集数或整季是否看完。
 - `latest` 为该分组最近观看过的一集视图（`fid`/`name`/`is_dir`/`size`/`parent`/`watched`/`position_ms`/`duration_ms`/`display`），按 `max(played_at, progress_at)` 取最新；`unfinished_count` 为该分组里仍可续播且未看完的视频数（判定与续播规则一致，并排除已标记已看）——已经全部看完的分组同样会列出，此时 `unfinished_count` 为 `0`。
-- 该接口只读本地 `library.json`，不做后台扫描，也不为此发起任何云端请求。
+- 该接口读取本地 `library.json` 和目录缓存，不做后台扫描；有登录时可补查缺失祖先的详情，成功后持久缓存。
 
 ### `GET /v1/series?parent=<目录 fid>`
 
@@ -202,7 +202,7 @@
 ```json
 {"parent":"...","total":3,"watched":1,"complete":false,
  "continue":{"fid":"...","name":"第10集.mp4","position_ms":90000,"duration_ms":1800000,"display":"第10集.mp4 · 已看 5%"},
- "latest":{"fid":"...","name":"第9集.mp4","position_ms":90000,"duration_ms":1800000,"display":"第9集.mp4 · 已看 5%"},
+ "latest":{"fid":"...","name":"第9集.mp4","position_ms":90000,"duration_ms":1800000,"display":"剧集 / 第9集.mp4 · 已看 5%"},
  "next":{"fid":"...","name":"第10集.mp4","position_ms":0,"duration_ms":0,"display":"第10集.mp4"},
  "episodes":[{"fid":"...","name":"第2集.mp4","size":123,"watched":false,
    "position_ms":0,"duration_ms":0,"display":"第2集.mp4"}]}
@@ -237,7 +237,7 @@
 ### 写入时机与数据边界
 
 - 最近记录在**首个非空媒体块成功转发之后**写入，不等整集传输结束：取链、`HEAD`、未转发任何媒体字节的失败 `GET` 不记录。已经开始传输后再关闭、拖动或遇到上游中断，已写入的记录仍保留；每个 HTTP 请求只记一次，不按分段或数据块重复写盘。
-- 收藏与最近观看存放在账号私有目录 `config_directory()/potplayer/accounts/<account_id>/library.json`（升级导入账号沿用原 `potplayer/library.json`）（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。文件版本 2 起，最近观看条目另含观看进度字段 `position_ms`、`duration_ms`、`progress_at`（本机时间）；版本 3 起另含真实 `parent` 目录 FID，并新增独立的 `marks` 列表保存显式“已看”标记（不受 100 条最近上限影响）；`marks` 按 FID **和大小** 记录，FID 被替换成不同大小的文件时不会继承旧的已看标记。版本 4 起，最近观看条目另存真实目录名 `parent_name`：它只取自桥接**已经拉取过**的目录清单或“收藏目录”，从不使用窗口标题、从不猜测剧名、也不为此新增任何云端请求；`/v1/recent` 与 `/v1/continue` 的 `display` 因此显示“目录名 / 原文件名”，无法确认所属目录（含根目录，`parent` 为 `0`）时保留原文件名。版本 1/2/3 记录可正常读取，读取时不改写文件，仅在下次正常写入时才就地升级为版本 4，既有收藏/最近观看不受影响。
+- 收藏与最近观看存放在账号私有目录 `config_directory()/potplayer/accounts/<account_id>/library.json`（升级导入账号沿用原 `potplayer/library.json`）（单进程内用一把普通线程锁保护读改写）；只含 FID、名称、大小与本机时间，**不含** Cookie、签名地址或视频数据。文件版本 2 起，最近观看条目另含观看进度字段 `position_ms`、`duration_ms`、`progress_at`（本机时间）；版本 3 起另含真实 `parent` 目录 FID，并新增独立的 `marks` 列表保存显式“已看”标记（不受 100 条最近上限影响）；`marks` 按 FID **和大小** 记录，FID 被替换成不同大小的文件时不会继承旧的已看标记。版本 4 起，最近观看条目另存真实目录名 `parent_name`：它只取自桥接**已经拉取过**的目录清单或“收藏目录”，从不使用窗口标题、从不猜测剧名、也不为此新增任何云端请求；`/v1/recent` 与 `/v1/continue` 的 `display` 使用独立祖先缓存显示“影片名/版本 / 原文件名”，缺失祖先在读取时按需补查并缓存，无法确认所属目录（含根目录，`parent` 为 `0`）时保留原文件名。版本 1/2/3 记录可正常读取，读取时不改写文件，仅在下次正常写入时才就地升级为版本 4，既有收藏/最近观看不受影响。
 - 切换、退出与登录过期均保留各账号的本机数据。退出仅移除所选账号凭证；切回或重新登录同一账号后读取其独立记录。
 - `/v1/watch-center`、`/v1/recent/remove`、本机 `/v1/bookmarks` 查看与编辑接口 与 `/v1/diagnostics*` 都只要求本地 Bearer，**不需要**夸克登录：`watch-center` 只读本地 `library.json`（不扫盘、不联网）；`recent/remove` 只删本地那一条观看记录，不动云端文件、收藏、`marks` 或精彩标记；`bookmarks/open` 只打开本机窗口。自动播放接口 `/v1/bookmarks/play` 需要登录；目录筛选使用本机标记，缺失的祖先信息可在登录时补全；失败不会隐藏本地标记。它们都不改变视频落盘策略：无分片、无磁盘缓存、无转码、无后台扫描，也不存在向云端回传记录或报告的步骤。
 
@@ -283,7 +283,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.12.4", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.12.5", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -445,3 +445,11 @@
 - `--series-settings-window --series-fid <FID> --account-id <账号标识>`：独立设置窗口，仅连接已运行本地服务；复用现有 Tk 工作线程和窗口图标/置前逻辑。
 
 监控只在原生播放器 PID、完整文件身份、实际时间和时长匹配后自动 seek。有效续播、显式精彩标记优先；同文件多实例冲突、暂停、无时长或片头与片尾覆盖整片时不自动跳过。片尾 seek 到结束前 1000ms，后续结束行为由 PotPlayer 控制，不更改全局播放器设置。
+
+
+## 来源导航与内容名称（0.12.5）
+
+- `.as` 的账号令牌内部增加 `quark-origin:<URL编码来源>|<URL编码页码>|<URL编码动作>`。设置、精彩标记等成功打开外部窗口后立即重绘来源列表；动作、取消、错误提示的返回行明确携带来源，不依赖原生 `folder=parent` 的栈推断。分页内部使用 `quark-page:<URL编码路径>|<页码>`，避免动作返回目录后翻页重复打开窗口。这些内容始终位于原账号信封内部，不改变账号校验。
+- `recent`、`continue`、`watch-center`、`favorites` 的标签使用同一份账号内目录祖先缓存；分类层之后的具体影片名称与所有版本子目录组合，不改原始 `name`、FID、大小和文件匹配。收藏可新增装饰字段 `display`；剧集详情的 `display` 同样包含影片与版本。追剧中心仍按实际视频父目录 FID 分组，避免把不同版本混成同一个播放目录。
+- 首次读取旧记录时允许只调用缺失的 `file/info` 祖先查询，后续复用持久缓存，不执行目录扫描。补全失败时保留本机条目，响应可新增非空 `metadata_notice`，列表给出可刷新提示；存储损坏仍返回本地读写错误，不覆盖原文件。
+- 设置窗口使用分钟/秒输入和滑块，接口及 `series-settings.json` 继续使用整数总秒数，旧规则无需迁移。关闭窗口不发送保存请求。
