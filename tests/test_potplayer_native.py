@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 import sys
 import unittest
+from unittest.mock import call, patch
 
 from quark_cli.potplayer import native_player
 from quark_cli.potplayer.native_player import (
@@ -287,6 +288,54 @@ class ReceiverCallbackLifetimeTests(unittest.TestCase):
             self.assertIs(api._wndproc, callback)
         finally:
             api.close()  # destroys this api's own hidden window and class
+
+    def test_every_receiver_allows_player_replies_across_integrity_levels(self):
+        api = native_player._WinApi()
+        try:
+            with patch.object(api._user32, 'ChangeWindowMessageFilterEx',
+                              wraps=api._user32.ChangeWindowMessageFilterEx) as allow:
+                first = api._receiver()
+                self.assertTrue(first)
+                api._stale = True
+                second = api._receiver()
+                self.assertTrue(second)
+                self.assertEqual(allow.call_args_list, [
+                    call(first, native_player.WM_COPYDATA, 1, None),
+                    call(second, native_player.WM_COPYDATA, 1, None),
+                ])
+        finally:
+            api.close()
+
+    def test_failed_message_filter_discards_receiver(self):
+        api = native_player._WinApi()
+        try:
+            with patch.object(api._user32, 'ChangeWindowMessageFilterEx', return_value=0), \
+                    patch.object(api._user32, 'DestroyWindow', wraps=api._user32.DestroyWindow) as destroy:
+                self.assertIsNone(api._receiver())
+                self.assertIsNone(api._hwnd)
+                destroy.assert_called_once()
+            self.assertTrue(api._receiver(), 'a later query can create a valid receiver')
+        finally:
+            api.close()
+
+    def test_unsolicited_or_wrong_sender_replies_are_ignored(self):
+        api = native_player._WinApi()
+        try:
+            receiver = api._receiver()
+            data = ctypes.create_string_buffer(URL_A.encode('utf-8'))
+            payload = native_player._CopyDataStruct(native_player.MSG_FILENAME, len(data), ctypes.addressof(data))
+            address = ctypes.addressof(payload)
+            api._on_copydata(receiver, native_player.WM_COPYDATA, 0, address)
+            self.assertIsNone(api._reply)
+            import time
+            api._pending = native_player._Pending(1, receiver, 12345, time.monotonic() + 1)
+            api._on_copydata(receiver, native_player.WM_COPYDATA, receiver + 1, address)
+            self.assertIsNone(api._reply)
+            api._pending.deadline = time.monotonic() - 1
+            api._on_copydata(receiver, native_player.WM_COPYDATA, 0, address)
+            self.assertIsNone(api._reply)
+        finally:
+            api.close()
 
 
 if __name__ == "__main__":

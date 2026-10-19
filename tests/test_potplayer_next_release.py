@@ -186,6 +186,39 @@ class PrefetchHttpCase(_ServerCase):
         return {'transport': self.fixture.transport(), 'cookie': COOKIE,
                 'native_factory': lambda: self.player, 'monitor_start': False}
 
+    def test_player_reset_while_buffer_is_full_releases_waiting_stream(self):
+        import socket
+        import struct
+        import threading
+        from unittest.mock import patch
+        size = 100 * 1024 ** 2
+        self.fixture.records.append(record('reset', 'video.mkv', 'root-dir', size=size))
+        self.fixture.virtual['reset'] = size
+        payload = self.api('POST', '/v1/play', body={'fid': 'reset'}).json()
+        finished = threading.Event()
+        process_request = self.server.process_request_thread
+
+        def processed(*args):
+            try:
+                process_request(*args)
+            finally:
+                finished.set()
+
+        with patch.object(self.server, 'process_request_thread', processed), patch.object(self.server, 'handle_error') as failed:
+            with socket.create_connection(('127.0.0.1', self.service.port), timeout=3) as peer:
+                peer.sendall(f"GET {payload['url']} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode('ascii'))
+                response = b''
+                while b'\r\n\r\n' not in response:
+                    response += peer.recv(65536)
+                received = len(response.split(b'\r\n\r\n', 1)[1])
+                while received < size // 5:
+                    chunk = peer.recv(65536)
+                    self.assertTrue(chunk)
+                    received += len(chunk)
+                peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+            self.assertTrue(finished.wait(3), 'the closed player must release its stream budget')
+            failed.assert_not_called()
+
     def test_full_speed_twenty_percent_pause_and_ten_percent_refill_over_http(self):
         import queue
         import threading

@@ -27,6 +27,7 @@ from pathlib import Path
 import httpx
 
 from quark_cli.potplayer import plugin_state
+from quark_cli.potplayer.accounts import Accounts
 from quark_cli.potplayer.service import Service
 from quark_cli.request_guard import REASON_RATE_LIMITED, RequestGuard
 
@@ -104,7 +105,7 @@ class RequestProtectionIntegrationTests(unittest.TestCase):
         return credential
 
     def test_api_429_pauses_locally_and_keeps_the_plugin_cookie(self):
-        credential = self._save_plugin_cookie()
+        self._save_plugin_cookie()
         fixture = _ThrottledApi()
         self._start(transport=fixture.transport(), guard=RequestGuard.memory())
 
@@ -113,8 +114,9 @@ class RequestProtectionIntegrationTests(unittest.TestCase):
         self.assertEqual(refused.json()["error"]["type"], "rate_limited")
         self.assertGreaterEqual(int(refused.headers["Retry-After"]), 60)
 
-        # 429 is not a credential failure: the saved Cookie and auth are kept.
-        self.assertTrue(credential.exists())
+        # Startup migrates the legacy Cookie into accounts.json; reopen that
+        # store to prove the credential stayed on disk after a 429.
+        self.assertEqual(Accounts().cookie(), COOKIE)
         self.assertTrue(self._api("GET", "/v1/auth").json()["authenticated"])
 
         # Local-only endpoints still work while the cooldown is active.
@@ -127,7 +129,7 @@ class RequestProtectionIntegrationTests(unittest.TestCase):
         again = self._api("GET", "/v1/files")
         self.assertEqual(again.status_code, 429)
         self.assertEqual(len(fixture.requests), sent)  # refused before any upstream call
-        self.assertTrue(credential.exists())
+        self.assertEqual(Accounts().cookie(), COOKIE)
         self.assertTrue(self._api("GET", "/v1/auth").json()["authenticated"])
 
     def test_login_under_active_cooldown_is_refused_without_a_window(self):
@@ -149,7 +151,7 @@ class RequestProtectionIntegrationTests(unittest.TestCase):
         self.assertEqual(self._api("GET", "/v1/auth").json()["login_state"], "idle")
 
     def test_video_origin_429_stops_streaming_without_a_refetch(self):
-        credential = self._save_plugin_cookie()
+        self._save_plugin_cookie()
         fixture = DriveFixture()
         self._start(transport=fixture.transport(), guard=RequestGuard.memory())
 
@@ -168,11 +170,11 @@ class RequestProtectionIntegrationTests(unittest.TestCase):
         self.assertEqual(again.status_code, 429)
         self.assertEqual(self._upstream_split(fixture), (api_before, origins_before))
 
-        self.assertTrue(credential.exists())
+        self.assertEqual(Accounts().cookie(), COOKIE)
         self.assertTrue(self._api("GET", "/v1/auth").json()["authenticated"])
 
     def test_subtitle_origin_429_stops_reading_without_a_refetch(self):
-        credential = self._save_plugin_cookie()
+        self._save_plugin_cookie()
         fixture = DriveFixture()
         fixture.records.append(record("sdir", "字幕剧", directory=True))
         fixture.records.append(record("sv1", "剧.S01E01.mkv", "sdir"))
@@ -191,7 +193,7 @@ class RequestProtectionIntegrationTests(unittest.TestCase):
         self.assertEqual(again.status_code, 429)
         self.assertEqual(self._upstream_split(fixture), (api_before, origins_before))
 
-        self.assertTrue(credential.exists())
+        self.assertEqual(Accounts().cookie(), COOKIE)
         self.assertTrue(self._api("GET", "/v1/auth").json()["authenticated"])
 
 

@@ -10,7 +10,7 @@
 | `SHA256SUMS.txt` | 安装程序 SHA-256 |
 | `build-info.json` | 构建时间、组件版本、随包扩展脚本清单 |
 
-当前版本为 **0.12.9**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.12.9/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
+当前版本为 **0.12.10**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.12.10/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
 
 构建方式见文末“开发者构建”。
 
@@ -99,7 +99,8 @@ QuarkPotPlayer-Setup.exe --uninstall --silent [--clear-credentials]
 | 目录框提示无效 / 自动检测报错 | 手动填入的目录会被严格校验，无效时直接报错且不会回退；清空该栏或点“自动检测”改用自动查找 |
 | 扩展脚本覆盖失败 | 关闭 PotPlayer 后重试安装 |
 | 目录/播放异常 | 运行 `<PotPlayer>\Plugin\QuarkPotPlayer\app\QuarkPotPlayer.exe --stop` 结束后台服务，再重新打开播放器 |
-| 升级后一直“搜索中”或目录空白 | 退出 PotPlayer，安装 0.12.9 或更新版后重新打开；新版在读取时恢复旧版管理员启动留下的服务状态及共享请求配置的文件归属，保留账号和观看记录，无需清空数据或重新扫码 |
+| 升级后一直“搜索中”或目录空白 | 退出 PotPlayer，安装 0.12.10 或更新版后重新打开；新版在读取时恢复旧版管理员启动留下的服务状态及共享请求配置的文件归属，保留账号和观看记录，无需清空数据或重新扫码 |
+| 片头片尾设置已保存但不自动跳过，且无法记录播放进度 | 退出 PotPlayer 并升级到 0.12.10 或更新版；修复管理员权限服务无法接收普通权限播放器进度回复的问题，保留已有片头片尾设置。有效续播及指定精彩点仍优先，暂停时不自动跳转 |
 | 需要重新登录 | 在插件入口重新扫码；如需彻底重置，卸载时勾选清除插件凭证后重装 |
 | 卸载后有残留 | 文件被占用时先退出 PotPlayer，再从“插件管理 → 安装管理”查看实际插件目录并处理残留 |
 
@@ -110,10 +111,16 @@ QuarkPotPlayer-Setup.exe --uninstall --silent [--clear-credentials]
 ## 开发者构建
 
 ```
-python packaging/potplayer/build.py --tag 0.12.9          # 读取 potplayer/*.as 生成 dist/potplayer/0.12.9/
+python packaging/potplayer/build.py --tag 0.12.10          # 读取 potplayer/*.as 生成 dist/potplayer/0.12.10/
 python packaging/potplayer/build.py --as-dir DIR --out-dir DIR   # 指定扩展脚本目录与输出目录
 python packaging/potplayer/build.py --component-only       # 只构建并打包组件
 python packaging/potplayer/build.py --skip-component       # 复用既有组件产物
 ```
 
 脚本先用 PyInstaller 构建窗口化 onedir 组件 `QuarkPotPlayer.exe` 并压缩为 `component.zip`，再把 `component.zip`、`potplayer/` 下的 AngelScript 文件与 `build-info.json` 嵌入 PyInstaller onefile 窗口化安装程序。需要带有 PyInstaller 6 的解释器（`--python` 指定，默认当前解释器）。构建时从该解释器环境读取依赖包的 `dist-info` 许可证元数据与 Python、Tcl/Tk 许可证文本，写入组件的 `licenses\` 目录随包分发（只读本地文件，不联网）。
+
+### 开发者验证
+
+在项目根目录运行插件测试：`python -m unittest discover -s tests -p "test_potplayer*.py" -q`。全项目测试需让项目根目录、`src`、`tests` 同时位于 Python 模块路径，并从 `tests` 目录运行，避免根目录历史调试脚本与测试同名。测试覆盖账号隔离、导航、续播、标记、字幕、20%/10% 缓存、窗口及安装卸载契约。
+
+发布前另用独立测试视频验证真实 PotPlayer 的自动跳过、续播、精彩点和已看状态；原生消息的验收必须包含“普通播放器 + 管理员服务”，不能仅用同权限测试替身代替。安装包在独立目录验收安装、覆盖升级、窗口开关和卸载；卸载联动使用模拟播放器与卸载入口，不对用户真实 PotPlayer 执行卸载。

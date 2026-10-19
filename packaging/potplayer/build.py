@@ -33,7 +33,7 @@ ROOT = HERE.parents[1]
 COMPONENT_NAME = "QuarkPotPlayer"
 LAUNCHER_NAME = "quark-potplayer"
 SETUP_NAME = "QuarkPotPlayer-Setup"
-DEFAULT_VERSION = "0.12.9"
+DEFAULT_VERSION = "0.12.10"
 ICON = ROOT / 'potplayer' / 'MediaPlayParse - Quark.ico'
 
 

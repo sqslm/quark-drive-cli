@@ -77,6 +77,7 @@ MSG_STATUS = 0x5006
 MSG_FILENAME = 0x6020
 
 SMTO_ABORTIFHUNG = 0x0002
+MSGFLT_ALLOW = 1
 QUERY_TIMEOUT_MS = 500
 #: Small grace window beyond the send timeout in which a reply to *this* request
 #: is still accepted; older replies are dropped by token/deadline.
@@ -215,6 +216,8 @@ class _WinApi:
         u.DefWindowProcW.restype = _LRESULT
         u.DestroyWindow.argtypes = [_HWND]
         u.DestroyWindow.restype = _BOOL
+        u.ChangeWindowMessageFilterEx.argtypes = [_HWND, _UINT, _DWORD, ctypes.c_void_p]
+        u.ChangeWindowMessageFilterEx.restype = _BOOL
         u.PeekMessageW.argtypes = [ctypes.POINTER(_w.MSG), _HWND, _UINT, _UINT, _UINT]
         u.PeekMessageW.restype = _BOOL
         u.TranslateMessage.argtypes = [ctypes.POINTER(_w.MSG)]
@@ -282,6 +285,12 @@ class _WinApi:
         self._user32.RegisterClassExW(ctypes.byref(wc))  # 1410 = already registered, harmless
         self._hwnd = self._user32.CreateWindowExW(0, self._class_name, self._class_name, 0, 0, 0, 0, 0,
                                                   None, None, None, None)
+        # An elevated bridge must receive WM_COPYDATA from a normal player.
+        # Limit the UIPI exception to this private receiver and this one message;
+        # _on_copydata still checks the pending query, sender and bounded payload.
+        if self._hwnd and not self._user32.ChangeWindowMessageFilterEx(self._hwnd, WM_COPYDATA, MSGFLT_ALLOW, None):
+            self._user32.DestroyWindow(self._hwnd)
+            self._hwnd = None
         return self._hwnd
 
     def _pump(self) -> None:

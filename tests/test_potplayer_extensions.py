@@ -992,7 +992,7 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
     def test_versions_report_the_current_release(self):
         # 本任务只把 UrlList 升到 0.8.0；PlayParse/SubtitleSearch 的版本由各自的
         # 任务维护，这里只要求仍是语义化版本串。
-        self.assertIn('return "0.12.9";', self.raw_body(self.url_raw, "string GetVersion()"))
+        self.assertIn('return "0.12.10";', self.raw_body(self.url_raw, "string GetVersion()"))
         self.assertRegex(
             self.raw_body(self.play_raw, "string GetVersion()"), r'return "\d+\.\d+\.\d+";'
         )

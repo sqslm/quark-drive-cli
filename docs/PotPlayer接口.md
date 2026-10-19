@@ -283,7 +283,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.12.9", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.12.10", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -445,6 +445,8 @@
 - `--series-settings-window --series-fid <FID> --account-id <账号标识>`：独立设置窗口，仅连接已运行本地服务；复用现有 Tk 工作线程和窗口图标/置前逻辑。
 
 监控只在原生播放器 PID、完整文件身份、实际时间和时长匹配后自动 seek。有效续播、显式精彩标记优先；同文件多实例冲突、暂停、无时长或片头与片尾覆盖整片时不自动跳过。片尾 seek 到结束前 1000ms，后续结束行为由 PotPlayer 控制，不更改全局播放器设置。
+
+当服务由管理员权限安装程序启动、播放器以普通权限运行时，原生读取窗口通过 `ChangeWindowMessageFilterEx` 仅允许该隐藏窗口接收 `WM_COPYDATA`。每次重建接收窗口都重新设置，继续校验待处理查询、发送窗口、PID、消息类型、长度与超时，不放开进程级消息过滤。这避免 Windows UIPI 拦截文件身份回复，导致续播、自动跳过和精彩标记无法读取进度。[Windows API 说明](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-changewindowmessagefilterex)。
 
 
 ## 来源导航与内容名称（0.12.5）

@@ -1835,10 +1835,14 @@ class _Handler(BaseHTTPRequestHandler):
                 # A seek/close can leave a paused response waiting for a clock;
                 # detect its peer closing instead of retaining an idle worker.
                 ready, _, _ = select.select([self.connection], [], [], .2)
-                if ready and not self.connection.recv(1, socket.MSG_PEEK):
-                    self.close_connection = True
-                    return False
                 if ready:
+                    try:
+                        closed = not self.connection.recv(1, socket.MSG_PEEK)
+                    except ConnectionResetError:
+                        closed = True  # PotPlayer resets old requests on a seek/close.
+                    if closed:
+                        self.close_connection = True
+                        return False
                     time.sleep(.1)
         try:
             if end - start + 1 > MEDIA_SEGMENT:
