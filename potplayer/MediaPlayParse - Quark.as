@@ -40,7 +40,7 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "0.12.5";
+	return "0.12.6";
 }
 
 string GetDesc()
@@ -51,14 +51,31 @@ string GetDesc()
 // -- 本机播放器进程 ---------------------------------------------------------
 
 // 当前播放器（PotPlayer）的 PID；桥接用它把播放器与播放地址绑定以恢复进度。
-// 由随包启动器 quark-potplayer.exe 的新本地动作 --player-pid 提供：启动器从自身
+// 由随包组件的纯本地动作 --player-pid 提供：从自身
 // 父进程链定位“真正拥有 PotPlayer 窗口”的进程并输出唯一 JSON 行；该动作不启动
 // 桥接、不读取 Cookie、不访问网络。取不到、输出不可解析或非正整数时返回 0，
 // PlayitemParse 据此省略字段，绝不猜测或回退到其他播放器。
+// 优先使用安装器记录的 onedir 组件，避免每集解压 onefile 启动器。
 // 每次解析按需调用一次，不缓存（多实例可能共享 INI），也不在此处发起额外请求。
+string QuarkPidLauncher()
+{
+	string record = HostGetExtensionFolder() + "\\quark-potplayer.path";
+	uintptr file = HostFileOpen(record);
+	if (file != 0)
+	{
+		int64 length = HostFileLength(file);
+		string component;
+		if (length > 0 && length <= 32768) component = HostFileRead(file, int(length));
+		HostFileClose(file);
+		component.Trim();
+		if (!component.empty() && HostFileExist(component)) return component;
+	}
+	return QuarkLauncher();
+}
+
 int QuarkPlayerPid()
 {
-	string launcher = QuarkLauncher();
+	string launcher = QuarkPidLauncher();
 
 	if (launcher.empty()) return 0;
 

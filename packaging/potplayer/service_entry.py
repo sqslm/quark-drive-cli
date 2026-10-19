@@ -49,6 +49,12 @@ def normalize_argv(argv: Sequence[str]) -> list[str]:
 def main(argv: Sequence[str] | None = None) -> int:
     restore_stdout()
     args = normalize_argv(sys.argv if argv is None else argv)
+    # The installed onedir executable starts without onefile extraction. Keep
+    # this local action ahead of every bridge/GUI/account import.
+    if args[1:] == ['--player-pid']:
+        from launcher_entry import emit_player_pid, resolve_player_pid
+        emit_player_pid(resolve_player_pid())
+        return 0
     from quark_cli.potplayer.__main__ import main as bridge_main
 
     return bridge_main(args[1:])

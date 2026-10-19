@@ -12,7 +12,7 @@ from .status_gui import BridgeClient, StatusWindow
 from .window_ui import configure_window
 from .gui_common import (
     EXIT_OK, EXIT_UNAVAILABLE, WINDOW_WIDTH, WINDOW_HEIGHT, MIN_WIDTH, MIN_HEIGHT,
-    _apply_font, _tkinter, _widgets, load_endpoint,
+    _tkinter, _widgets, load_endpoint,
 )
 
 
@@ -24,14 +24,16 @@ class ManagementWindow:
         self.root = None
 
     def run(self):
-        from tkinter import ttk, font
+        from tkinter import ttk
         tk = _tkinter()
         root = self.root = tk.Tk()
         root.title('夸克网盘插件管理')
         root.geometry(f'{WINDOW_WIDTH}x{WINDOW_HEIGHT}')
         root.minsize(MIN_WIDTH, MIN_HEIGHT)
-        _apply_font(root, font, ttk)
+        configure_window(root)
         root.protocol('WM_DELETE_WINDOW', root.quit)
+        ttk.Label(root, text='夸克网盘 · PotPlayer 第三方插件', style='Muted.TLabel',
+                  padding=(16, 5)).pack(side='bottom', fill='x')
         tabs = self.tabs = ttk.Notebook(root)
         tabs.pack(fill='both', expand=True)
         try:
@@ -55,7 +57,6 @@ class ManagementWindow:
             tabs.bind('<<NotebookTabChanged>>', activate)
             tabs.select(0)
             self.pages[0].activate()
-            configure_window(root)
             root.mainloop()
         finally:
             for page in self.pages:

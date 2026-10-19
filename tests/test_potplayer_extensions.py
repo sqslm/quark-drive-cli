@@ -75,7 +75,7 @@ SUBTITLE_SEARCH_EXPORTS = (
 SUBTITLE_BODY = "1\n00:00:01,000 --> 00:00:02,000\n你好，世界\n".encode("utf-8")
 
 #: Calls that exist in PotPlayer's AngelScript runtime but are not in api.txt.
-BUILTIN_CALLS = frozenset({"formatInt", "formatFloat", "parseInt", "parseFloat", "sizeof"})
+BUILTIN_CALLS = frozenset({"formatInt", "formatFloat", "parseInt", "parseFloat", "sizeof", "int"})
 KEYWORDS = frozenset({"if", "for", "while", "switch", "case", "return", "else", "do", "cast"})
 DECLARATION = re.compile(
     r"(?:^|[\s(])(?:string|bool|int|float|double|void|array<[^>\n]*>)\s+([A-Za-z_]\w*)\s*\(",
@@ -992,7 +992,7 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
     def test_versions_report_the_current_release(self):
         # 本任务只把 UrlList 升到 0.8.0；PlayParse/SubtitleSearch 的版本由各自的
         # 任务维护，这里只要求仍是语义化版本串。
-        self.assertIn('return "0.12.5";', self.raw_body(self.url_raw, "string GetVersion()"))
+        self.assertIn('return "0.12.6";', self.raw_body(self.url_raw, "string GetVersion()"))
         self.assertRegex(
             self.raw_body(self.play_raw, "string GetVersion()"), r'return "\d+\.\d+\.\d+";'
         )
@@ -1011,7 +1011,11 @@ class DiagnosticsEntryDesignTests(unittest.TestCase):
     def test_player_pid_comes_from_the_launcher_local_action(self):
         pid_body = self.raw_body(self.play_raw, "int QuarkPlayerPid()")
         # PID 只能来自启动器的本地动作；不再加载 DLL、也不再猜进程。
-        self.assertIn("QuarkLauncher()", pid_body)
+        self.assertIn("QuarkPidLauncher()", pid_body)
+        helper = self.raw_body(self.play_raw, 'string QuarkPidLauncher()')
+        self.assertIn('quark-potplayer.path', helper)
+        self.assertIn('HostFileClose(file)', helper)
+        self.assertIn('return QuarkLauncher()', helper)
         self.assertIn('HostExecuteProgram(launcher, "--player-pid")', pid_body)
         self.assertIn("QuarkJsonObject", pid_body)
         self.assertIn('json["player_pid"]', pid_body)

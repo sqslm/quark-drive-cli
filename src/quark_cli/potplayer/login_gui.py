@@ -144,6 +144,10 @@ class QrLoginWindow:
                 raise LocalIOError("无法创建扫码窗口，请检查桌面环境") from None
             root.title("夸克网盘扫码登录")
             root.resizable(False, False)
+            # The downloader embeds this login as a Toplevel; ttk themes belong
+            # to its entire interpreter, so keep that host's existing style.
+            plugin_window = isinstance(root, tk.Tk)
+            configure_window(root, themed=plugin_window)
             # A bare Label's width/height are text units until an image is set;
             # a fixed-pixel Frame keeps the window small before the QR arrives.
             holder = tk.Frame(root, width=280, height=280)
@@ -153,10 +157,10 @@ class QrLoginWindow:
             image.pack()
             status = self._status = tk.Label(root, text="正在获取二维码……", wraplength=280, justify="center")
             status.pack(padx=18, pady=(0, 6))
-            tk.Label(root, text="请用手机夸克 App 扫码，并在手机上确认登录", fg="#444444").pack(padx=18)
+            tk.Label(root, text="请用手机夸克 App 扫码，并在手机上确认登录",
+                     fg="#aaaaaa" if plugin_window else '#444444').pack(padx=18)
             tk.Button(root, text="关闭", width=10, command=self.close).pack(pady=14)
             root.protocol("WM_DELETE_WINDOW", self.close)
-            configure_window(root)
 
             self._on_qr_ready = on_qr_ready
             self._runner = LoginRunner(self._new_login, self._post)

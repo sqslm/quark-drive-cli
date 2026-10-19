@@ -136,6 +136,21 @@ class EmitPlayerPidTests(unittest.TestCase):
 
 
 class MainDispatchTests(unittest.TestCase):
+    def test_onedir_component_answers_pid_before_importing_bridge(self):
+        import service_entry
+        import builtins
+        real_import = builtins.__import__
+        def checked(name, *args, **kwargs):
+            if name.startswith('quark_cli'):
+                raise AssertionError('PID action must not load bridge business modules')
+            return real_import(name, *args, **kwargs)
+        stream = io.StringIO()
+        with mock.patch.object(builtins, '__import__', side_effect=checked), mock.patch.object(
+            launcher_entry, 'resolve_player_pid', return_value=777
+        ), mock.patch.object(launcher_entry, '_stdout', return_value=stream):
+            self.assertEqual(service_entry.main(['QuarkPotPlayer.exe', '--player-pid']), 0)
+        self.assertEqual(json.loads(stream.getvalue()), {'player_pid':777})
+
     def test_player_pid_is_answered_locally_and_never_reaches_the_bridge(self):
         stream = io.StringIO()
         with mock.patch.object(

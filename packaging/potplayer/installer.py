@@ -242,7 +242,7 @@ def run_silent(args: argparse.Namespace, payload: Payload) -> int:
 
 class InstallerWindow:
     def __init__(self, root, args: argparse.Namespace, payload: Payload) -> None:
-        from tkinter import BooleanVar, StringVar, ttk
+        from tkinter import BooleanVar, StringVar, Text, ttk
 
         self.root = root
         self.args = args
@@ -288,10 +288,14 @@ class InstallerWindow:
 
         self.progress = ttk.Progressbar(frame, mode="determinate", maximum=100)
         self.progress.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(10, 4))
-        from tkinter.scrolledtext import ScrolledText
-
-        self.text = ScrolledText(frame, height=12, state="disabled", wrap="word")
-        self.text.grid(row=7, column=0, columnspan=4, sticky="nsew")
+        log_frame = ttk.Frame(frame)
+        log_frame.grid(row=7, column=0, columnspan=4, sticky="nsew")
+        self.text = Text(log_frame, height=12, state="disabled", wrap="word",
+                         borderwidth=0, highlightthickness=0)
+        scroll = ttk.Scrollbar(log_frame, orient='vertical', command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right', fill='y')
+        self.text.pack(side='left', fill='both', expand=True)
         frame.rowconfigure(7, weight=1)
 
         self.detect()
@@ -395,11 +399,11 @@ class InstallerWindow:
         self._run(job)
 
     def uninstall(self) -> None:
-        from tkinter import messagebox
+        from quark_cli.potplayer import dialogs as messagebox
 
         options = self.options()
         extra = "，并清除插件凭证" if options.clear_credentials else "，保留插件凭证"
-        if not messagebox.askyesno("确认卸载", f"将删除本插件组件与扩展脚本{extra}。继续？"):
+        if not messagebox.askyesno("确认卸载", f"将删除本插件组件与扩展脚本{extra}。继续？", parent=self.root):
             return
 
         def job() -> None:
@@ -426,12 +430,14 @@ class InstallerWindow:
 
 def run_gui(args: argparse.Namespace, payload: Payload) -> int:
     from tkinter import Tk
+    from quark_cli.potplayer.window_ui import configure_window
 
     root = Tk()
     icon = payload.as_dir / 'MediaPlayParse - Quark.ico'
     if icon.is_file():
         root.iconbitmap(default=str(icon))
         root.iconbitmap(str(icon))
+    configure_window(root)
     try:
         root.call("tk", "scaling", 1.2)
     except Exception:  # noqa: BLE001 - cosmetic only

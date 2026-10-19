@@ -124,19 +124,23 @@ class DurationWidgetTests(unittest.TestCase):
 
     def test_minute_second_inputs_and_slider_update_each_other(self):
         from tkinter import ttk
-        from quark_cli.potplayer.series_gui import DurationControl
+        from quark_cli.potplayer.series_gui import DurationControl, SkipRangeControl
         value = DurationControl(self.tk, ttk, self.root, '片头')
+        outro = DurationControl(self.tk, ttk, self.root, '片尾')
+        self.addCleanup(value.close)
+        self.addCleanup(outro.close)
+        slider = SkipRangeControl(self.tk, self.root, value, outro)
         value.set(90)
         self.assertEqual((value.minutes.get(), value.seconds.get()), ('1', '30'))
-        value.slider.set(125)
+        slider._set(125)
         self.root.update()
         self.assertEqual(value.get(), 125)
         self.assertEqual((value.minutes.get(), value.seconds.get()), ('2', '5'))
         value.minutes.set('3')
         value.seconds.set('20')
-        self.assertEqual(int(value.slider.get()), 200)
+        self.assertEqual(value.get(), 200)
         value.set(900)
-        self.assertGreaterEqual(float(value.slider.cget('to')), 900)
+        self.assertGreaterEqual(slider.limit, 900)
         value.minutes.set('60')
         value.seconds.set('0')
         self.assertEqual(value.get(), 3600)
@@ -148,11 +152,42 @@ class DurationWidgetTests(unittest.TestCase):
         with self.assertRaises(UsageError):
             value.get()
 
+    def test_one_track_opposing_drags_do_not_change_the_other_end(self):
+        from tkinter import ttk
+        from types import SimpleNamespace
+        from quark_cli.potplayer.series_gui import DurationControl, SkipRangeControl
+        frame = ttk.Frame(self.root)
+        frame.pack()
+        intro = DurationControl(self.tk, ttk, frame, '片头')
+        outro = DurationControl(self.tk, ttk, frame, '片尾')
+        self.addCleanup(intro.close)
+        self.addCleanup(outro.close)
+        slider = SkipRangeControl(self.tk, self.root, intro, outro)
+        self.root.geometry('600x250')
+        self.root.deiconify()
+        self.root.update()
+        intro.set(90)
+        outro.set(145)
+        start, half = slider._geometry()
+        left, right = slider.positions()
+        slider._press(SimpleNamespace(x=left))
+        slider._drag(SimpleNamespace(x=start+half/2))
+        self.assertEqual((intro.get(), outro.get()), (300, 145))
+        slider._press(SimpleNamespace(x=right))
+        slider._drag(SimpleNamespace(x=start+half*1.5))
+        self.assertEqual((intro.get(), outro.get()), (300, 300))
+        slider._step(-1)
+        self.assertEqual(outro.get(), 301, 'left arrow increases skip-from-end')
+        slider._set(0)
+        self.assertEqual(outro.get(), 0)
+        self.assertEqual(slider.positions()[1], start+2*half)
+
     def test_close_does_not_save_and_save_converts_to_total_seconds(self):
         from quark_cli.potplayer.series_gui import SeriesPanel
         panel = SeriesPanel(None, None, 'show', 'account-a')
         panel._root = self.root
         panel._build(self.tk, self.root)
+        self.addCleanup(panel._shutdown)
         panel._handle('snapshot', {'name':'蒸蒸日上','intro_seconds':90,'outro_seconds':120})
         panel._intro.minutes.set('2')
         panel._intro.seconds.set('15')

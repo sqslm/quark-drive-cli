@@ -182,8 +182,8 @@ class LocalPanel:
         root.geometry(f'{WINDOW_WIDTH}x{WINDOW_HEIGHT}')
         root.protocol('WM_DELETE_WINDOW', self._close)
         try:
-            self.mount(tk, root, root)
             configure_window(root)
+            self.mount(tk, root, root)
             root.mainloop()
         finally:
             self._shutdown()

@@ -472,7 +472,8 @@ class HighlightsPanel(LocalPanel):
 
     def _build_bookmarks(self, host=None) -> None:
         """Create the manager window; every Tk call stays on this thread."""
-        from tkinter import simpledialog, ttk
+        from tkinter import ttk
+        from . import dialogs as simpledialog
 
         root = self._root
         self._simpledialog = simpledialog

@@ -70,7 +70,10 @@ def present_window(window):
         pass  # The user can close the window before its idle callback runs.
 
 
-def configure_window(window):
+def configure_window(window, *, themed=True):
+    if themed:
+        from .ui_theme import apply_theme
+        apply_theme(window)
     icon = Path(__file__).with_name(ICON_NAME)
     if not icon.is_file():
         icon = Path(__file__).resolve().parents[3] / 'potplayer' / ICON_NAME
@@ -78,6 +81,21 @@ def configure_window(window):
         window.iconbitmap(default=str(icon))
         window.iconbitmap(str(icon))
     window.after_idle(lambda: present_window(window))
+    if sys.platform == 'win32' and themed:
+        window.after_idle(lambda: _dark_titlebar(window))
+
+
+def _dark_titlebar(window):
+    from tkinter import TclError
+    try:
+        handle = _user32().GetAncestor(window.winfo_id(), 2)
+        enabled = wintypes.BOOL(True)
+        api = ctypes.WinDLL('dwmapi')
+        api.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        # Windows 10 20H1+; earlier systems retain their native title bar.
+        api.DwmSetWindowAttribute(handle, 20, ctypes.byref(enabled), ctypes.sizeof(enabled))
+    except TclError:
+        pass
 
 
 def foreground_process(player_pid):

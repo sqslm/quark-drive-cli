@@ -33,7 +33,7 @@ ROOT = HERE.parents[1]
 COMPONENT_NAME = "QuarkPotPlayer"
 LAUNCHER_NAME = "quark-potplayer"
 SETUP_NAME = "QuarkPotPlayer-Setup"
-DEFAULT_VERSION = "0.12.5"
+DEFAULT_VERSION = "0.12.6"
 ICON = ROOT / 'potplayer' / 'MediaPlayParse - Quark.ico'
 
 
@@ -352,6 +352,7 @@ def build_launcher(python: str, build_dir: Path) -> Path:
             "--name",
             LAUNCHER_NAME,
             "--icon", str(ICON),
+            "--paths", str(ROOT / 'src'),
             "--distpath",
             str(dist),
             "--workpath",
@@ -432,6 +433,7 @@ def build_installer(python: str, build_dir: Path, payload: Path, out_dir: Path) 
             "--icon", str(ICON),
             "--paths",
             str(HERE),
+            "--paths", str(ROOT / 'src'),
             *add,
             "--distpath",
             str(dist),

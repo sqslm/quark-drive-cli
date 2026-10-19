@@ -31,8 +31,10 @@ def _run(argv=None):
     root = None
     if not args.silent:
         import tkinter as tk
-        from tkinter import messagebox
+        from quark_cli.potplayer import dialogs as messagebox
+        from quark_cli.potplayer.ui_theme import apply_theme
         root = tk.Tk()
+        apply_theme(root)
         icon = args.install_dir / 'app' / '_internal' / 'quark_cli' / 'potplayer' / 'MediaPlayParse - Quark.ico'
         if icon.is_file():
             root.iconbitmap(default=str(icon))

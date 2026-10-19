@@ -41,7 +41,7 @@ class InstallationPanel:
         os.startfile(str(self.directory))
 
     def uninstall(self):
-        from tkinter import messagebox
+        from . import dialogs as messagebox
         if not messagebox.askyesno('卸载插件', '将关闭插件管理窗口并启动卸载。请先关闭 PotPlayer。继续？', parent=self.root):
             return
         command = [str(self.directory / 'Uninstall.exe'), '--uninstall', '--install-dir', str(self.directory), '--confirmed']

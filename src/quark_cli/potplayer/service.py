@@ -640,6 +640,8 @@ class Service:
         # name live on the recent record. Names are never guessed from a window
         # title and never fetched with an extra request.
         self._parents: dict[str, str] = {}
+        # Complete, recently browsed selections only. No URLs or media bytes.
+        self._playlists: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._dir_names: dict[str, str] = {}
         self._parent_lock = threading.Lock()
         self._client: QuarkClient | None = None
@@ -736,6 +738,33 @@ class Service:
         """The last verified directory of ``fid``, or ``""`` when unknown."""
         with self._parent_lock:
             return self._parents.get(fid, "")
+
+    def remember_playlist(self, parent, items):
+        self._playlists.pop(parent, None)
+        self._playlists[parent] = (self._clock(), items)
+        while len(self._playlists) > 32:
+            self._playlists.pop(next(iter(self._playlists)))
+
+    def selection(self, parent, start):
+        """Reuse a complete listing for 30s; an explicit directory refresh replaces it."""
+        known = parent if parent is not None else self.parent_of(start)
+        cached = self._playlists.get(known)
+        if cached is not None and self._clock() - cached[0] < 30:
+            videos = cached[1]
+            if start is None:
+                return known, videos
+            position = next((i for i, row in enumerate(videos) if row['fid'] == start), None)
+            if position is None:
+                raise UsageError('start 不是该目录中的视频文件')
+            return known, videos[position:]
+        # Fetch a full list, so another episode in the same folder can reuse it.
+        if parent is None and start is not None:
+            info = self.files().info(start)
+            parent = require_fid(info.get('pdir_fid'), label='pdir_fid', allow_root=True)
+        resolved, videos = playlist(self.files(), parent, None)
+        self.note_directory(resolved, videos)
+        self.remember_playlist(resolved, videos)
+        return self.selection(resolved, start)
 
     def directory_names(self) -> dict[str, str]:
         """Directory FID→name from listings already read plus favorites; no request.
@@ -853,6 +882,7 @@ class Service:
         with self._parent_lock:
             self._parents.clear()
             self._dir_names.clear()
+        self._playlists.clear()
         with self._bookmark_lock:
             self._bookmark_request = None
         self._publish_view()
@@ -1376,6 +1406,7 @@ class _Handler(BaseHTTPRequestHandler):
                 payload["series"] = _series_payload(snapshot, parent, videos)
                 payload["favorite"] = any(row["fid"] == parent for row in snapshot["favorites"])
                 service.note_directory(parent, videos)
+                service.remember_playlist(parent, videos)
             else:
                 payload = page(service.files(), parent, number, size)
             service.note_directory(parent, payload["items"])
@@ -1398,7 +1429,7 @@ class _Handler(BaseHTTPRequestHandler):
             start_value = _first(query, "start", None)
             parent = require_fid(parent_value, label="parent", allow_root=True) if parent_value is not None else None
             start = require_fid(start_value, label="start") if start_value is not None else None
-            resolved, items = playlist(service.files(), parent, start)
+            resolved, items = service.selection(parent, start)
             service.note_directory(resolved, items)
             service.directories.chain(resolved, service.files().info)
             return self._json(200, {"parent": resolved, "items": items})

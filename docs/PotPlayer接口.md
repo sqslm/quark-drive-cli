@@ -15,7 +15,7 @@
 - `--serve`：在当前进程运行服务（供打包后的常驻组件使用）。
 - `--stop`：以记录的 token 请求 `/v1/shutdown`；实例不存在时视为已停止（`0`）。
 - `--login`：打开 Tkinter 扫码窗口，登录**插件自己的**凭证；不影响 `quark` CLI 的 Cookie。
-- `--player-pid`：扩展读取当前播放器 PID 的本地动作。启动器从自身父进程链定位真正拥有 `PotPlayer`/`PotPlayer64` 窗口的进程，在标准输出打印单行 JSON `{"player_pid": 整数}`（严格 JSON 整数，非字符串）；无法验证时为 `{"player_pid":0}`。该动作由启动器就地完成，**不启动桥接、不读取 Cookie、不访问网络**；协议版本保持 `1`，动作语义不变。扩展每次解析都调用一次，不缓存（多实例可能共享 INI）。
+- `--player-pid`：扩展读取当前播放器 PID 的本地动作。优先读取 `Extension/quark-potplayer.path` 指向的已安装 onedir 组件，直接执行该动作，避免每集解压 onefile 启动器；路径不可用时仍使用原开发启动器。两者使用相同的祖先/窗口校验，在标准输出打印单行 JSON `{"player_pid": 整数}`；无法验证时为 `{"player_pid":0}`。组件在导入服务、账号、GUI 业务模块前处理，**不启动桥接、不读取 Cookie、不访问网络**；协议版本保持 `1`。每次解析调用一次，不缓存 PID（多实例可能共享 INI）。
 
 单实例：插件目录下的文件锁；已有实例时 `--ensure-service` 直接复用而不启动第二个。运行信息（端口、token、pid）写入插件私有目录 `config_directory()/potplayer/runtime.json`，退出时仅当实例号匹配才清除。服务不注册 Windows 服务、不开机启动、不监听局域网。
 
@@ -122,7 +122,7 @@
 
 `url` 是本地相对地址，只含不可猜测的会话标识；**不含** Cookie、账号信息或夸克签名地址。目录 FID → `502`；`fid` 缺失/空 → `400`。
 
-带 `player_pid`（严格 JSON 整数，`1..4294967295`）时，服务把该播放器窗口进程与本次会话登记为绑定，用于按“PID + 完整逻辑 fid 地址”核对并恢复观看进度；扩展通过启动器本地动作 `--player-pid` 取得该整数，只有验证到拥有 PotPlayer 窗口的进程才发送，取不到时保持仅 `fid` 的旧请求体。省略或旧版调用仍然只在线播放、不绑定、不续播。响应结构不变；`player_pid` 不是该范围的整数（含字符串、布尔、浮点、`0`、负数）→ `400 bad_request`。
+带 `player_pid`（严格 JSON 整数，`1..4294967295`）时，服务把该播放器窗口进程与本次会话登记为绑定，用于按“PID + 完整逻辑 fid 地址”核对并恢复观看进度；扩展通过已安装组件或开发启动器的本地动作 `--player-pid` 取得该整数，只有验证到拥有 PotPlayer 窗口的进程才发送，取不到时保持仅 `fid` 的旧请求体。省略或旧版调用仍然只在线播放、不绑定、不续播。响应结构不变；`player_pid` 不是该范围的整数（含字符串、布尔、浮点、`0`、负数）→ `400 bad_request`。
 
 ## 搜索、收藏、最近与继续观看
 
@@ -283,7 +283,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.12.5", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.12.6", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -453,3 +453,9 @@
 - `recent`、`continue`、`watch-center`、`favorites` 的标签使用同一份账号内目录祖先缓存；分类层之后的具体影片名称与所有版本子目录组合，不改原始 `name`、FID、大小和文件匹配。收藏可新增装饰字段 `display`；剧集详情的 `display` 同样包含影片与版本。追剧中心仍按实际视频父目录 FID 分组，避免把不同版本混成同一个播放目录。
 - 首次读取旧记录时允许只调用缺失的 `file/info` 祖先查询，后续复用持久缓存，不执行目录扫描。补全失败时保留本机条目，响应可新增非空 `metadata_notice`，列表给出可刷新提示；存储损坏仍返回本地读写错误，不覆盖原文件。
 - 设置窗口使用分钟/秒输入和滑块，接口及 `series-settings.json` 继续使用整数总秒数，旧规则无需迁移。关闭窗口不发送保存请求。
+
+## 播放启动与共用窗口样式
+
+- `files?include_series=1&page=1` 取得的完整视频清单供 `/v1/playlist` 复用；最多 32 个目录、30 秒有效期，仅限当前账号内存，显式完整浏览替换、切换账号清空。普通分页不当作完整清单。`start` 裁剪和自然排序不变，过期/未缓存仍读取远端，不缓存签名地址或预取下一集。
+- 片头片尾 UI 为同一轨道的两个独立时长端点，左端向右增加 intro，右端向左增加 outro；每端默认 0–600 秒，分秒输入可扩展至 3600 秒。轨道不是视频时间轴。键盘左右键微调，空格切换端点；接口、存储、自动跳过优先级不变。
+- `ui_theme` 仅负责共用视觉；`dialogs` 仅负责备注/确认/提示模态窗口，不持有账号或播放数据。Tk/ttk 共用深灰、浅色文字和黄色状态，标题栏使用系统支持的深色属性；文件选择器保留系统外观。安装和独立卸载提示使用同一主题，不依赖账号或服务。

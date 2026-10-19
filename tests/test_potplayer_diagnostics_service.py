@@ -203,7 +203,7 @@ class DiagnosticsRouteCase(_ServerCase):
         self.assertEqual(snapshot["playback"], [])
         report = self.api("GET", "/v1/diagnostics/report").json()
         self.assertEqual(report["schema_version"], 1)
-        self.assertEqual(report["release"], "0.12.5")
+        self.assertEqual(report["release"], "0.12.6")
         # No account/API request was made by either projection.
         self.assertEqual(self.fixture.requests, [])
 

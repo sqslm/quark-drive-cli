@@ -10,11 +10,13 @@
 | `SHA256SUMS.txt` | 安装程序 SHA-256 |
 | `build-info.json` | 构建时间、组件版本、随包扩展脚本清单 |
 
-当前版本为 **0.12.5**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.12.5/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
+当前版本为 **0.12.6**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.12.6/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
 
 构建方式见文末“开发者构建”。
 
 扩展与 YouTube 一样，使用和 `.as` 同名、同目录的 `.ico` 显示根入口图标。根目录七个入口使用 Lucide 同一套简约线条图标：云盘、搜索、收藏、历史、追剧、标记和设置。打包从同一份列表源码生成七个单分类脚本，各配同名 ICO；组件 EXE、启动器、安装器与窗口仍使用 PotPlayer 图标。Lucide 原始 SVG 和许可证在 `potplayer/icons/`，发行包在 `app/licenses/navigation-icons/` 附带许可证；安装/升级自动部署。
+
+插件窗口统一使用参考 PotPlayer 默认皮肤的深色控件与黄色状态，账号管理为首页；备注、片头片尾、扫码和安装/卸载提示共用样式。文件选择器使用 Windows 原生外观。管理窗口保留“第三方插件”说明。片头片尾改为单轨道双端滑块，并保留分秒输入。
 
 ## 安装前
 
@@ -104,7 +106,7 @@ QuarkPotPlayer-Setup.exe --uninstall --silent [--clear-credentials]
 ## 开发者构建
 
 ```
-python packaging/potplayer/build.py --tag 0.12.5          # 读取 potplayer/*.as 生成 dist/potplayer/0.12.5/
+python packaging/potplayer/build.py --tag 0.12.6          # 读取 potplayer/*.as 生成 dist/potplayer/0.12.6/
 python packaging/potplayer/build.py --as-dir DIR --out-dir DIR   # 指定扩展脚本目录与输出目录
 python packaging/potplayer/build.py --component-only       # 只构建并打包组件
 python packaging/potplayer/build.py --skip-component       # 复用既有组件产物
