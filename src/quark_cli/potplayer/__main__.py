@@ -75,7 +75,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(info, ensure_ascii=False, separators=(",", ":")))
         return EXIT_OK
     from .service import stop_service
-    return stop_service()
+    try:
+        return stop_service()
+    except (QuarkError, OSError) as exc:
+        print(str(exc) or "无法停止夸克网盘本地服务", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@
 | `SHA256SUMS.txt` | 安装程序 SHA-256 |
 | `build-info.json` | 构建时间、组件版本、随包扩展脚本清单 |
 
-当前版本为 **0.12.7**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.12.7/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
+当前版本为 **0.12.8**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.12.8/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
 
 构建方式见文末“开发者构建”。
 
@@ -99,6 +99,7 @@ QuarkPotPlayer-Setup.exe --uninstall --silent [--clear-credentials]
 | 目录框提示无效 / 自动检测报错 | 手动填入的目录会被严格校验，无效时直接报错且不会回退；清空该栏或点“自动检测”改用自动查找 |
 | 扩展脚本覆盖失败 | 关闭 PotPlayer 后重试安装 |
 | 目录/播放异常 | 运行 `<PotPlayer>\Plugin\QuarkPotPlayer\app\QuarkPotPlayer.exe --stop` 结束后台服务，再重新打开播放器 |
+| 升级后一直“搜索中”或目录空白 | 退出 PotPlayer，安装 0.12.8 或更新版后重新打开；新版自动恢复旧版管理员启动留下的私有服务状态，保留账号和观看记录，无需清空数据或重新扫码 |
 | 需要重新登录 | 在插件入口重新扫码；如需彻底重置，卸载时勾选清除插件凭证后重装 |
 | 卸载后有残留 | 文件被占用时先退出 PotPlayer，再从“插件管理 → 安装管理”查看实际插件目录并处理残留 |
 
@@ -109,7 +110,7 @@ QuarkPotPlayer-Setup.exe --uninstall --silent [--clear-credentials]
 ## 开发者构建
 
 ```
-python packaging/potplayer/build.py --tag 0.12.7          # 读取 potplayer/*.as 生成 dist/potplayer/0.12.7/
+python packaging/potplayer/build.py --tag 0.12.8          # 读取 potplayer/*.as 生成 dist/potplayer/0.12.8/
 python packaging/potplayer/build.py --as-dir DIR --out-dir DIR   # 指定扩展脚本目录与输出目录
 python packaging/potplayer/build.py --component-only       # 只构建并打包组件
 python packaging/potplayer/build.py --skip-component       # 复用既有组件产物

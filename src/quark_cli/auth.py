@@ -60,8 +60,8 @@ def credential_path() -> Path:
     return config_directory() / "cookie"
 
 
-def _restrict_windows_acl(path: Path, *, directory: bool) -> None:
-    restrict_windows_acl(path, directory=directory)
+def _restrict_windows_acl(path: Path, *, directory: bool, set_owner: bool = False) -> None:
+    restrict_windows_acl(path, directory=directory, set_owner=set_owner)
 
 
 def _secure_directory(path: Path) -> None:
@@ -118,7 +118,7 @@ def save_cookie(cookie: str, path: Path | None = None) -> None:
         if sys.platform == "win32":
             os.close(descriptor)
             descriptor = None
-            _restrict_windows_acl(temporary_path, directory=False)
+            _restrict_windows_acl(temporary_path, directory=False, set_owner=True)
             with temporary_path.open("w", encoding="utf-8", newline="\n") as stream:
                 stream.write(value + "\n")
                 stream.flush()

@@ -75,6 +75,79 @@ class StateTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(list(self.root.glob(".data.json-*")), [])
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows default owner semantics")
+    def test_new_json_and_cookie_set_current_user_owner_before_publication(self):
+        # Elevated Windows tokens default to Administrators ownership. Verify
+        # the native write requests OWNER as well as a private DACL before
+        # either atomic file becomes visible to a read-only service client.
+        import ctypes
+        native_dll = ctypes.WinDLL
+        writes = []
+
+        def library(name, *args, **kwargs):
+            dll = native_dll(name, *args, **kwargs)
+            if name == "advapi32":
+                set_security = dll.SetFileSecurityW
+                def record(path, flags, descriptor):
+                    writes.append((Path(path).name, flags))
+                    return set_security(path, flags, descriptor)
+                dll.SetFileSecurityW = record
+            return dll
+
+        path, cookie = self.root / "runtime.json", self.root / "cookie"
+        with patch("ctypes.WinDLL", side_effect=library):
+            state.write_json(path, {"version": 1})
+            auth.save_cookie("sid=offline", cookie)
+        temporary_writes = [(name, flags) for name, flags in writes if name.startswith((".runtime.json-", ".cookie-"))]
+        self.assertEqual(len(temporary_writes), 2)
+        for name, flags in temporary_writes:
+            self.assertTrue(flags & 1, name + " did not explicitly set its owner")
+        self.assertEqual(state.read_json(path, read_only=True), {"version": 1})
+        state.validate_windows_acl(cookie)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows owner and DACL semantics")
+    def test_admin_recovery_exception_still_rejects_other_owners_and_extra_grants(self):
+        import ctypes
+        from ctypes import wintypes
+        native_dll = ctypes.WinDLL
+        api = native_dll('advapi32', use_last_error=True)
+        api.CreateWellKnownSid.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+        fake_owner = ctypes.create_string_buffer(68)
+        size = wintypes.DWORD(len(fake_owner))
+        self.assertTrue(api.CreateWellKnownSid(26, None, fake_owner, ctypes.byref(size)))
+
+        def library(name, *args, **kwargs):
+            dll = native_dll(name, *args, **kwargs)
+            if name == 'advapi32':
+                get_security = dll.GetNamedSecurityInfoW
+                def elevated_owner(path, kind, flags, owner, *rest):
+                    result = get_security(path, kind, flags, owner, *rest)
+                    if not result:
+                        ctypes.cast(owner, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.addressof(fake_owner)
+                    return result
+                dll.GetNamedSecurityInfoW = elevated_owner
+            return dll
+
+        path = self.root / 'runtime.json'
+        state.write_json(path, {'version': 1})
+        with patch('ctypes.WinDLL', side_effect=library):
+            with self.assertRaises(LocalIOError):
+                state.validate_windows_acl(path)
+            state.validate_windows_acl(path, allow_admin_owner=True)
+            with self.assertRaises(LocalIOError):
+                state.validate_windows_acl(path, allow_admin_owner=True, owner_only=True)
+            # A non-admin foreign owner is never eligible.
+            size.value = len(fake_owner)
+            self.assertTrue(api.CreateWellKnownSid(1, None, fake_owner, ctypes.byref(size)))  # Everyone
+            with self.assertRaises(LocalIOError):
+                state.validate_windows_acl(path, allow_admin_owner=True)
+            size.value = len(fake_owner)
+            self.assertTrue(api.CreateWellKnownSid(26, None, fake_owner, ctypes.byref(size)))
+            grant = subprocess.run(['icacls', str(path), '/grant', '*S-1-1-0:F'], capture_output=True)
+            self.assertEqual(grant.returncode, 0)
+            with self.assertRaises(LocalIOError):
+                state.validate_windows_acl(path, allow_admin_owner=True)
+
     def test_read_only_json_checks_existing_permissions_without_repair_or_creation(self):
         path = self.root / "data.json"
         state.write_json(path, {"version": 1})

@@ -23,6 +23,19 @@ import uninstall_entry  # noqa: E402
 from navigation_assets import ENTRIES, stage_navigation
 
 
+def setUpModule():
+    # Upgrade recovery must never inspect/repair the real user's runtime.
+    global _private_config, _config_env
+    _private_config = tempfile.TemporaryDirectory(prefix='quark-installer-config-')
+    _config_env = mock.patch.dict(os.environ, QUARK_CONFIG_DIR=_private_config.name)
+    _config_env.start()
+
+
+def tearDownModule():
+    _config_env.stop()
+    _private_config.cleanup()
+
+
 def make_payload(root: Path) -> Path:
     payload = root / "payload"
     payload.mkdir(parents=True, exist_ok=True)
@@ -306,6 +319,24 @@ class InstallTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
+
+    def test_upgrade_recovers_runtime_before_calling_old_component_and_reports_rejection(self):
+        from quark_cli.errors import LocalIOError
+        component = self.install_dir / 'app' / core.COMPONENT_EXE
+        component.parent.mkdir(parents=True)
+        component.write_bytes(b'MZ fake')
+        events = []
+        with mock.patch('quark_cli.state.repair_windows_private_owner',
+                        side_effect=lambda path: events.append('recover')), \
+             mock.patch.object(core.subprocess, 'run', side_effect=lambda *a, **k:
+                               (events.append('stop') or mock.Mock(returncode=0))):
+            self.assertTrue(core.stop_service(self.install_dir))
+        self.assertEqual(events, ['recover', 'stop'])
+        with mock.patch('quark_cli.state.repair_windows_private_owner',
+                        side_effect=LocalIOError('untrusted')), mock.patch.object(core.subprocess, 'run') as run:
+            with self.assertRaises(core.InstallError):
+                core.stop_service(self.install_dir)
+            run.assert_not_called()
 
     def install(self, version: str = "1.0.0") -> core.InstallRecord:
         return core.install(

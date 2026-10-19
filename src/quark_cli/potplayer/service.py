@@ -71,6 +71,7 @@ from .plugin_state import (
     clear_runtime,
     load_cookie,
     read_runtime,
+    repair_runtime_owner,
     write_runtime,
 )
 from .stream import (
@@ -2213,6 +2214,7 @@ def ensure_service(
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, str]:
     """Return the live instance's ``{base_url, token}``, starting it when needed."""
+    repair_runtime_owner()
     entry = _healthy_runtime()
     if entry is None:
         (spawn or _spawn_service)(executable or sys.executable or "python")
@@ -2227,6 +2229,7 @@ def ensure_service(
 
 def stop_service() -> int:
     """Ask the recorded instance to stop; a missing instance counts as stopped."""
+    repair_runtime_owner()
     entry = read_runtime()
     if not entry:
         return EXIT_OK

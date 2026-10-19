@@ -62,6 +62,16 @@ def read_runtime() -> dict[str, Any] | None:
     return data
 
 
+def repair_runtime_owner() -> None:
+    """Recover the private runtime left by an elevated pre-0.12.8 bridge.
+
+    Never adopt a different user's file or relax read-only runtime validation.
+    Only the Administrators default owner with our user's private DACL qualifies.
+    """
+    from ..state import repair_windows_private_owner
+    repair_windows_private_owner(runtime_path())
+
+
 def write_runtime(entry: dict[str, Any]) -> None:
     write_json(runtime_path(), entry)
 

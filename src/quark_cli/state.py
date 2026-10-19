@@ -45,15 +45,15 @@ def _acl_failure(message: str, exception: BaseException) -> str:
     return f"{message}（Win32 错误 {code}）" if code else message
 
 
-def restrict_windows_acl(path: Path, *, directory: bool) -> None:
+def restrict_windows_acl(path: Path, *, directory: bool, set_owner: bool = False) -> None:
     """Replace the DACL, including explicit grants, with one current-SID ACE.
 
-    Only the DACL is written. The owner of an object implicitly holds
+    By default only the DACL is written. The owner implicitly holds
     READ_CONTROL and WRITE_DAC, but WRITE_OWNER comes from the DACL alone, so
     requesting OWNER_SECURITY_INFORMATION needs rights an inheriting folder such
     as a plain save directory does not grant and fails with ERROR_ACCESS_DENIED.
-    Ownership is therefore never taken over here; callers that must not adopt
-    foreign state check the owner separately.
+    Ownership is set only for newly created files or explicitly validated
+    upgrade recovery. Existing Modify-only files keep the DACL-only repair.
 
     The DACL written here is protected: the P flag of the SDDL sets
     SE_DACL_PROTECTED on the descriptor, so the object stops inheriting ACEs
@@ -87,12 +87,13 @@ def restrict_windows_acl(path: Path, *, directory: bool) -> None:
             raise OSError(ctypes.get_last_error(), "ConvertSidToStringSidW")
         current_sid = ctypes.wstring_at(sid_text)
         inheritance = "OICI" if directory else ""
-        # No owner or group component: this call writes the DACL only, so what
-        # the descriptor states is exactly what the object receives.
-        sddl = f"D:P(A;{inheritance};FA;;;{current_sid})"
+        sddl = (f"O:{current_sid}" if set_owner else "") + f"D:P(A;{inheritance};FA;;;{current_sid})"
         if not api.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None):
             raise OSError(ctypes.get_last_error(), "ConvertStringSecurityDescriptorToSecurityDescriptorW")
-        if not api.SetFileSecurityW(str(path), 0x80000004, descriptor):  # DACL | PROTECTED_DACL
+        # A fresh file may belong to Administrators under an elevated token.
+        # Publish it as the actual user, matching strict read-only validation.
+        flags = 0x80000004 | (1 if set_owner else 0)  # DACL | PROTECTED_DACL [| OWNER]
+        if not api.SetFileSecurityW(str(path), flags, descriptor):
             raise OSError(ctypes.get_last_error(), "SetFileSecurityW")
     except (OSError, ValueError) as exception:
         raise LocalIOError(_acl_failure("无法设置仅当前用户可访问的 Windows ACL", exception)) from None
@@ -105,8 +106,8 @@ def restrict_windows_acl(path: Path, *, directory: bool) -> None:
             kernel.CloseHandle(token)
 
 
-def validate_windows_acl(path: Path, *, owner_only: bool = False) -> None:
-    """Read owner/protected DACL; require only current-user allow ACEs."""
+def validate_windows_acl(path: Path, *, owner_only: bool = False, allow_admin_owner: bool = False) -> None:
+    """Require a current-user owner/DACL; optional admin-owner upgrade check."""
     import ctypes
     from ctypes import wintypes
 
@@ -133,6 +134,7 @@ def validate_windows_acl(path: Path, *, owner_only: bool = False) -> None:
     api.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
     api.IsValidSid.argtypes = [ctypes.c_void_p]
     api.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    api.CreateWellKnownSid.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
     token = wintypes.HANDLE()
     descriptor, owner, dacl = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
     try:
@@ -149,8 +151,17 @@ def validate_windows_acl(path: Path, *, owner_only: bool = False) -> None:
         if api.GetNamedSecurityInfoW(str(path), 1, 0x00000005, ctypes.byref(owner), None,
                                     ctypes.byref(dacl), None, ctypes.byref(descriptor)):
             raise OSError()
-        if not owner.value or not api.IsValidSid(owner) or not api.EqualSid(owner, current_sid):
+        if not owner.value or not api.IsValidSid(owner):
             raise OSError()
+        if not api.EqualSid(owner, current_sid):
+            # This exception is only for repairing an old plugin runtime,
+            # after its parent was validated. The DACL checks still apply.
+            admin_sid = ctypes.create_string_buffer(68)  # SECURITY_MAX_SID_SIZE
+            sid_size = wintypes.DWORD(len(admin_sid))
+            if (not allow_admin_owner or owner_only
+                    or not api.CreateWellKnownSid(26, None, admin_sid, ctypes.byref(sid_size))
+                    or not api.EqualSid(owner, admin_sid)):
+                raise OSError()
         if owner_only:
             return
         control, revision = wintypes.WORD(), wintypes.DWORD()
@@ -177,6 +188,21 @@ def validate_windows_acl(path: Path, *, owner_only: bool = False) -> None:
             kernel.LocalFree(descriptor)
         if token.value:
             kernel.CloseHandle(token)
+
+
+def repair_windows_private_owner(path: Path) -> None:
+    """Recover an old admin-owned runtime only inside a current-user private directory."""
+    if sys.platform != 'win32' or not path.exists():
+        return
+    _not_link(path)
+    if not path.is_file():
+        raise LocalIOError('服务状态对象类型无效')
+    try:
+        validate_windows_acl(path)
+    except LocalIOError:
+        validate_windows_acl(path.parent)
+        validate_windows_acl(path, allow_admin_owner=True)
+        restrict_windows_acl(path, directory=False, set_owner=True)
 
 
 def private_path(path: Path, *, directory: bool = False, read_only: bool = False) -> None:
@@ -253,7 +279,10 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     try:
         descriptor, name = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
         temporary = Path(name)
-        private_path(temporary)
+        if sys.platform == "win32":
+            restrict_windows_acl(temporary, directory=False, set_owner=True)
+        else:
+            private_path(temporary)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
             descriptor = None
             json.dump(data, stream, ensure_ascii=False, separators=(",", ":"))

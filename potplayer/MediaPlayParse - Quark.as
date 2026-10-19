@@ -40,7 +40,7 @@ string GetTitle()
 
 string GetVersion()
 {
-	return "0.12.7";
+	return "0.12.8";
 }
 
 string GetDesc()

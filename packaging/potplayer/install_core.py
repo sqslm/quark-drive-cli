@@ -585,6 +585,14 @@ def stop_service(install_dir: Path, *, timeout: float = 5.0) -> bool:
     component = Path(install_dir) / "app" / COMPONENT_EXE
     if not component.is_file():
         return False
+    # The installed 0.12.7 executable cannot read its own elevated runtime.
+    # Recover it before asking that old executable to release its files.
+    from quark_cli.errors import LocalIOError
+    from quark_cli.state import repair_windows_private_owner
+    try:
+        repair_windows_private_owner(plugin_credential_dir() / 'runtime.json')
+    except LocalIOError as exc:
+        raise InstallError(f'无法恢复旧服务状态：{exc}') from None
     try:
         result = subprocess.run(
             [str(component), "--stop"],
