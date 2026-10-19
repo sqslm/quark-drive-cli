@@ -148,6 +148,50 @@ class StateTests(unittest.TestCase):
             with self.assertRaises(LocalIOError):
                 state.validate_windows_acl(path, allow_admin_owner=True)
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows legacy file ownership")
+    def test_mutable_json_recovers_legacy_admin_owner_but_read_only_never_repairs(self):
+        import ctypes
+        from ctypes import wintypes
+        native_dll = ctypes.WinDLL
+        api = native_dll('advapi32', use_last_error=True)
+        api.CreateWellKnownSid.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+        admin = ctypes.create_string_buffer(68)
+        length = wintypes.DWORD(len(admin))
+        self.assertTrue(api.CreateWellKnownSid(26, None, admin, ctypes.byref(length)))
+        path = self.root / 'request_guard.json'
+        state.write_json(path, {'cooldown_until': 12345, 'cooldown_reason': 'rate_limited'})
+        original = path.read_bytes()
+        legacy = True
+        repairs = []
+
+        def library(name, *args, **kwargs):
+            dll = native_dll(name, *args, **kwargs)
+            if name == 'advapi32':
+                get_security, set_security = dll.GetNamedSecurityInfoW, dll.SetFileSecurityW
+                def legacy_owner(target, kind, flags, owner, *rest):
+                    result = get_security(target, kind, flags, owner, *rest)
+                    if not result and legacy and Path(target) == path:
+                        ctypes.cast(owner, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.addressof(admin)
+                    return result
+                def restore_owner(target, flags, descriptor):
+                    nonlocal legacy
+                    result = set_security(target, flags, descriptor)
+                    if result and Path(target) == path and flags & 1:
+                        repairs.append(Path(target))
+                        legacy = False
+                    return result
+                dll.GetNamedSecurityInfoW, dll.SetFileSecurityW = legacy_owner, restore_owner
+            return dll
+
+        with patch('ctypes.WinDLL', side_effect=library):
+            with self.assertRaises(LocalIOError):
+                state.read_json(path, read_only=True)
+            self.assertEqual(repairs, [])
+            self.assertEqual(state.read_json(path), {'cooldown_until': 12345, 'cooldown_reason': 'rate_limited'})
+            self.assertEqual(repairs, [path])
+            self.assertEqual(state.read_json(path, read_only=True)['cooldown_until'], 12345)
+        self.assertEqual(path.read_bytes(), original)
+
     def test_read_only_json_checks_existing_permissions_without_repair_or_creation(self):
         path = self.root / "data.json"
         state.write_json(path, {"version": 1})

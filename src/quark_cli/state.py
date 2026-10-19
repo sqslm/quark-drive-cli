@@ -182,7 +182,7 @@ def validate_windows_acl(path: Path, *, owner_only: bool = False, allow_admin_ow
                     or not ace.mask or not api.IsValidSid(sid) or not api.EqualSid(sid, current_sid)):
                 raise OSError()
     except (OSError, ValueError):
-        raise LocalIOError("私有状态的 Windows 所有者或 ACL 不可信，已停止") from None
+        raise LocalIOError("无法读取本地配置文件，请确认当前用户拥有读写权限") from None
     finally:
         if descriptor.value:
             kernel.LocalFree(descriptor)
@@ -249,8 +249,13 @@ def read_json(path: Path, *, default: dict[str, Any] | None = None, read_only: b
                 return default
             raise LocalIOError("必要状态文件缺失，已停止")
         if sys.platform == "win32" and not read_only:
-            # Tightening a current-owner DACL must never take over foreign state.
-            validate_windows_acl(path, owner_only=True)
+            # Old elevated versions also created admin-owned request guard and
+            # account JSON, not just runtime.json. Recover only that known case
+            # with a private current-user parent and DACL; reject foreign state.
+            try:
+                validate_windows_acl(path, owner_only=True)
+            except LocalIOError:
+                repair_windows_private_owner(path)
         private_path(path, read_only=read_only)
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)

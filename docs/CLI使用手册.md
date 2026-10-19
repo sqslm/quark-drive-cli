@@ -67,7 +67,7 @@ quark auth logout
 | Windows | `%APPDATA%\quark-drive-cli` |
 | Linux | `${XDG_CONFIG_HOME:-~/.config}/quark-drive-cli` |
 
-目录中保存 Cookie、任务、备份清单和传输恢复状态，以及请求节奏/冷却状态（`request_guard.json`，只含本机时间与固定原因，不含 Cookie、身份或令牌）。`QUARK_CONFIG_DIR` 可指定非空绝对本地路径，并会同时改变凭证和任务状态的位置；切换目录不会搬运凭证。CLI 会检查私有文件所有者和权限，拒绝符号链接及不安全路径。
+目录中保存 Cookie、任务、备份清单和传输恢复状态，以及请求节奏/冷却状态（`request_guard.json`，只含本机时间与固定原因，不含 Cookie、身份或令牌）。`QUARK_CONFIG_DIR` 可指定非空绝对本地路径，并会同时改变凭证和任务状态的位置；切换目录不会搬运凭证。CLI 会检查私有文件所有者和权限，拒绝符号链接及不安全路径。Windows 普通 JSON 读取可恢复旧版管理员启动留下的文件归属：仅允许当前用户私有父目录下、保护权限只授权当前用户的 Administrators 所有文件；保留原数据和冷却记录。只读检查不修改权限，其他用户所有的文件仍拒绝读取。
 
 ## 3. 命令结构和通用选项
 
