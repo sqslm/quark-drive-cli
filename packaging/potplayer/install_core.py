@@ -423,7 +423,7 @@ def install(
     as_files: Iterable[AsFile],
     self_exe: Path | None = None,
     start_menu_dir: Path | None = None,
-    make_shortcut: bool = True,
+    make_shortcut: bool = False,
     registry: bool = True,
     config_dir: Path | None = None,
 ) -> InstallRecord:
@@ -431,6 +431,12 @@ def install(
     install_dir = Path(install_dir)
     potplayer_dir = resolve_potplayer_dir(potplayer_dir)
     ensure_install_dir_available(install_dir)
+    previous = read_manifest(install_dir) or {}
+    from player_uninstall import prepare, attach
+    try:
+        linked = prepare(potplayer_dir, previous.get('player_uninstall')) if registry else None
+    except PermissionError:
+        raise InstallError('设置 PotPlayer 卸载联动需要管理员权限，请右键安装包选择“以管理员身份运行”后重试') from None
     package_zip = Path(payload_dir) / "component.zip"
     if not package_zip.is_file():
         raise InstallError(f"安装包缺少组件负载：{package_zip}")
@@ -480,50 +486,26 @@ def install(
     record.created.append(UNINSTALL_EXE_NAME)
     stop_service(install_dir)
 
-    if make_shortcut and start_menu_dir is not None:
-        # The bridge needs an action argument (--serve/--login/...), so a shortcut
-        # to it would exit at once; open the player the extension lives in instead.
-        player_exe = _exe_in(potplayer_dir)
-        assert player_exe is not None, "resolve_potplayer_dir 已保证存在 PotPlayer 可执行文件"
-        shortcut = Path(start_menu_dir) / START_MENU_NAME
-        write_shortcut(shortcut, target=player_exe, icon=component, description=PRODUCT_NAME)
-        record.shortcut = str(shortcut)
+    old_shortcut = previous.get('shortcut')
+    menu = Path(start_menu_dir) if start_menu_dir is not None else default_start_menu_dir()
+    if isinstance(old_shortcut, str) and menu is not None:
+        shortcut = Path(old_shortcut)
+        if shortcut.name == START_MENU_NAME and shortcut.resolve().parent == menu.resolve():
+            shortcut.unlink(missing_ok=True)
 
     manifest = record.to_json()
+    if linked is not None:
+        from player_uninstall import command
+        linked['command'] = command(install_dir)
+        manifest['player_uninstall'] = linked
     (install_dir / MANIFEST_NAME).write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     if registry:
+        if linked is not None:
+            attach(linked, install_dir)
         register_uninstall(install_dir, version=version)
     return record
-
-
-def write_shortcut(shortcut: Path, *, target: Path, icon: Path, description: str) -> None:
-    """Create a ``.lnk`` through the WScript.Shell COM object (no third-party deps)."""
-    shortcut.parent.mkdir(parents=True, exist_ok=True)
-
-    def quote(value: str) -> str:
-        return "'" + str(value).replace("'", "''") + "'"
-
-    script = ";".join(
-        [
-            "$s=(New-Object -ComObject WScript.Shell).CreateShortcut(" + quote(str(shortcut)) + ")",
-            "$s.TargetPath=" + quote(str(target)),
-            "$s.WorkingDirectory=" + quote(str(Path(target).parent)),
-            "$s.IconLocation=" + quote(f"{icon},0"),
-            "$s.Description=" + quote(description),
-            "$s.Save()",
-        ]
-    )
-    result = subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True,
-        text=True,
-        creationflags=CREATE_NO_WINDOW,
-        check=False,
-    )
-    if result.returncode != 0 or not shortcut.exists():
-        raise InstallError(f"创建快捷方式失败：{shortcut}（{result.stderr.strip() or result.stdout.strip()}）")
 
 
 def register_uninstall(install_dir: Path, *, version: str) -> None:
@@ -666,6 +648,9 @@ def uninstall(
 
     if stop:
         stop_service(install_dir)
+    if registry:
+        from player_uninstall import restore
+        restore(manifest.get('player_uninstall'))
 
     potplayer_dir = Path(str(manifest.get("potplayer_dir", "")))
     if potplayer_dir.is_dir():
@@ -679,15 +664,24 @@ def uninstall(
                 continue
             _remove_file(target, potplayer_dir, report)
 
+    _remove_installed_files(install_dir, manifest, report)
+    cleanup_external(manifest, report, clear_credentials=clear_credentials,
+                     config_dir=config_dir, start_menu_dir=start_menu_dir, registry=registry)
+    return report
+
+
+def cleanup_external(manifest, report, *, clear_credentials=False, config_dir=None,
+                     start_menu_dir=None, registry=True):
+    """Also usable after PotPlayer removed the component's entire directory."""
     shortcut = manifest.get("shortcut")
     if isinstance(shortcut, str) and shortcut:
         root = Path(start_menu_dir) if start_menu_dir is not None else Path(shortcut).parent
         _remove_file(Path(shortcut), root, report)
 
     if registry:
+        from player_uninstall import restore
+        restore(manifest.get('player_uninstall'))
         remove_uninstall_registry()
-
-    _remove_installed_files(install_dir, manifest, report)
 
     if clear_credentials:
         plugin_dir = plugin_credential_dir(config_dir)
@@ -700,10 +694,11 @@ def uninstall(
             shutil.rmtree(plugin_dir, ignore_errors=True)
             report.credentials_removed = not plugin_dir.exists()
             report.kept_credentials = plugin_dir.exists()
+            if report.kept_credentials:
+                report.notes.append('插件账号与观看数据未能清理，请检查目录权限')
         else:
             report.credentials_removed = True
             report.kept_credentials = False
-    return report
 
 
 def remove_uninstall_registry() -> None:

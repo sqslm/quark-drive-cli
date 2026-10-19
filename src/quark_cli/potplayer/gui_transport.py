@@ -108,11 +108,16 @@ class LocalWorker:
 
     def cancel(self) -> None:
         self._stop.set()
+        self._requests.put(None)  # Wake an idle queue.get immediately.
 
     def tick(self) -> None:
         """Exactly one diagnostics GET; a failure is classified by a health probe."""
+        if self._stop.is_set():
+            return
         self.polls += 1
         snapshot = self._client.snapshot()
+        if self._stop.is_set():
+            return
         if snapshot is not None:
             self._events.put(("snapshot", snapshot))
             return
@@ -122,18 +127,25 @@ class LocalWorker:
             self._events.put(("disconnected", None))
 
     def run(self) -> None:
-        while not self._stop.is_set():
-            self.tick()
-            deadline = time.monotonic() + self._interval
+        try:
             while not self._stop.is_set():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    request = self._requests.get(timeout=remaining)
-                except queue.Empty:
-                    break
-                self._serve(request)
+                self.tick()
+                deadline = time.monotonic() + self._interval
+                while not self._stop.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        request = self._requests.get(timeout=remaining)
+                    except queue.Empty:
+                        break
+                    if self._stop.is_set():
+                        break
+                    self._serve(request)
+        finally:
+            # Only this thread touches its active HTTP transport. No Tk objects
+            # are owned by the worker; closing the window never waits for I/O.
+            self._client.close()
 
 
     def _serve(self, request):
@@ -210,9 +222,7 @@ class LocalPanel:
             self._root.after_cancel(self._pump_id)
         if self._worker is not None:
             self._worker.cancel()
-        if self._thread is not None:
-            self._thread.join(REQUEST_TIMEOUT + 1)
-        if self._client is not None:
+        if self._worker is None and self._client is not None:
             self._client.close()
         import tkinter
         for name, value in list(vars(self).items()):
@@ -228,4 +238,5 @@ class LocalPanel:
 
     def _close(self):
         if self._root is not None:
+            self._root.withdraw()
             self._root.quit()

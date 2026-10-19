@@ -256,7 +256,7 @@ def emit_player_pid(pid: int) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv if argv is None else argv)
-    if '--uninstall' in args[1:] or (getattr(sys, 'frozen', False) and Path(sys.executable).name.lower() == 'uninstall.exe'):
+    if '--uninstall' in args[1:] or '--uninstall-player' in args[1:] or (getattr(sys, 'frozen', False) and Path(sys.executable).name.lower() == 'uninstall.exe'):
         from uninstall_entry import main as uninstall_main
         return uninstall_main(args[1:])
     if PID_ACTION in args[1:]:

@@ -486,11 +486,9 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(self.install_dir.is_dir())
         self.assertFalse((self.install_dir / "app").exists())
 
-    def test_shortcut_opens_the_player_not_the_bridge(self) -> None:
-        # The bridge needs an action argument, so the Start Menu entry must launch
-        # PotPlayer itself (the extension lives in its URL list).
+    def test_install_does_not_create_shortcuts_even_for_legacy_callers(self) -> None:
         start_menu = self.root / "StartMenu"
-        with mock.patch.object(core, "write_shortcut") as write:
+        with mock.patch.object(core, "stop_service"):
             record = core.install(
                 payload_dir=self.payload,
                 install_dir=self.install_dir,
@@ -501,10 +499,25 @@ class InstallTests(unittest.TestCase):
                 make_shortcut=True,
                 registry=False,
             )
-        write.assert_called_once()
-        self.assertEqual(write.call_args.kwargs["target"], self.potplayer / "PotPlayerMini64.exe")
-        self.assertEqual(write.call_args.kwargs["icon"], self.install_dir / "app" / core.COMPONENT_EXE)
-        self.assertEqual(record.shortcut, str(start_menu / core.START_MENU_NAME))
+        self.assertIsNone(record.shortcut)
+        self.assertFalse(start_menu.exists())
+
+    def test_upgrade_removes_the_previous_owned_shortcut(self) -> None:
+        menu = self.root / 'StartMenu'
+        with mock.patch.object(core, 'stop_service'):
+            core.install(payload_dir=self.payload, install_dir=self.install_dir,
+                         potplayer_dir=self.potplayer, version='1', as_files=self.as_files,
+                         registry=False)
+            menu.mkdir()
+            shortcut = menu / core.START_MENU_NAME
+            shortcut.write_bytes(b'old owned shortcut')
+            manifest = core.read_manifest(self.install_dir)
+            manifest['shortcut'] = str(shortcut)
+            (self.install_dir / core.MANIFEST_NAME).write_text(json.dumps(manifest), 'utf-8')
+            core.install(payload_dir=self.payload, install_dir=self.install_dir,
+                         potplayer_dir=self.potplayer, version='2', as_files=self.as_files,
+                         start_menu_dir=menu, registry=False)
+        self.assertFalse(shortcut.exists())
 
 
 class ReplacementTests(unittest.TestCase):
@@ -782,7 +795,7 @@ class InstallerCliTests(unittest.TestCase):
             args = installer.build_parser().parse_args(["--install-dir", str(install_dir)])
             options = installer.options_from(args)
             self.assertEqual(options.potplayer_dir, potplayer)
-            self.assertTrue(options.make_shortcut)
+            self.assertFalse(options.make_shortcut)
             self.assertFalse(options.clear_credentials)
 
     def test_unpacked_runs_never_copy_a_python_interpreter(self) -> None:

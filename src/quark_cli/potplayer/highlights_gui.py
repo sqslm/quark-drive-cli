@@ -521,19 +521,19 @@ class HighlightsPanel(LocalPanel):
         actions = ttk.Frame(outer)
         actions.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self._bookmark_add_button = ttk.Button(
-            actions, text="标记当前时间点", width=16, command=self._add_bookmark
+            actions, text="标记当前时间点", command=self._add_bookmark
         )
         self._bookmark_jump_button = ttk.Button(
-            actions, text="跳转", width=8, command=self._jump_bookmark
+            actions, text="跳转", command=self._jump_bookmark
         )
         self._bookmark_rename_button = ttk.Button(
-            actions, text="编辑备注", width=10, command=self._rename_bookmark
+            actions, text="编辑备注", command=self._rename_bookmark
         )
         self._bookmark_remove_button = ttk.Button(
-            actions, text="删除", width=8, command=self._remove_bookmark
+            actions, text="删除", command=self._remove_bookmark
         )
         self._bookmark_refresh_button = ttk.Button(
-            actions, text="刷新", width=8, command=self._request_bookmarks
+            actions, text="刷新", command=self._request_bookmarks
         )
         for button in (
             self._bookmark_add_button,
@@ -543,11 +543,13 @@ class HighlightsPanel(LocalPanel):
             self._bookmark_refresh_button,
         ):
             button.pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text='全部剧集', command=self._open_all).pack(side='right')
-        ttk.Button(actions, text='返回剧集列表', command=self._back_to_groups).pack(side='right', padx=6)
+        navigation = ttk.Frame(outer)
+        navigation.grid(row=3, column=0, sticky='ew', pady=(8, 0))
+        ttk.Button(navigation, text='返回剧集列表', command=self._back_to_groups).pack(side='left')
+        ttk.Button(navigation, text='全部剧集', command=self._open_all).pack(side='left', padx=6)
         ttk.Label(
             outer, textvariable=self._bookmark_notice_var, anchor="w", wraplength=BOOKMARK_NOTICE_WRAP
-        ).grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ).grid(row=4, column=0, sticky="ew", pady=(8, 0))
         self._refresh_bookmark_header()
         self._update_bookmark_actions()
 

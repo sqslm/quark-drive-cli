@@ -72,13 +72,6 @@ class ManagementWindow:
 
 def run_management_window(runtime_reader: Callable[[], Any] = plugin_state.read_runtime) -> int:
     endpoint = load_endpoint(runtime_reader)
-    if endpoint is not None:
-        client = BridgeClient(endpoint)
-        try:
-            if not client.healthy():
-                endpoint = None
-        finally:
-            client.close()
     try:
         return ManagementWindow(endpoint).run()
     except LocalIOError:

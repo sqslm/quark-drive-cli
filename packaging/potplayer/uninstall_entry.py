@@ -12,14 +12,31 @@ import install_core as core
 def _run(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--uninstall', action='store_true')
+    parser.add_argument('--uninstall-player', action='store_true')
     parser.add_argument('--install-dir', type=Path, default=Path(sys.executable).resolve().parent)
     parser.add_argument('--clear-credentials', action='store_true')
     parser.add_argument('--silent', action='store_true')
     parser.add_argument('--confirmed', action='store_true')
     parser.add_argument('--no-registry', action='store_true')
     args = parser.parse_args(argv)
+    manifest = core.read_manifest(args.install_dir) or {}
+    linked = manifest.get('player_uninstall') or {}
+    if (not args.no_registry and linked.get('hive') == 'HKLM' and sys.platform == 'win32'
+            and getattr(sys, 'frozen', False)):
+        import ctypes
+        shell = ctypes.WinDLL('shell32')
+        if not shell.IsUserAnAdmin():
+            shell.ShellExecuteW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                                           ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
+            shell.ShellExecuteW.restype = ctypes.c_void_p
+            parameters = list(sys.argv[1:] if argv is None else argv)
+            result = shell.ShellExecuteW(None, 'runas', sys.executable,
+                                         subprocess.list2cmdline(parameters), None, 1)
+            return 0 if result and result > 32 else 4
     if core.needs_temp_relaunch(args.install_dir):
         extra = ['--silent'] if args.silent else []
+        if args.uninstall_player:
+            extra.append('--uninstall-player')
         if args.confirmed:
             extra.append('--confirmed')
         if args.clear_credentials:
@@ -39,12 +56,17 @@ def _run(argv=None):
         if icon.is_file():
             root.iconbitmap(default=str(icon))
         root.withdraw()
-        if not args.confirmed and not messagebox.askyesno('卸载夸克网盘插件', '请先关闭 PotPlayer。确定卸载插件？\n默认保留账号及观看记录。', parent=root):
+        if not args.uninstall_player and not args.confirmed and not messagebox.askyesno('卸载夸克网盘插件', '请先关闭 PotPlayer。确定卸载插件？\n默认保留账号及观看记录。', parent=root):
             root.destroy()
             return 0
     try:
+        from player_uninstall import run, close_plugin_windows
+        if args.uninstall_player:
+            return run(args.install_dir, silent=args.silent, registry=not args.no_registry)
+        core.stop_service(args.install_dir)
+        close_plugin_windows(args.install_dir)
         report = core.uninstall(install_dir=args.install_dir, clear_credentials=args.clear_credentials,
-                                start_menu_dir=core.default_start_menu_dir(), registry=not args.no_registry)
+                                start_menu_dir=core.default_start_menu_dir(), registry=not args.no_registry, stop=False)
         if report.notes:
             raise core.InstallError('\n'.join(report.notes))
         if root:

@@ -11,7 +11,7 @@ from ..errors import QuarkError
 from . import SERVICE_VERSION
 from .login_gui import QrLoginWindow
 from .plugin_state import credential_path
-from .service import EXIT_OK, ensure_service, run_service, stop_service
+from .gui_common import EXIT_OK
 from .status_gui import run_status_window
 from .highlights_gui import run_highlights_window
 
@@ -49,6 +49,7 @@ def login() -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.serve:
+        from .service import run_service
         return run_service()
     if arguments.series_settings_window:
         from .series_gui import run_series_settings
@@ -65,6 +66,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(str(exc) or "扫码登录失败", file=sys.stderr)
             return 1
     if arguments.ensure_service:
+        from .service import ensure_service
         try:
             info = ensure_service()
         except (QuarkError, OSError) as exc:
@@ -72,6 +74,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         print(json.dumps(info, ensure_ascii=False, separators=(",", ":")))
         return EXIT_OK
+    from .service import stop_service
     return stop_service()
 
 

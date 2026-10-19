@@ -27,6 +27,8 @@ class InstallationPanel:
         for text in ('插件版本：' + str(manifest.get('version', '安装信息不可用 / 开发环境')),
                      '组件目录：' + str(self.directory),
                      'PotPlayer：' + str(manifest.get('potplayer_dir', '未记录')),
+                     '随播放器卸载：' + ('已联动 Windows 的 PotPlayer 卸载入口，完成后清理插件及其账号数据。'
+                                        if manifest.get('player_uninstall') else '未联动（便携版或没有系统卸载入口）。'),
                      '安装包使用后可删除。日常账号、标记和卸载管理均使用已安装组件。'):
             ttk.Label(outer, text=text, wraplength=730).pack(anchor='w', pady=(0, 12))
         ttk.Button(outer, text='打开插件目录', command=self.open_directory).pack(anchor='w', pady=6)

@@ -49,6 +49,27 @@ def apply_theme(window):
             style.configure(widget, indicatorbackground=SURFACE, indicatorforeground=SURFACE, padding=3)
             style.map(widget, background=[('active', BACKGROUND)], foreground=[('disabled', '#777777')],
                       indicatorbackground=[('selected', ACCENT), ('active', CONTROL)])
+        # Clam's stock selected indicator is an X on Windows. Supply a real
+        # check mark, retaining images on this interpreter's owning root.
+        import tkinter as tk
+        images = []
+        for selected, disabled in ((False, False), (True, False), (False, True), (True, True)):
+            image = tk.PhotoImage(master=window, width=16, height=16)
+            image.put(BACKGROUND, to=(0, 0, 16, 16))
+            image.put(BORDER if disabled else MUTED, to=(1, 1, 15, 15))
+            image.put(ACCENT if selected and not disabled else SURFACE, to=(2, 2, 14, 14))
+            if selected:
+                for x, y in ((4, 8), (5, 9), (6, 10), (7, 9), (8, 8), (9, 7), (10, 6), (11, 5)):
+                    image.put(MUTED if disabled else SURFACE, to=(x, y, x+2, y+2))
+            images.append(image)
+        window._root()._quark_check_images = images
+        style.element_create('Quark.Check.indicator', 'image', images[0],
+                             ('disabled', 'selected', images[3]), ('selected', images[1]),
+                             ('disabled', images[2]), width=20, sticky='w')
+        style.layout('TCheckbutton', [('Checkbutton.padding', {'sticky':'nswe', 'children':[
+            ('Quark.Check.indicator', {'side':'left', 'sticky':''}),
+            ('Checkbutton.focus', {'side':'left', 'sticky':'w', 'children':[
+                ('Checkbutton.label', {'sticky':'nswe'})]})]})])
         style.configure('TScrollbar', background=CONTROL, arrowcolor=MUTED, borderwidth=0,
                         arrowsize=12, troughcolor=SURFACE)
         style.map('TScrollbar', background=[('active', '#555555')])

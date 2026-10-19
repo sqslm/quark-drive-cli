@@ -10,7 +10,7 @@
 | `SHA256SUMS.txt` | 安装程序 SHA-256 |
 | `build-info.json` | 构建时间、组件版本、随包扩展脚本清单 |
 
-当前版本为 **0.12.6**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.12.6/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
+当前版本为 **0.12.7**；发行包由 `packaging/potplayer/build.py` 生成到 `dist/potplayer/0.12.7/`（含 `QuarkPotPlayer-Setup.exe`、`SHA256SUMS.txt`、`build-info.json`）。
 
 构建方式见文末“开发者构建”。
 
@@ -25,9 +25,9 @@
 
 ## 安装
 
-1. 双击 `QuarkPotPlayer-Setup.exe`。
+1. 关闭 PotPlayer，右键 `QuarkPotPlayer-Setup.exe` 选择“以管理员身份运行”。系统卸载联动可能需要修改 HKLM 下的原卸载命令；权限不足时在写入程序文件前提示。
 2. 安装程序自动查找 PotPlayer（注册表 `HKCU/HKLM\Software\DAUM\PotPlayer*` 的 `ProgramPath`、卸载项，以及 `Program Files\DAUM\PotPlayer` 等常见路径）；未找到时点“浏览…”手动选择包含 `PotPlayerMini64.exe` 的目录。
-3. 可取消“创建开始菜单快捷方式”“安装完成后打开 PotPlayer”。开始菜单快捷方式直接打开 PotPlayer（插件入口在播放器内，见“首次使用”）。
+3. 可取消“安装完成后打开 PotPlayer”。不再提供或创建开始菜单快捷方式；从 PotPlayer 内打开插件。升级清理旧清单记录的本插件快捷方式。复选框对号表示已选中。
 4. 点“安装 / 升级”，下方日志显示每一步写入的位置。
 
 默认安装位置跟随所选 PotPlayer；程序文件不再另装到 C 盘的用户程序目录。安装完成后下载的安装包可删除，根目录“插件管理 → 安装管理”提供安装位置与卸载入口：
@@ -43,10 +43,9 @@
 <PotPlayer 目录>\Extension\Media\UrlList\MediaUrlList - *.as
 <PotPlayer 目录>\Extension\Media\PlayParse\MediaPlayParse - *.as
 <PotPlayer 目录>\Extension\Subtitle\Search\SubtitleSearch - *.as
-%APPDATA%\Microsoft\Windows\Start Menu\Programs\夸克网盘 (PotPlayer).lnk   指向 PotPlayer 本身的快捷方式
 ```
 
-安装程序只写入以上路径，不修改 PotPlayer 的播放设置、不触碰其它扩展、不读写 quark CLI 的登录 Cookie。
+安装程序写入以上路径与本插件卸载项；找到匹配的 PotPlayer 系统卸载入口时，备份原命令后接入联合卸载。原 `PotPlayer/uninstall.exe` 保持完整。不修改播放设置、不触碰其它扩展、不读写 quark CLI 的登录 Cookie。
 
 组件、`Uninstall.exe` 与 `install.json` 默认写在 `<PotPlayer>\Plugin\QuarkPotPlayer`，选择另一个 PotPlayer 后默认路径随之变化。受保护的 PotPlayer 安装目录（如 Program Files）需要写权限；安装失败时应解决权限或以管理员身份运行，不会回退安装到 C 盘。账号及观看记录仍位于系统用户私有配置目录，升级沿用原数据。
 
@@ -75,7 +74,11 @@
 * `<PotPlayer>\Plugin\QuarkPotPlayer\Uninstall.exe`（也可直接双击）
 * 安装窗口中的“卸载”按钮
 
-卸载默认**保留**插件凭证（下次安装无需重新扫码）。若同时要清除凭证，在安装窗口中勾选“卸载时同时清除插件凭证”，或使用 `--uninstall --silent --clear-credentials`。清除范围仅限 `%APPDATA%\quark-drive-cli\potplayer\`，`quark` CLI 的登录状态（`%APPDATA%\quark-drive-cli\cookie`）不受影响。
+**仅卸载插件**时默认保留凭证与观看记录，并恢复由本插件改写的 PotPlayer 原卸载命令；用户后来另行修改的命令不覆盖。若也要清除数据，勾选“卸载时同时清除插件凭证”，或使用 `--uninstall --silent --clear-credentials`。清除仅限当前用户安装清单对应的插件私有目录，不影响 CLI 登录。
+
+**卸载 PotPlayer 与插件一起清理**：日志及“插件管理 → 安装管理”显示已联动后，从 Windows“已安装的应用”或“程序和功能”的 **PotPlayer** 项卸载。联合入口先关闭本安装的插件窗口与服务，再等待原卸载程序完成；确认播放器已移除后，清理插件文件、卸载项以及该安装对应的账号、观看记录和精彩标记。取消播放器卸载时保留插件数据；原始卸载器不改写。涉及系统卸载键时由 Windows 请求管理员权限。
+
+便携版、找不到匹配系统卸载项或非 NSIS 卸载器，不声明已联动；先卸载插件再删除播放器。直接运行原 `PotPlayer/uninstall.exe`、手动删目录、第三方强制删除均绕过联合入口，无法保证清理系统目录外的插件记录。等待使用 [NSIS 官方 `_?=` 参数](https://nsis.sourceforge.io/Docs/Chapter3.html#installerusageuninstaller)，不会因启动器退出就认定卸载完成。
 
 卸载删除本插件创建的文件：组件树 `app\`、`Uninstall.exe`、`install.json`（旧安装的安装包副本如在清单中也会清理），以及清单记录的扩展脚本、启动器与开始菜单快捷方式；安装目录中此后加入的其它文件会保留，目录清空后才删除。清单缺失、位置与记录不一致时安装程序拒绝删除并保留文件；扩展脚本位于 PotPlayer 目录之外时同样保留。
 
@@ -106,7 +109,7 @@ QuarkPotPlayer-Setup.exe --uninstall --silent [--clear-credentials]
 ## 开发者构建
 
 ```
-python packaging/potplayer/build.py --tag 0.12.6          # 读取 potplayer/*.as 生成 dist/potplayer/0.12.6/
+python packaging/potplayer/build.py --tag 0.12.7          # 读取 potplayer/*.as 生成 dist/potplayer/0.12.7/
 python packaging/potplayer/build.py --as-dir DIR --out-dir DIR   # 指定扩展脚本目录与输出目录
 python packaging/potplayer/build.py --component-only       # 只构建并打包组件
 python packaging/potplayer/build.py --skip-component       # 复用既有组件产物

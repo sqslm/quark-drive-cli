@@ -436,8 +436,10 @@ class WorkerTests(unittest.TestCase):
     def test_run_cancels_cleanly_while_a_poll_is_in_flight(self):
         entered = threading.Event()
         release = threading.Event()
+        paths = []
 
         def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
             entered.set()
             release.wait(2.0)
             raise httpx.ConnectError("refused", request=request)
@@ -451,7 +453,8 @@ class WorkerTests(unittest.TestCase):
         thread.join(timeout=REQUEST_TIMEOUT + 1.0)
         self.assertFalse(thread.is_alive())
         self.assertEqual(worker.polls, 1)  # the cancelled in-flight poll is the last
-        self.assertEqual(events.get_nowait()[0], "disconnected")
+        self.assertTrue(events.empty())
+        self.assertEqual(paths, ['/v1/diagnostics'], 'closed windows must not start another health request')
 
 
 class SelectionTests(unittest.TestCase):

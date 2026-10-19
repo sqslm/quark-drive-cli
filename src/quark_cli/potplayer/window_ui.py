@@ -19,10 +19,10 @@ def _user32():
         ('GetWindowThreadProcessId', [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)], wintypes.DWORD),
         ('IsWindowVisible', [wintypes.HWND], wintypes.BOOL),
         ('IsIconic', [wintypes.HWND], wintypes.BOOL),
-        ('ShowWindow', [wintypes.HWND, ctypes.c_int], wintypes.BOOL),
+        ('ShowWindowAsync', [wintypes.HWND, ctypes.c_int], wintypes.BOOL),
+        ('SetWindowPos', [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT], wintypes.BOOL),
         ('BringWindowToTop', [wintypes.HWND], wintypes.BOOL),
         ('SetForegroundWindow', [wintypes.HWND], wintypes.BOOL),
-        ('AttachThreadInput', [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL], wintypes.BOOL),
     ):
         function = getattr(api, name)
         function.argtypes, function.restype = arguments, result
@@ -33,26 +33,15 @@ def _foreground(handle):
     if not handle:
         return False
     api = _user32()
-    api.ShowWindow(handle, 9 if api.IsIconic(handle) else 5)
+    api.ShowWindowAsync(handle, 9 if api.IsIconic(handle) else 5)
     if api.SetForegroundWindow(handle):
         return True
-    # A bridge-spawned window has no foreground input queue of its own.
-    # Join only for this explicit user action, then always detach again.
-    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
-    kernel.GetCurrentThreadId.restype = wintypes.DWORD
-    current = kernel.GetCurrentThreadId()
-    attached = []
-    threads = {api.GetWindowThreadProcessId(api.GetForegroundWindow(), None),
-               api.GetWindowThreadProcessId(handle, None)}
-    try:
-        for thread in threads - {0, current}:
-            if api.AttachThreadInput(current, thread, True):
-                attached.append(thread)
-        api.BringWindowToTop(handle)
-        return bool(api.SetForegroundWindow(handle))
-    finally:
-        for thread in reversed(attached):
-            api.AttachThreadInput(current, thread, False)
+    # Never couple our input queue to PotPlayer's. All operations address only
+    # the explicitly opened owned window; don't wait for its UI thread.
+    flags = 0x0001 | 0x0002 | 0x0010 | 0x4000  # NOSIZE|NOMOVE|NOACTIVATE|ASYNC
+    api.SetWindowPos(handle, -1, 0, 0, 0, 0, flags)
+    api.SetWindowPos(handle, -2, 0, 0, 0, 0, flags)
+    return bool(api.SetForegroundWindow(handle))
 
 
 def present_window(window):

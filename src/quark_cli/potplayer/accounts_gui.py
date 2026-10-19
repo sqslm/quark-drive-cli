@@ -8,6 +8,12 @@ from .gui_common import (
 from .gui_transport import LocalClient, LocalWorker, LocalPanel
 
 
+def capacity_text(value, total):
+    amount = format_bytes(value)
+    percent = f'{value / total:.2%}' if type(value) is int and value >= 0 and type(total) is int and total > 0 else '—'
+    return f'{amount} / {percent}'
+
+
 class AccountClient(LocalClient):
     def snapshot(self):
         try:
@@ -97,10 +103,10 @@ class AccountsPanel(LocalPanel):
         self._current_account_var = tk.StringVar(value='当前账号：未登录')
         self._accounts_notice = tk.StringVar(value='切换会保留其他账号登录；退出只清除所选账号凭证。')
         ttk.Label(frame, textvariable=self._current_account_var, font=('Microsoft YaHei UI', 13)).pack(anchor='w', pady=(0, 12))
-        self._accounts_tree = ttk.Treeview(frame, columns=('nickname', 'state', 'remaining', 'total'),
+        self._accounts_tree = ttk.Treeview(frame, columns=('nickname', 'state', 'used', 'remaining', 'total'),
                                           show='headings', selectmode='browse')
-        for column, title, width in (('nickname', '账号昵称', 220), ('state', '登录状态', 110),
-                                     ('remaining', '剩余容量', 150), ('total', '总容量', 150)):
+        for column, title, width in (('nickname', '账号昵称', 140), ('state', '登录状态', 90),
+                                     ('used', '已用', 180), ('remaining', '剩余容量', 180), ('total', '总容量', 110)):
             self._accounts_tree.heading(column, text=title)
             self._accounts_tree.column(column, width=width, stretch=True)
         self._accounts_tree.pack(fill='both', expand=True)
@@ -135,7 +141,8 @@ class AccountsPanel(LocalPanel):
             remaining = max(0, total - used) if type(total) is int and type(used) is int else None
             state = '当前账号' if row['current'] else ('已登录' if row['logged_in'] else '已退出 / 已失效')
             self._accounts_tree.insert('', 'end', iid=key,
-                                       values=(row['nickname'], state, format_bytes(remaining), format_bytes(total)))
+                                       values=(row['nickname'], state, capacity_text(used, total),
+                                               capacity_text(remaining, total), format_bytes(total)))
             if row['current']:
                 current_name = row['nickname']
         self._current_account_var.set('当前账号：' + current_name)

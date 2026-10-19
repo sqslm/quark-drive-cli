@@ -283,7 +283,7 @@
                           "status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0},
                           "last_status": null, "last_elapsed_ms": null}]},
   "errors": {"count": 0, "events": [{"at": null, "phase": "播放", "kind": "unknown", "message": "未知错误", "status": null}]},
-  "versions": {"release": "0.12.6", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
+  "versions": {"release": "0.12.7", "protocol": "1", "schema_version": 1, "python": "3.x", "os": "Windows"},
   "protection": {"available": true, "active": false, "reason": null, "remaining_seconds": 0.0},
   "playback": [{"player_pid": 1234, "fid": "…", "name": "第2集.mp4", "position_ms": 0,
                 "duration_ms": 0, "state": "waiting", "message": "等待播放开始"}]
@@ -456,6 +456,9 @@
 
 ## 播放启动与共用窗口样式
 
+- 界面先打开再由各自后台线程检查连接；关闭取消轮询并唤醒空闲队列，不在 Tk 线程等待网络。HTTP 客户端由对应 worker 的 finally 释放，不从界面线程关闭正在使用的 transport。窗口置前使用异步恢复，不使用 AttachThreadInput 与播放器共享输入队列。
+- 账号表新增“已用”，已用/剩余均显示容量与占总量百分比；总量未知或为零时百分比为未知。服务容量接口保持整数 bytes，无数据迁移。
+- `install.json` 可附加 `player_uninstall`：原 ARP 键、注册表视图、原始与静默命令及本插件联合命令。只绑定与选定目录匹配的 NSIS 卸载器；原命令在改写注册表前落盘。`Uninstall.exe --uninstall-player` 从临时副本等待原 NSIS 卸载器，确认播放器文件消失后清理插件外部数据。取消不清理；单独卸载恢复仍属于本插件的命令。便携版/未匹配项不登记联动。
 - `files?include_series=1&page=1` 取得的完整视频清单供 `/v1/playlist` 复用；最多 32 个目录、30 秒有效期，仅限当前账号内存，显式完整浏览替换、切换账号清空。普通分页不当作完整清单。`start` 裁剪和自然排序不变，过期/未缓存仍读取远端，不缓存签名地址或预取下一集。
 - 片头片尾 UI 为同一轨道的两个独立时长端点，左端向右增加 intro，右端向左增加 outro；每端默认 0–600 秒，分秒输入可扩展至 3600 秒。轨道不是视频时间轴。键盘左右键微调，空格切换端点；接口、存储、自动跳过优先级不变。
 - `ui_theme` 仅负责共用视觉；`dialogs` 仅负责备注/确认/提示模态窗口，不持有账号或播放数据。Tk/ttk 共用深灰、浅色文字和黄色状态，标题栏使用系统支持的深色属性；文件选择器保留系统外观。安装和独立卸载提示使用同一主题，不依赖账号或服务。

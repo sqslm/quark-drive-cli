@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--potplayer-dir", type=Path, default=None, help="PotPlayer 安装目录（含 Extension）")
     parser.add_argument("--install-dir", type=Path, default=None, help="组件安装目录，默认 PotPlayer\\Plugin\\QuarkPotPlayer")
     parser.add_argument("--clear-credentials", action="store_true", help="卸载时同时清除插件凭证（不影响 CLI 登录）")
-    parser.add_argument("--no-shortcut", action="store_true", help="不创建开始菜单快捷方式")
+    parser.add_argument("--no-shortcut", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no-registry", action="store_true", help="不写入卸载注册表项")
     parser.add_argument("--no-open", action="store_true", help="安装完成后不打开 PotPlayer")
     # Development-only overrides; the packaged installer carries its own payload.
@@ -132,7 +132,7 @@ def options_from(args: argparse.Namespace) -> Options:
     return Options(
         potplayer_dir=potplayer,
         install_dir=install_dir,
-        make_shortcut=not args.no_shortcut,
+        make_shortcut=False,
         registry=not args.no_registry,
         open_player=not args.no_open,
         clear_credentials=args.clear_credentials,
@@ -176,6 +176,10 @@ def do_install(options: Options, payload: Payload, emit: Callable[[str], None]) 
         emit(f"扩展脚本：{item}")
     if record.shortcut:
         emit(f"开始菜单：{record.shortcut}")
+    if options.registry:
+        manifest = core.read_manifest(options.install_dir) or {}
+        emit('已接入 Windows 的 PotPlayer 卸载入口' if manifest.get('player_uninstall')
+             else '未找到匹配的系统卸载入口；便携版请先在插件管理中卸载插件，再删除播放器')
     emit("安装完成" if not record.upgraded else "升级完成")
     return str(potplayer)
 
@@ -251,7 +255,6 @@ class InstallerWindow:
         self.messages: queue.Queue[str] = queue.Queue()
         options = options_from(args)
         self.clear_credentials = BooleanVar(value=args.clear_credentials)
-        self.make_shortcut = BooleanVar(value=options.make_shortcut)
         self.open_player = BooleanVar(value=options.open_player)
         self.potplayer = StringVar(value=str(options.potplayer_dir or ""))
         self.install_dir = StringVar(value=str(options.install_dir))
@@ -272,9 +275,9 @@ class InstallerWindow:
         ttk.Label(frame, text="组件安装目录").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(frame, textvariable=self.install_dir).grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=(6, 0))
 
-        ttk.Checkbutton(frame, text="创建开始菜单快捷方式", variable=self.make_shortcut).grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(6, 0)
-        )
+        ttk.Label(frame, text='插件从 PotPlayer 内打开，不创建额外快捷方式。\n'
+                  '系统安装版会接入卸载联动；需要右键以管理员身份运行安装包。', wraplength=620).grid(
+            row=2, column=0, columnspan=4, sticky='w', pady=(6, 0))
         ttk.Checkbutton(frame, text="安装完成后打开 PotPlayer", variable=self.open_player).grid(
             row=3, column=0, columnspan=2, sticky="w"
         )
@@ -356,7 +359,7 @@ class InstallerWindow:
         return Options(
             potplayer_dir=Path(raw) if raw else None,
             install_dir=Path(self.install_dir.get().strip()),
-            make_shortcut=self.make_shortcut.get(),
+            make_shortcut=False,
             registry=not self.args.no_registry,
             open_player=self.open_player.get(),
             clear_credentials=self.clear_credentials.get(),
