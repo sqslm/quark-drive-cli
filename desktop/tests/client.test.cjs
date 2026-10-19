@@ -33,7 +33,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
       const preferences = { output_dir: 'C:\\Downloads', connections: 4, limit_rate: null, width: 1180, height: 780 };
       window.testCalls = [];
       let appearanceSource='system';
-      let clientSettings={closeBehavior:'tray',notifications:true};
+      let clientSettings={closeBehavior:'tray',notifications:true,shareExpiryMode:'hours'};
       matchMedia('(prefers-color-scheme: dark)').addEventListener('change',event => {if(appearanceSource === 'system') listeners.forEach(listener => listener({id:null,event:'appearance',data:{source:'system',dark:event.matches,warning:''}}));});
       window.quark = {
         readDroppedFiles:async files => {
@@ -52,7 +52,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.27',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.28',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'account.capacity') {
             const data={...(window.testCapacity || {used_bytes:50*1073741824,total_bytes:100*1073741824})};
@@ -395,6 +395,19 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.evaluate(() => {window.testClockMs+=10*3600000;});
     await page.getByText('剩余 710 小时',{exact:true}).waitFor();
     assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'share.list').length),1);
+    await openSettings(page);
+    await page.getByRole('combobox',{name:'分享剩余有效期显示',exact:true}).selectOption('daysHours');
+    await page.locator('.toast.success').getByText('分享有效期显示已保存',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'我的分享',exact:true}).click();
+    await page.getByText('剩余 29 天 14 小时',{exact:true}).waitFor();
+    const modeShareCalls=await page.evaluate(() => window.testCalls.filter(call => call.method === 'share.list').length);
+    await page.evaluate(() => {window.testClockMs+=3600000;});
+    await page.getByText('剩余 29 天 13 小时',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'share.list').length),modeShareCalls);
+    await openSettings(page);
+    await page.getByRole('combobox',{name:'分享剩余有效期显示',exact:true}).selectOption('hours');
+    await page.getByRole('button',{name:'我的分享',exact:true}).click();
+    await page.getByText('剩余 709 小时',{exact:true}).waitFor();
     await page.getByLabel('选择记录 知否 00001.txt',{exact:true}).check();
     await page.getByRole('button',{name:'取消选中分享',exact:true}).click();
     await page.evaluate(() => {window.testHoldRevoke=true;});
@@ -403,7 +416,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.ok(await page.getByRole('button',{name:'处理中…',exact:true}).isDisabled());
     await page.evaluate(() => {window.testHoldRevoke=false;window.releaseRevoke();});
     await page.getByText('知否 00001.txt：已取消分享',{exact:true}).waitFor();
-    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'share.list').length),1);
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'share.list').length),3);
     assert.equal(await page.getByLabel('选择记录 知否 00001.txt',{exact:true}).count(),0);
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     await page.getByRole('button',{name:'回收站',exact:true}).click();
@@ -709,7 +722,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.screenshot({path:path.resolve(__dirname,'../test-results/light-files.png')});
     const originalTasks=await page.evaluate(() => window.testGetTasks());
     await page.evaluate(() => window.testSetTasks([
-      {id:'df',name:'下载失败.txt',direction:'download',state:'failed'},
+      {id:'df',name:'下载失败.txt',direction:'download',state:'failed',detail:'传输失败：测试错误原因'},
       {id:'ds',name:'下载暂停.txt',direction:'download',state:'stopped'},
       {id:'dd',name:'下载成功.txt',direction:'download',state:'done',created_at:Date.UTC(2025,11,31,15,50),started_at:Date.UTC(2025,11,31,15,58),finished_at:Date.UTC(2025,11,31,16,2),elapsed_seconds:121},
       {id:'dc',name:'下载取消.txt',direction:'download',state:'cancelled'},
@@ -729,6 +742,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await page.getByText('下载失败.txt',{exact:true}).count(),0);
     await directions.getByRole('button',{name:/^下载/}).click();
     assert.equal(await page.getByText('下载成功.txt',{exact:true}).count(),0);
+    await page.locator('.task-error').getByText('传输失败：测试错误原因',{exact:true}).waitFor();
     assert.equal(await page.locator('.task-row').first().locator('.task-controls button').count(),3);
     assert.ok(await page.locator('.task-row').filter({hasText:'旧账号下载.txt'}).getByRole('button',{name:'开始',exact:true}).isDisabled());
     assert.equal(await page.locator('.task-row').filter({hasText:'旧账号下载.txt'}).locator('.task-state').textContent(),'失败');
@@ -746,7 +760,9 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await page.locator('.task-row').count(),2);
     const uploadedRecord=page.locator('.task-row').filter({hasText:'上传成功.txt'});
     assert.equal(await uploadedRecord.locator('.task-total').textContent(),'1.6 MiB');
-    assert.equal(await uploadedRecord.locator('.task-name').textContent(),'上传成功.txt');
+    assert.equal(await uploadedRecord.locator('.task-name strong').textContent(),'上传成功.txt');
+    assert.equal(await uploadedRecord.locator('.task-name .task-subline').textContent(),'上传到：/资料/上传成功.txt');
+    await uploadedRecord.getByLabel('累计耗时：1 小时 1 分 1 秒',{exact:true}).waitFor();
     await uploadedRecord.getByLabel('完成时间：2026-10-16 15:42',{exact:true}).waitFor();
     assert.match(await uploadedRecord.locator('.task-record-line').getAttribute('title'),/累计耗时：1 小时 1 分 1 秒\n上传到：\/资料\/上传成功.txt/);
     assert.equal(await uploadedRecord.locator('.task-controls button').count(),2);
@@ -845,9 +861,10 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await directions.getByRole('button',{name:/^下载/}).click();await completion.getByRole('button',{name:/^未完成/}).click();
     const progressRow=name => page.locator('.task-row').filter({hasText:name});
     const activeProgress=progressRow('大文件.bin');
-    assert.deepEqual(await page.locator('.task-header').getByRole('columnheader').allTextContents(),['文件名','下载速度','状态','操作']);
-    assert.equal(await activeProgress.getByRole('cell').count(),4);
+    assert.deepEqual(await page.locator('.task-header').getByRole('columnheader').allTextContents(),['文件名','进度','下载速度','状态','操作']);
+    assert.equal(await activeProgress.getByRole('cell').count(),5);
     assert.equal(await page.locator('.task-list').getByRole('progressbar').count(),0);
+    assert.match(await activeProgress.locator('.task-progress').textContent(),/50%50.0 MB \/ 100.0 MB/);
     await activeProgress.getByLabel('速度 10.0 MB/s',{exact:true}).waitFor();
     await activeProgress.locator('.task-state').getByText('正在下载',{exact:true}).waitFor();
     await progressRow('测试目录').getByText('当前文件：子目录/视频.mkv',{exact:true}).waitFor();
@@ -871,6 +888,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.setViewportSize({width:1180,height:780});
     await page.evaluate(() => {const task=window.testGetTasks().find(task => task.id === 'pd');window.testEmit({id:null,event:'task',data:{...task,state:'stopped',revision:3}});});
     await activeProgress.locator('.task-state').getByText('已暂停',{exact:true}).waitFor();
+    assert.match(await activeProgress.locator('.task-progress').textContent(),/40%40.0 MB \/ 100.0 MB/);
     await activeProgress.getByLabel('速度 —',{exact:true}).waitFor();
     await page.evaluate(() => window.testEmit({id:null,event:'task',data:window.testGetTasks().find(task => task.id === 'pd')}));
     await activeProgress.locator('.task-state').getByText('已暂停',{exact:true}).waitFor();
@@ -990,13 +1008,16 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     await rm(localDropFile);
     await assert.rejects(page.evaluate(() => window.quark.readDroppedFiles([window.realDropFiles[0]])),/无法访问/);
     await page.evaluate(() => document.getElementById('native-drop-test').remove());await dragSession.detach();
-    assert.deepEqual((await page.evaluate(() => window.quark.getClientSettings())).settings,{closeBehavior:'tray',notifications:true});
+    assert.deepEqual((await page.evaluate(() => window.quark.getClientSettings())).settings,{closeBehavior:'tray',notifications:true,shareExpiryMode:'hours'});
     await assert.rejects(page.evaluate(() => window.quark.setClientSettings({closeBehavior:'unknown',notifications:true})),/设置无效/);
+    await page.evaluate(() => window.quark.setClientSettings({closeBehavior:'tray',notifications:true,shareExpiryMode:'daysHours'}));
+    assert.equal(JSON.parse(await readFile(path.join(await app.evaluate(({app}) => app.getPath('userData')),'desktop.json'),'utf8')).shareExpiryMode,'daysHours');
+    await assert.rejects(page.evaluate(() => window.quark.setClientSettings({closeBehavior:'tray',notifications:true,shareExpiryMode:'invalid'})),/设置无效/);
     await app.evaluate(({Tray}) => {
       const original=Tray.prototype.setContextMenu;
       Tray.prototype.setContextMenu=function(menu) {global.testTray=this;global.testTrayMenu=menu;return original.call(this,menu);};
     });
-    await page.evaluate(() => window.quark.setClientSettings({closeBehavior:'tray',notifications:true}));
+    await page.evaluate(() => window.quark.setClientSettings({closeBehavior:'tray',notifications:true,shareExpiryMode:'hours'}));
     assert.ok(await app.evaluate(() => global.testTray && !global.testTray.isDestroyed()));
     const packagedIcon=path.join(path.dirname(executable),'resources/app-icon.ico');
     const iconHeader=await readFile(packagedIcon);
@@ -1022,7 +1043,7 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     await page.locator('.toast.success').getByText('后台运行设置已保存',{exact:true}).waitFor();
     await page.waitForFunction(() => !document.querySelector('[aria-label="传输完成通知"]').disabled);
     const savedDesktop=JSON.parse(await readFile(path.join(await app.evaluate(({app}) => app.getPath('userData')),'desktop.json'),'utf8'));
-    assert.deepEqual(savedDesktop,{closeBehavior:'quit',notifications:false});
+    assert.deepEqual(savedDesktop,{closeBehavior:'quit',notifications:false,shareExpiryMode:'hours'});
     await page.getByRole('button',{name:'我的文件',exact:true}).click();
     const initialAppearance=await page.evaluate(() => window.quark.getAppearance());
     assert.equal(initialAppearance.source,'system');
@@ -1074,7 +1095,7 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     const restarted=await app.firstWindow();
     await restarted.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
     assert.equal((await restarted.evaluate(() => window.quark.getAppearance())).source,'dark');
-    assert.deepEqual((await restarted.evaluate(() => window.quark.getClientSettings())).settings,{closeBehavior:'quit',notifications:false});
+    assert.deepEqual((await restarted.evaluate(() => window.quark.getClientSettings())).settings,{closeBehavior:'quit',notifications:false,shareExpiryMode:'hours'});
     assert.equal(await app.evaluate(({nativeTheme}) => nativeTheme.themeSource),'dark');
     await restarted.waitForFunction(() => document.documentElement.dataset.colorScheme === 'dark');
     assert.equal(await restarted.locator('.titlebar').evaluate(element => getComputedStyle(element).backgroundColor),'rgb(25, 28, 30)');
@@ -1101,14 +1122,14 @@ test('packaged Electron starts its bundled backend with sandbox and no external 
     const brokenSettings=await app.firstWindow();
     await brokenSettings.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
     const defaults=await brokenSettings.evaluate(() => window.quark.getClientSettings());
-    assert.deepEqual(defaults.settings,{closeBehavior:'tray',notifications:true});assert.match(defaults.warning,/无法读取/);
+    assert.deepEqual(defaults.settings,{closeBehavior:'tray',notifications:true,shareExpiryMode:'hours'});assert.match(defaults.warning,/无法读取/);
     assert.equal(await readFile(path.join(userData,'desktop.json'),'utf8'),'{broken');
     await app.close();await rm(path.join(userData,'desktop.json'));await mkdir(path.join(userData,'desktop.json'));
     app=await _electron.launch(launchOptions);
     const readonly=await app.firstWindow();
     await readonly.getByRole('heading',{name:'我的文件',exact:true}).waitFor();
-    const unsavedDesktop=await readonly.evaluate(() => window.quark.setClientSettings({closeBehavior:'quit',notifications:false}));
-    assert.deepEqual(unsavedDesktop.settings,{closeBehavior:'quit',notifications:false});assert.match(unsavedDesktop.warning,/未能保存/);
+    const unsavedDesktop=await readonly.evaluate(() => window.quark.setClientSettings({closeBehavior:'quit',notifications:false,shareExpiryMode:'hours'}));
+    assert.deepEqual(unsavedDesktop.settings,{closeBehavior:'quit',notifications:false,shareExpiryMode:'hours'});assert.match(unsavedDesktop.warning,/未能保存/);
   } finally { await app.close(); await rm(directory, { recursive:true, force:true }); }
 });
 

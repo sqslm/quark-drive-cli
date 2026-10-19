@@ -331,6 +331,58 @@ class RecursiveTests(unittest.TestCase):
             self.recursive.download_tree("remote-root", output, resume=True, scope=self.scope)
         self.assertEqual(len(self.transfer.downloads), count)
 
+    def test_download_missing_completed_tree_can_be_downloaded_again(self):
+        import shutil
+        self.remote_tree()
+        output = self.root / "downloaded"
+        self.recursive.download_tree("remote-root", output, resume=True, scope=self.scope)
+        shutil.rmtree(output)
+        result = self.recursive.download_tree("remote-root", output, resume=True, scope=self.scope)
+        self.assertEqual((result["downloaded_files"], result["skipped_files"]), (2, 0))
+        self.assertEqual((output / "a.txt").read_bytes(), b"one")
+        self.assertTrue((output / "空目录").is_dir())
+        _, ledger = self.state("download", output)
+        self.assertTrue(ledger["completed"])
+
+    def test_download_missing_member_is_retrieved_without_overwriting_kept_files(self):
+        self.remote_tree()
+        output = self.root / "downloaded"
+        self.recursive.download_tree("remote-root", output, resume=True, scope=self.scope)
+        (output / "a.txt").unlink()
+        kept = output / "资料" / "中文 文件.txt"
+        timestamp = kept.stat().st_mtime_ns
+        result = self.recursive.download_tree("remote-root", output, resume=True, scope=self.scope)
+        self.assertEqual((result["downloaded_files"], result["skipped_files"]), (1, 1))
+        self.assertEqual(kept.stat().st_mtime_ns, timestamp)
+        self.assertEqual((output / "a.txt").read_bytes(), b"one")
+
+    def test_missing_member_does_not_allow_changed_existing_member_to_be_overwritten(self):
+        self.remote_tree()
+        output = self.root / "downloaded"
+        self.recursive.download_tree("remote-root", output, resume=True, scope=self.scope)
+        (output / "a.txt").unlink()
+        kept = output / "资料" / "中文 文件.txt"
+        kept.write_bytes(b"local edits")
+        count = len(self.transfer.downloads)
+        with self.assertRaisesRegex(UsageError, "内容变化"):
+            self.recursive.download_tree("remote-root", output, resume=True, scope=self.scope)
+        self.assertEqual(len(self.transfer.downloads), count)
+        self.assertFalse((output / "a.txt").exists())
+        self.assertEqual(kept.read_bytes(), b"local edits")
+
+    def test_missing_completed_tree_still_rejects_changed_remote_identity(self):
+        import shutil
+        self.remote_tree()
+        output = self.root / "downloaded"
+        self.recursive.download_tree("remote-root", output, resume=True, scope=self.scope)
+        shutil.rmtree(output)
+        next(record for record in self.fixture.items if record["fid"] == "remote-a")["updated_at"] = 456
+        count = len(self.transfer.downloads)
+        with self.assertRaises(UsageError):
+            self.recursive.download_tree("remote-root", output, resume=True, scope=self.scope)
+        self.assertEqual(len(self.transfer.downloads), count)
+        self.assertFalse(output.exists())
+
     def test_resume_does_not_adopt_directory_created_after_fixed_tree_preflight(self):
         def stopped(record):
             raise ProcessExit()

@@ -577,11 +577,22 @@ class RecursiveTransfer:
                 self._download_preflight(output, nodes, document, overwrite)
             except OSError:
                 raise LocalIOError("无法预检本地目录下载目标") from None
+            missing = []
             for relative, receipt in document["files"].items():
                 local = output / relative
+                if not local.exists():
+                    missing.append(relative)
+                    continue
                 if not local.is_file() or _hashes(local)["sha256"] != receipt["sha256"]:
-                    raise UsageError("完成下载的本地文件丢失或内容变化")
+                    raise UsageError("完成下载的本地文件内容变化；请更换保存目录，避免覆盖")
                 self._content(receipt["identity"], _hashes(local), boundaries, limiter)
+            # Published members may have been moved/deleted locally. Re-fetch only
+            # those absent members; unfinished single-file checkpoints still verify
+            # their own prefix, and existing changed files are never overwritten.
+            for relative in missing:
+                del document["files"][relative]
+            if missing:
+                document["completed"] = False
             write_json(state_path, document)
             total = sum(node["identity"].get("size", 0) for node in nodes)
             done = sum(receipt["identity"]["size"] for receipt in document["files"].values())

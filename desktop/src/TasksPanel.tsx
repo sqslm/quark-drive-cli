@@ -31,7 +31,7 @@ function TaskRecordInfo({task}:{task:Task}) {
   const size=task.progress ? formatSize(task.progress.total) : task.detail.match(/[：:]\s*(\d+(?:\.\d+)?\s*(?:B|KiB|MiB|GiB|TiB|KB|MB|GB|TB))$/)?.[1] || '—';
   return <>
     <span className="task-cell task-number task-total" role="cell">{size}</span>
-    <span className="task-cell task-record-line" role="cell" aria-label={`完成时间：${recordDate(task.finished_at)}`} title={detail}>{recordDate(task.finished_at)}</span>
+    <div className="task-cell task-record-line" role="cell" title={detail}><span aria-label={`完成时间：${recordDate(task.finished_at)}`}>{recordDate(task.finished_at)}</span><small className="task-subline" aria-label={`累计耗时：${elapsedTime(task.elapsed_seconds)}`}>耗时：{elapsedTime(task.elapsed_seconds)}</small></div>
     <span className="task-cell task-state done" role="cell">已完成</span>
   </>;
 }
@@ -49,7 +49,13 @@ function TransferProgress({task}:{task:Task}) {
     status=finishing ? '正在完成上传…' : preparing || !progress ? '准备中' : ['saving','cleaning'].includes(progress.phase) ? phases[progress.phase] : task.direction === 'upload' ? '正在上传' : '正在下载';
   }
   const detail=task.detail || (progress ? phases[progress.phase] : '') || status;
+  const bytes=progress ? active ? progress.transferred : progress.confirmed : null;
+  const total=progress?.total ?? null;
+  const percent=bytes !== null && total !== null && total > 0 ? `${Math.floor(Math.min(100,Math.max(0,bytes/total*100)))}%` : '—';
+  const amount=progress ? `${formatSize(bytes)} / ${formatSize(total)}` : '';
+
   return <>
+    <div className="task-cell task-number task-progress" role="cell" title={amount}><span>{percent}</span>{amount && <small className="task-subline">{amount}</small>}</div>
     <span className="task-cell task-number task-rate" role="cell" aria-label={`速度 ${rateText}`}>{rateText}</span>
     <span className={'task-cell task-state '+task.state} role="cell" title={detail}>{status}</span>
   </>;
@@ -121,15 +127,17 @@ export function TasksPanel({ tasks,busy,onTasks,onStart,onEnd,onStatus }: {
       <input type="search" className="task-search" aria-label="按文件名筛选传输记录" placeholder="筛选文件名" value={query} onChange={event => {setQuery(event.target.value);if(scroll.current) scroll.current.scrollTop=0;}}/>
     </div>
     <div className="task-list" ref={scroll}>
-      <div className={"task-table "+(completed ? "task-completed" : "task-pending")} role="table" aria-label={`${direction === 'upload' ? '上传' : '下载'}任务`} aria-colcount={completed ? 5 : 4} aria-rowcount={visible.length+1}>
+      <div className={"task-table "+(completed ? "task-completed" : "task-pending")} role="table" aria-label={`${direction === 'upload' ? '上传' : '下载'}任务`} aria-colcount={5} aria-rowcount={visible.length+1}>
         <div className="task-header task-grid" role="row" aria-rowindex={1}>
           <span className="task-name" role="columnheader">文件名</span>
-          {completed ? <><span className="task-number" role="columnheader">大小</span><span role="columnheader">传输时间</span><span role="columnheader">完成状态</span></> : <><span className="task-number" role="columnheader">{direction === 'upload' ? '上传速度' : '下载速度'}</span><span role="columnheader">状态</span></>}
+          {completed ? <><span className="task-number" role="columnheader">大小</span><span role="columnheader">传输时间</span><span role="columnheader">完成状态</span></> : <><span className="task-number" role="columnheader">进度</span><span className="task-number" role="columnheader">{direction === 'upload' ? '上传速度' : '下载速度'}</span><span role="columnheader">状态</span></>}
           <span className="task-controls" role="columnheader">操作</span>
         </div>
         {!visible.length && <div className="empty">{keyword ? '没有匹配的传输记录' : !tasks.length ? '尚无传输任务，请在文件页下载或上传' : `暂无${completed ? '已完成' : '未完成'}的${direction === 'upload' ? '上传' : '下载'}任务`}</div>}
         <div role="rowgroup" style={{height:virtual.getTotalSize(),position:'relative'}}>{virtual.getVirtualItems().map(item => { const task = visible[item.index]; return <div className="task-row virtual-task task-grid" role="row" aria-rowindex={item.index+2} key={task.id} style={{transform:`translateY(${item.start-TASK_HEADER_HEIGHT}px)`}}>
-          <div className="task-name" role="cell"><strong title={`${task.name}\n${task.direction === 'upload' ? '上传到' : '下载到'}：${task.target}`}>{task.name}</strong>{!completed && task.progress?.recursive ? <span className="progress-file" title={task.progress.name}>{task.state === 'running' && !['saving','cleaning'].includes(task.progress.phase) ? `当前文件：${task.progress.name}` : '正在处理目录'}</span> : null}</div>
+          <div className="task-name" role="cell"><strong title={task.name}>{task.name}</strong>
+            <span className={'task-subline'+(task.state === 'failed' ? ' task-error' : '')} title={task.state === 'failed' ? task.detail : task.target}>{task.state === 'failed' ? task.detail || '传输失败，请重试' : !completed && task.progress?.recursive && task.state === 'running' ? `当前文件：${task.progress.name}` : `${task.direction === 'upload' ? '上传到' : '下载到'}：${task.target}`}</span>
+          </div>
           {completed ? <TaskRecordInfo task={task}/> : <TransferProgress task={task}/>}
         <div className="task-controls" role="cell">
           {!completed && <button className="task-icon-button" title={task.needs_authorization ? '重新授权并开始' : task.pausing ? '正在暂停' : task.state === 'running' || (task.state === 'waiting' && task.scheduled) ? '暂停' : '开始'} aria-label={task.needs_authorization ? '重新授权并开始' : task.pausing ? '正在暂停' : task.state === 'running' || (task.state === 'waiting' && task.scheduled) ? '暂停' : '开始'} disabled={commandBusy || task.pausing || task.removing || (!eligible(task) && !task.needs_authorization && task.state !== 'running' && !(task.state === 'waiting' && task.scheduled))} onClick={() => {

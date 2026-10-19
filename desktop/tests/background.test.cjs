@@ -115,7 +115,7 @@ async function runtime(closeBehavior='tray') {
     if(name === './types') return {METHODS:['hello','tasks','download.stop','tasks.retry']};
     if(name === './WebLogin') return {};
     if(name === './Appearance') return {loadAppearance:async () => ({source:'system',warning:''}),appearanceColors:() => ({background:'#fff',title:'#fff',symbol:'#111'})};
-    if(name === './ClientSettings') return {defaultClientSettings:{closeBehavior,notifications:true},loadClientSettings:async () => ({settings:{closeBehavior,notifications:true},warning:''})};
+    if(name === './ClientSettings') return {defaultClientSettings:{closeBehavior,notifications:true,shareExpiryMode:'hours'},loadClientSettings:async () => ({settings:{closeBehavior,notifications:true,shareExpiryMode:'hours'},warning:''})};
     return require(name);
   },process,URL,Response,Map,MAIN_WINDOW_WEBPACK_ENTRY:'http://localhost/',MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY:'preload.js'};
   vm.runInNewContext(await source('main'),context);await tick();await tick();

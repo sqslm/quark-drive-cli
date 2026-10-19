@@ -20,5 +20,14 @@ test('remaining lifetime uses the server deadline and rolls over at hour and exp
   assert.equal(exported.shareExpiry({expired_type:1},expiry).text,'永久');
   assert.equal(exported.shareExpiry({expired_type:3},now).text,'到期时间未知');
   for(const value of [0,-1,Infinity,NaN,'invalid',10**20]) assert.equal(exported.shareExpiry({expired_type:3,expired_at:value},now).text,'到期时间未知');
+  assert.equal(exported.shareExpiry(row,now,'daysHours').text,'剩余 2 天 0 小时');
+  assert.equal(exported.shareExpiry(row,now+1,'daysHours').text,'剩余 1 天 23 小时');
+  assert.equal(exported.shareExpiry(row,expiry-25*hour,'daysHours').text,'剩余 1 天 1 小时');
+  assert.equal(exported.shareExpiry(row,expiry-23*hour,'daysHours').text,'剩余 23 小时');
+  assert.equal(exported.shareExpiry(row,expiry-hour+1,'daysHours').text,'不足 1 小时');
+  assert.equal(exported.shareExpiry(row,expiry,'daysHours').text,'已过期');
+  assert.equal(exported.shareExpiry({expired_type:1},now,'daysHours').text,'永久');
+  assert.equal(exported.shareExpiry({},now,'daysHours').text,'到期时间未知');
+  assert.equal(exported.shareExpiry(row,now,'daysHours').title,exported.shareExpiry(row,now,'hours').title);
   assert.match(exported.shareExpiry(row,now).title,/^到期：/);
 });

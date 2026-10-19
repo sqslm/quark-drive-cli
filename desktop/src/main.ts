@@ -166,7 +166,7 @@ app.whenReady().then(async () => {
     if(!validClientSettings(settings)) throw new Error('后台运行设置无效');
     if(clientSettingsSaving) throw new Error('正在保存设置，请稍后再试');
     clientSettingsSaving=true;
-    clientSettings={closeBehavior:settings.closeBehavior,notifications:settings.notifications};
+    clientSettings={closeBehavior:settings.closeBehavior,notifications:settings.notifications,shareExpiryMode:settings.shareExpiryMode};
     background.notifications=settings.notifications;
     try {await saveClientSettings(clientSettings);clientSettingsWarning='';}
     catch {clientSettingsWarning='后台运行设置已生效，但未能保存；本次窗口内有效';}

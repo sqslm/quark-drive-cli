@@ -50,7 +50,7 @@ function App() {
   const [clientVersion,setClientVersion] = useState('');
   const [appearanceSource,setAppearanceSource] = useState<AppearanceSource>('system');
   const [appearanceSaving,setAppearanceSaving] = useState(false);
-  const [clientSettings,setClientSettings] = useState<ClientSettings>({closeBehavior:'tray',notifications:true});
+  const [clientSettings,setClientSettings] = useState<ClientSettings>({closeBehavior:'tray',notifications:true,shareExpiryMode:'hours'});
   const [clientSettingsSaving,setClientSettingsSaving] = useState(false);
   const [quitting,setQuitting] = useState(false);
   const [dragging,setDragging] = useState(false);
@@ -61,13 +61,13 @@ function App() {
   const [dropBusy,setDropBusy]=useState(false);
   function clearDrag() {dragDepth.current=0;setDragging(false);}
   function cancelDrop() {++dropGeneration.current;setDropUpload(null);clearDrag();}
-  async function changeClientSettings(next:ClientSettings) {
+  async function changeClientSettings(next:ClientSettings,message='后台运行设置已保存') {
     const previous=clientSettings;
     setClientSettings(next);
     setClientSettingsSaving(true);
     try {
       const result=await window.quark.setClientSettings(next);setClientSettings(result.settings);
-      notify(result.warning || '后台运行设置已保存',result.warning ? 'warning' : 'success');
+      notify(result.warning || message,result.warning ? 'warning' : 'success');
     } catch(error) {setClientSettings(previous);notify(error instanceof Error ? error.message : '无法保存后台运行设置','error');}
     finally {setClientSettingsSaving(false);}
   }
@@ -537,12 +537,13 @@ function App() {
         <label>提取码 <small>可手工修改</small><input aria-label="提取码" value={passcode} onChange={event => { codeRevision.current++; setPasscode(event.target.value); }} /></label><button className="primary" disabled={loading} onClick={() => void openShare()}>打开分享</button>
         <p className="note">浏览不会转存。分享下载使用临时目录，下载结束、失败或停止后清理。</p></section>}
       {page === 'tasks' && <TasksPanel tasks={tasks} busy={transferring} onTasks={acceptTasks} onStart={() => setTransferring(true)} onEnd={() => setTransferring(false)} onStatus={notify}/>}
-      {(page === 'shares' || page === 'recycle') && (signedIn ? <CatalogPanel key={`${page}-${accountRevision}`} mode={page === 'shares' ? 'shares' : 'recycle'} busy={transferring || loggingIn} onStatus={notify}/> : <div className="empty">请先登录账号</div>)}
+      {(page === 'shares' || page === 'recycle') && (signedIn ? <CatalogPanel key={`${page}-${accountRevision}`} mode={page === 'shares' ? 'shares' : 'recycle'} expiryMode={clientSettings.shareExpiryMode} busy={transferring || loggingIn} onStatus={notify}/> : <div className="empty">请先登录账号</div>)}
       {page === 'settings' && <section className="form-section settings-section"><h2>外观</h2><p className="section-description">选择适合你的主题，让浏览更舒服。</p><div className="theme-options" role="group" aria-label="外观主题">{([['system','跟随系统'],['light','浅色'],['dark','暗色']] as [AppearanceSource,string][]).map(([source,label]) => <label className={'theme-option'+(appearanceSource === source ? ' chosen' : '')} key={source}><span className={'theme-preview '+source} aria-hidden="true"><i/><span><b/><b/><b/></span></span><span className="theme-option-label"><input type="radio" name="appearance" value={source} checked={appearanceSource === source} disabled={appearanceSaving} onChange={() => void changeAppearance(source)}/>{label}</span></label>)}</div><p className="note">立即生效并自动保存。跟随系统会自动响应 Windows 主题变化。</p><div className="settings-divider"/><h2>下载设置</h2>
         <div className="transfer-settings"><div className="transfer-setting"><div><label htmlFor="thread-value">线程数</label><p>单文件并发连接，默认 4</p></div><input id="thread-value" aria-label="线程数" type="number" min="1" max="16" step="1" disabled={transferring} value={threads} onChange={event => setThreads(event.target.value)}/><div className="setting-slider"><span>1</span><input aria-label="拖动调整线程数" type="range" min="1" max="16" step="1" disabled={transferring} value={Math.min(16,Math.max(1,Number(threads) || 1))} style={{'--range-fill':`${(Math.min(16,Math.max(1,Number(threads) || 1))-1)/15*100}%`} as React.CSSProperties} onChange={event => setThreads(event.target.value)}/><span>16</span></div></div>
         <div className="transfer-setting"><div><label htmlFor="rate-value">总限速</label><p>MiB/s，0 表示不限速</p></div><input id="rate-value" aria-label="总限速" type="number" min="0" max="10240" step="0.01" disabled={transferring} value={rate} onChange={event => setRate(event.target.value)} title="滑块范围 0–100，输入框支持 0.01–10240 MiB/s"/><div className="setting-slider"><span>0</span><input aria-label="拖动调整总限速" type="range" min="0" max="100" step="0.01" disabled={transferring} value={Math.min(100,Math.max(0,Number(rate) || 0))} style={{'--range-fill':`${Math.min(100,Math.max(0,Number(rate) || 0))}%`} as React.CSSProperties} onChange={event => setRate(event.target.value)}/><span>100</span></div></div></div>
         <label>保存目录<input value={preferences.output_dir} readOnly /></label><button disabled={transferring} onClick={() => void action(async () => { const folder = await window.quark.chooseFolder(); if (folder) await saveSettings(folder); })}>选择目录</button>
         <button className="primary" disabled={transferring} onClick={() => void saveSettings()}>保存设置</button><p className="note">上传和下载队列逐项执行，线程数作用于单个下载文件。限速对上传和下载均生效，实际速度受账号与服务端限制。限速滑块为 0–100，输入框可填写更高值。</p>
+        <div className="settings-divider"/><h2>分享链接</h2><label>剩余有效期显示<select aria-label="分享剩余有效期显示" value={clientSettings.shareExpiryMode} disabled={clientSettingsSaving} onChange={event => void changeClientSettings({...clientSettings,shareExpiryMode:event.target.value as ClientSettings['shareExpiryMode']},'分享有效期显示已保存')}><option value="hours">按小时，例如剩余 50 小时</option><option value="daysHours">按天加小时，例如剩余 2 天 2 小时</option></select></label><p className="note">即时生效并自动保存，剩余时间随时钟更新；永久链接不受影响。</p>
         <div className="settings-divider"/><h2>后台运行</h2><div className="desktop-options"><label>关闭窗口时<select aria-label="关闭窗口行为" value={clientSettings.closeBehavior} disabled={clientSettingsSaving} onChange={event => void changeClientSettings({...clientSettings,closeBehavior:event.target.value as ClientSettings['closeBehavior']})}><option value="tray">最小化到托盘，继续传输</option><option value="quit">安全退出客户端</option></select></label><label className="notification-option"><input aria-label="传输完成通知" type="checkbox" checked={clientSettings.notifications} disabled={clientSettingsSaving} onChange={event => void changeClientSettings({...clientSettings,notifications:event.target.checked})}/>传输完成时显示系统通知</label></div><p className="note">即时生效并自动保存。托盘可打开窗口、暂停或继续任务；退出会等待当前操作结束并保存进度。</p><button onClick={() => void action(() => window.quark.quit())}>退出客户端</button></section>}
       <div className="status" role="status">{status}</div>
     </main>

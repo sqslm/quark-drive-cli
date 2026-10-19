@@ -576,6 +576,32 @@ class DriveBackendTests(unittest.TestCase):
         self.assertEqual(ledger["phase"], "completed")
         self.assertEqual(self._local_parts(), [])
 
+    def test_deleted_completed_directory_download_restarts_real_file_checkpoints(self):
+        import shutil
+        payload = b"offline directory download"
+        media = MediaFixture(payload, fid="remote-file", name="test.txt")
+        drive = DriveFixture([
+            item("remote-root", "下载源", "0", directory=True),
+            item("remote-empty", "空目录", "remote-root", directory=True),
+            item("remote-file", "test.txt", "remote-root", size=len(payload), updated_at=123,
+                 md5=hashlib.md5(payload).hexdigest()),
+        ])
+        def handler(request):
+            if request.url.host == "cdn.quark.cn" or request.url.path.endswith("/file/download"):
+                return media.handler(request)
+            return drive.handler(request)
+        target = self.output / "下载源"
+        request = self._request("remote-root", target, recursive=True, name="下载源")
+        for attempt in range(2):
+            result = DriveBackend(lambda: COOKIE, transport=httpx.MockTransport(handler)).download(request, None)
+            self.assertEqual(result["downloaded_files"], 1)
+            self.assertEqual((target / "test.txt").read_bytes(), payload)
+            self.assertTrue((target / "空目录").is_dir())
+            if attempt == 0:
+                shutil.rmtree(target)
+        self.assertEqual(len(media.body_requests), 2)
+        self.assertTrue(all('cookie' not in req.headers for req in media.body_requests))
+
     def test_a_directory_request_uses_the_recursive_download_path(self):
         payload = "公开测试".encode()
         fixture = DriveFixture(

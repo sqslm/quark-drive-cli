@@ -2,10 +2,11 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { shareText } from './SharingDialog';
 import { Feedback } from './Feedback';
+import { ClientSettings } from './types';
 import { shareExpiry } from './shareExpiry';
 
 type Row = {share_id?:string;record_id?:string;title?:string;name?:string;share_url?:string;expired_type?:number;expired_at?:number;directory?:boolean;size?:number;parent?:string;deleted_at?:number};
-export function CatalogPanel({mode,busy,onStatus}: {mode:'shares'|'recycle';busy:boolean;onStatus:Feedback}) {
+export function CatalogPanel({mode,busy,onStatus,expiryMode}: {mode:'shares'|'recycle';busy:boolean;onStatus:Feedback;expiryMode:ClientSettings['shareExpiryMode']}) {
   const [rows,setRows] = useState<Row[]>([]);
   const [selected,setSelected] = useState<Set<string>>(new Set());
   const [loading,setLoading] = useState(false);
@@ -72,7 +73,7 @@ export function CatalogPanel({mode,busy,onStatus}: {mode:'shares'|'recycle';busy
     <div className="catalog-list" ref={scroll}>{!rows.length && <div className="empty">{loading ? '正在读取…' : error ? '读取失败，请刷新重试' : mode === 'shares' ? '暂无本人分享' : '回收站为空'}</div>}<div style={{height:virtual.getTotalSize(),position:'relative'}}>{virtual.getVirtualItems().map(item => {const row = rows[item.index];return <div className="catalog-row" key={key(row)} style={{transform:`translateY(${item.start}px)`}}>
       <input type="checkbox" disabled={loading || !ready} aria-label={`选择记录 ${row.title || row.name}`} checked={selected.has(key(row))} onChange={() => setSelected(old => {const next = new Set(old);next.has(key(row)) ? next.delete(key(row)) : next.add(key(row));return next;})}/>
       <div><strong>{row.title || row.name || row.share_id}</strong><p title={row.share_url || row.parent}>{mode === 'shares' ? row.share_url || '复制时读取链接' : row.parent ? `原目录 FID：${row.parent}` : '原目录信息不可用'}</p></div>
-      <span title={mode === 'shares' ? shareExpiry(row,now).title : undefined}>{mode === 'shares' ? shareExpiry(row,now).text : row.directory ? '目录' : `${row.size ?? '—'} B`}</span>
+      <span title={mode === 'shares' ? shareExpiry(row,now,expiryMode).title : undefined}>{mode === 'shares' ? shareExpiry(row,now,expiryMode).text : row.directory ? '目录' : `${row.size ?? '—'} B`}</span>
       {mode === 'shares' ? <button disabled={loading} onClick={() => void copy(row)}>复制分享文案</button> : <span>已删除</span>}</div>;})}</div></div>
     {confirm && <div className="modal-backdrop"><section className="modal file-modal" role="dialog" aria-modal="true" aria-label={title}><h2>{title}</h2>
       {loading && stage && <p className="catalog-progress" aria-live="polite">{stage}</p>}
