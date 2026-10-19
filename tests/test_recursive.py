@@ -282,6 +282,14 @@ class RecursiveTests(unittest.TestCase):
         self.assertEqual(events[-1].total, result["size"])
         self.assertEqual(events[-1].name, "资料/中文 文件.txt")
 
+    def test_download_account_root_uses_the_synthetic_root_identity(self):
+        self.fixture.items=[item('root-file','root.txt',size=3,updated_at=123,md5=hashlib.md5(b'one').hexdigest())]
+        self.fixture.payloads['root-file']=b'one'
+        output=self.root/'root-download'
+        self.recursive.download_tree('0',output,resume=True)
+        self.assertEqual((output/'root.txt').read_bytes(),b'one')
+        self.assertFalse(any(request.url.path.endswith('/file/info') and request.url.params.get('fid')=='0' for request in self.fixture.calls))
+
     def test_download_contents_to_output_and_empty_directories(self):
         self.remote_tree()
         output = self.root / "downloaded"

@@ -491,17 +491,21 @@ class RecursiveTransfer:
             return {"uploaded": True, "recursive": True, "resumed": bool(resume), "destination_fid": document["directories"][""]["fid"], "files": preview["files"], "directories": preview["directories"], "size": total, "uploaded_files": saved, "skipped_files": preview["files"] - saved, "callback_warning": any(receipt["callback_warning"] for receipt in document["files"].values())}
 
     def _download_tree(self, fid, boundaries):
-        root = self.paths.resolve(fid, directory=True)
-        root_path = self.paths.absolute_path(root.fid)
         nodes = []
-        for record in self.paths.walk(root.fid, depth=None):
+        root_path = None
+        for record in self.paths.walk(fid, depth=None):
             boundaries.check(record["fid"])
             absolute = record["path"]
+            if record["depth"] == 0:
+                fid, root_path = record["fid"], absolute
             relative = "" if record["depth"] == 0 else absolute[len(root_path.rstrip("/")) + 1:]
             if relative:
                 for component in relative.split("/"):
                     local_name(component)
-            actual = self.paths.ancestry(record["fid"])[0].item or self.paths.root().item
+            # walk validates every parent edge and anchors the root ancestry.
+            # Read each member's exact identity once, rather than re-listing its
+            # entire ancestor chain for every sibling. Scope checks remain fresh.
+            actual = self.paths.root().item if record["fid"] == "0" else self.files.info(record["fid"])
             identity = _remote_identity(actual, root=record["depth"] == 0)
             if _remote_identity(record, root=record["depth"] == 0) != identity:
                 raise UsageError("远端目录列表与精确详情身份不一致")
@@ -512,7 +516,7 @@ class RecursiveTransfer:
             siblings.setdefault(parent, []).append(node["path"].rsplit("/", 1)[-1])
         for names in siblings.values():
             _names(names)
-        return root.fid, nodes
+        return fid, nodes
 
     @staticmethod
     def _download_preflight(output, nodes, document, overwrite):

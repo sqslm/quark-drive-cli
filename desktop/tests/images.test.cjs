@@ -48,7 +48,7 @@ test('cloud previews load visible images, zoom and retry; text refreshes safely 
       window.imageCalls=[];window.imageActive=0;window.imageMax=0;window.failPreview=false;window.textVersion=1;window.textCalls=[];window.saves=[];window.savedTexts={};window.editSession=0;
       const listeners=[];window.navigateTasks=() => listeners.forEach(callback => callback({event:'navigate',data:'tasks'}));
       window.quark={setEditorDirty:async dirty => {window.editorDirty=dirty;},copyText:async text => {window.copiedPreview=text;},onEvent:callback => {listeners.push(callback);return () => {};},getAppearance:async () => ({source:'light',dark:false,warning:''}),getClientSettings:async () => ({settings:{closeBehavior:'tray',notifications:false,shareExpiryMode:'hours'},warning:''}),call:async (method,params={}) => {
-        if(method==='hello') return {protocol:1,client_version:'0.5.28',signed_in:true,preferences,extension_groups:{}};
+        if(method==='hello') return {protocol:1,client_version:'0.5.29',signed_in:true,preferences,extension_groups:{}};
         if(method==='account') return {nickname:'图片测试',logged_in:true};
         if(method==='browse') return window.showTextRows ? textRows : rows;
         if(method==='tasks' || method==='favorites.list') return [];

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import httpx
@@ -46,6 +47,42 @@ class CutTests(unittest.TestCase):
         self.assertEqual(drive.records['copy-a-2']['pdir_fid'],'target2')
         self.assertEqual(drive.records['a']['pdir_fid'],'0')
         self.assertEqual(len(drive.writes),2)
+
+    def test_copy_waits_for_destination_index_without_repeating_the_write(self):
+        drive=Drive([item('a','A.txt',size=3),item('target','Target',directory=True)])
+        transport=drive.transport(); reads=[]
+        def handle(request):
+            if drive.writes and request.url.path.endswith('file/sort') and request.url.params.get('pdir_fid')=='target':
+                reads.append(request)
+                if len(reads)==1:
+                    return httpx.Response(200,json={'status':200,'code':0,'data':{'list':[],'_total':0}})
+            return transport.handle_request(request)
+        drive.transport=lambda:httpx.MockTransport(handle)
+        service=self.service(drive)
+        clipboard=self.call(service,'file.copy',{'entries':[entry('a','A.txt',size=3)]})
+        result=self.call(service,'file.paste',{'id':clipboard['id'],'target':'target'})
+        self.assertEqual(result['results'][0]['state'],'done')
+        self.assertFalse(result['clipboard']['blocked'])
+        self.assertEqual(len(drive.writes),1)
+        self.assertEqual(len(reads),2)
+
+    def test_copy_index_never_appears_stays_unknown_and_is_not_replayed(self):
+        drive=Drive([item('a','A.txt',size=3),item('target','Target',directory=True)])
+        transport=drive.transport(); reads=[]
+        def handle(request):
+            if drive.writes and request.url.path.endswith('file/sort') and request.url.params.get('pdir_fid')=='target':
+                reads.append(request)
+                return httpx.Response(200,json={'status':200,'code':0,'data':{'list':[],'_total':0}})
+            return transport.handle_request(request)
+        drive.transport=lambda:httpx.MockTransport(handle)
+        service=self.service(drive)
+        clipboard=self.call(service,'file.copy',{'entries':[entry('a','A.txt',size=3)]})
+        with patch('quark_cli.desktop.file_operations.time.sleep'):
+            result=self.call(service,'file.paste',{'id':clipboard['id'],'target':'target'})
+        self.assertEqual(result['results'][0]['state'],'unknown')
+        self.assertTrue(result['clipboard']['blocked'])
+        self.assertEqual(len(drive.writes),1)
+        self.assertEqual(len(reads),4)
 
     def test_copy_rejects_stale_account_share_same_folder_and_descendant(self):
         for case in ('account','share','id','same','descendant','stale'):

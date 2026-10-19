@@ -775,6 +775,8 @@ class DesktopService:
                 task["revision"] += 1
                 self.persist_tasks()
                 self.task_event(task)
+                if task['direction'] == 'upload' and task['state'] == 'done':
+                    self.event(None, 'files.changed', {})
         finally:
             with self.lock:
                 self.active_id = None

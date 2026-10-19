@@ -1,5 +1,7 @@
 """Small desktop adapters around existing verified file operations."""
 
+import time
+
 from ..errors import RemoteError, UsageError
 from ..files import Files
 from ..paths import RemotePaths, is_directory, valid_fid, validate_name
@@ -230,9 +232,18 @@ class FileOperations:
 
     def _confirm_copies(self, candidates, target, results, previous_ids):
         try:
-            copied = {}
-            for row in self.paths.children(target):
-                copied.setdefault(row['file_name'], []).append(row)
+            # A successful task can precede the destination index update.
+            # Only absent names trigger bounded read-only refreshes. Conflicts,
+            # malformed data or throttling are not retried, nor is the copy POST.
+            for attempt in range(4):
+                if attempt:
+                    time.sleep((.15, .3, .6)[attempt-1])
+                    self.reset()
+                copied = {}
+                for row in self.paths.children(target):
+                    copied.setdefault(row['file_name'], []).append(row)
+                if all(copied.get(actual['file_name']) for _, actual in candidates):
+                    break
         except Exception as error:
             for index, _ in candidates:
                 results[index].update(state='unknown', detail=describe_error(error,'复制结果核验')+'；未重发，请刷新核实')

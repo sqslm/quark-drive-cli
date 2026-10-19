@@ -576,6 +576,26 @@ class DriveBackendTests(unittest.TestCase):
         self.assertEqual(ledger["phase"], "completed")
         self.assertEqual(self._local_parts(), [])
 
+    def test_directory_preparation_does_not_repeat_every_ancestor_listing(self):
+        from quark_cli.request_guard import RequestGuard
+        records=[item('root','Root',directory=True),item('sub','Sub','root',directory=True)]
+        records += [item('f'+str(n),str(n)+'.txt','sub',size=1,updated_at=123) for n in range(30)]
+        fixture=DriveFixture(records);clock=[0.0];first=[]
+        stub=StubTransfer({'f'+str(n):b'x' for n in range(30)})
+        original=stub.download
+        def download(fid,path,**options):
+            if not first:first.append((len(fixture.calls),clock[0]))
+            return original(fid,path,**options)
+        stub.download=download
+        backend=DriveBackend(lambda:COOKIE,transport=fixture.transport())
+        sleep=lambda delay:clock.__setitem__(0,clock[0]+delay)
+        backend._guard=RequestGuard.memory(pacing=.5,clock=lambda:clock[0],sleep=sleep)
+        backend._operation_guard=RequestGuard.memory(pacing=.1,clock=lambda:clock[0],sleep=sleep)
+        with patch.object(worker_module,'Transfer',lambda client:stub):
+            backend.download(self._request('root',self.output/'Root',recursive=True,name='Root'),None)
+        self.assertLessEqual(first[0][0],45)
+        self.assertLessEqual(first[0][1],5)
+
     def test_deleted_completed_directory_download_restarts_real_file_checkpoints(self):
         import shutil
         payload = b"offline directory download"

@@ -228,6 +228,7 @@ class QueueTests(unittest.TestCase):
         self.assertLessEqual(reports[-1]['created_at'],reports[-1]['started_at'])
         self.assertLessEqual(reports[-1]['started_at'],reports[-1]['finished_at'])
         self.assertGreaterEqual(reports[-1]['elapsed_seconds'],0)
+        self.assertEqual(len([message for message in self.messages if message.get("event") == "files.changed"]),1)
 
     def test_append_during_download_remains_sequential_and_durable(self):
         self.queue("a")

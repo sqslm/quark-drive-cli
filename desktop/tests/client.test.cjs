@@ -52,7 +52,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.28',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.29',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'account.capacity') {
             const data={...(window.testCapacity || {used_bytes:50*1073741824,total_bytes:100*1073741824})};
@@ -125,6 +125,8 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
       };
       window.testEmit=event => listeners.forEach(listener => listener(event));
       window.testGetTasks=() => tasks.map(task => ({...task}));
+      window.testAddFile=row=>rows.push(row);
+      window.testAddShare=row=>shares.push(row);
       window.testSetRecycle=next => {recycle=next;};
       window.testSetFavorites=next => {favorites=next;};
       window.testSetTasks=next => {tasks=next;listeners.forEach(listener => listener({id:null,event:'tasks.changed',data:tasks}));};
@@ -304,6 +306,24 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await copyDialog.getByText('知否 00003.txt：已复制到目标目录，源项目保留',{exact:true}).waitFor();
     await copyDialog.getByRole('button',{name:'关闭',exact:true}).click();
     await page.locator('.file-row').getByRole('button',{name:'知否 00003.txt',exact:true}).waitFor();
+    await page.getByLabel('选择 知否 00003.txt',{exact:true}).check();
+    const refreshBrowseBefore=await page.evaluate(()=>window.testCalls.filter(row=>row.method==='browse').length);
+    await page.evaluate(()=>{
+      window.testAddFile({fid:'auto-upload',name:'刚上传.txt',directory:false,size:4,path:'',location:[],parent:'new'});
+      for(let n=0;n<3;n++) window.testEmit({id:null,event:'files.changed',data:{}});
+    });
+    await page.locator('.file-row').getByRole('button',{name:'刚上传.txt',exact:true}).waitFor();
+    assert.equal(await page.getByLabel('选择 知否 00003.txt',{exact:true}).isChecked(),true);
+    assert.equal(await page.locator('.list-loading').count(),0);
+    assert.equal(await page.evaluate(()=>window.testCalls.filter(row=>row.method==='browse').length),refreshBrowseBefore+1);
+    await page.evaluate(()=>{window.testHoldBrowse=true;window.testEmit({id:null,event:'files.changed',data:{}});});
+    await page.waitForFunction(before=>window.testCalls.filter(row=>row.method==='browse').length===before+2,refreshBrowseBefore);
+    await page.getByRole('button',{name:/^传输任务/}).click();
+    await page.evaluate(()=>{window.testAddFile({fid:'auto-later',name:'后台上传.txt',directory:false,size:5,path:'',location:[],parent:'new'});window.testHoldBrowse=false;window.releaseBrowse();});
+    await page.getByRole('heading',{name:'传输任务',exact:true}).waitFor();
+    await page.getByRole('button',{name:'我的文件',exact:true}).click();
+    await page.locator('.file-row').getByRole('button',{name:'后台上传.txt',exact:true}).waitFor();
+    await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'新建测试',exact:true}).waitFor();
     await page.getByRole('button',{name:'取消复制',exact:true}).click();
     await page.getByRole('navigation',{name:'文件路径'}).getByRole('button',{name:'我的网盘',exact:true}).click();
     await page.locator('.file-row').getByRole('button',{name:'知否 00003.txt',exact:true}).waitFor();
@@ -408,16 +428,25 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.getByRole('combobox',{name:'分享剩余有效期显示',exact:true}).selectOption('hours');
     await page.getByRole('button',{name:'我的分享',exact:true}).click();
     await page.getByText('剩余 709 小时',{exact:true}).waitFor();
-    await page.getByLabel('选择记录 知否 00001.txt',{exact:true}).check();
-    await page.getByRole('button',{name:'取消选中分享',exact:true}).click();
+    await page.evaluate(()=>window.testAddShare({share_id:'keep-share',pwd_id:'keep-public',title:'保留的分享',share_url:'https://pan.quark.cn/s/keep-public',expired_type:1}));
+    await page.getByRole('button',{name:'刷新',exact:true}).click();
+    await page.getByLabel('选择记录 保留的分享',{exact:true}).check();
+    await page.locator('.catalog-row').filter({hasText:'知否 00001.txt'}).getByRole('button',{name:'取消此分享',exact:true}).click();
+    await page.getByRole('dialog',{name:'取消此分享',exact:true}).getByText('已选择 1 项：知否 00001.txt',{exact:true}).waitFor();
     await page.evaluate(() => {window.testHoldRevoke=true;});
     await page.getByRole('button',{name:'确认',exact:true}).click();
     await page.locator('.catalog-progress').getByText('正在批量取消 1 个分享…',{exact:true}).waitFor();
     assert.ok(await page.getByRole('button',{name:'处理中…',exact:true}).isDisabled());
     await page.evaluate(() => {window.testHoldRevoke=false;window.releaseRevoke();});
     await page.getByText('知否 00001.txt：已取消分享',{exact:true}).waitFor();
-    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'share.list').length),3);
+    assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.method === 'share.list').length),4);
     assert.equal(await page.getByLabel('选择记录 知否 00001.txt',{exact:true}).count(),0);
+    await page.getByRole('button',{name:'关闭',exact:true}).click();
+    assert.deepEqual(await page.evaluate(()=>window.testCalls.filter(row=>row.method==='share.revoke').at(-1).params.entries.map(row=>row.share_id)),['own-new']);
+    assert.equal(await page.getByLabel('选择记录 保留的分享',{exact:true}).isChecked(),true);
+    await page.getByRole('button',{name:'取消选中分享',exact:true}).click();
+    await page.getByRole('button',{name:'确认',exact:true}).click();
+    await page.getByText('保留的分享：已取消分享',{exact:true}).waitFor();
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     await page.getByRole('button',{name:'回收站',exact:true}).click();
     await page.getByLabel('选择记录 测试删除.txt',{exact:true}).check();

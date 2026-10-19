@@ -409,7 +409,7 @@ class DriveBackend:
             options["progress"] = progress
         if should_stop is not None:
             options["should_stop"] = should_stop
-        with self._client() as client:
+        with self._client(interactive=True) as client:
             if request.share_source is not None:
                 # A share item is not an account FID: it cannot be handed to the
                 # account download or the transfer library directly, and its

@@ -13,6 +13,7 @@ export function CatalogPanel({mode,busy,onStatus,expiryMode}: {mode:'shares'|'re
   const [error,setError] = useState('');
   const [ready,setReady] = useState(false);
   const [confirm,setConfirm] = useState<'revoke'|'restore'|'remove'|null>(null);
+  const [single,setSingle] = useState<Row|null>(null);
   const [confirmed,setConfirmed] = useState(false);
   const [results,setResults] = useState<{record_id?:string;share_id?:string;name:string;detail:string;state:string}[]|null>(null);
   const [stage,setStage] = useState('');
@@ -22,6 +23,7 @@ export function CatalogPanel({mode,busy,onStatus,expiryMode}: {mode:'shares'|'re
   const key = (row:Row) => String(mode === 'shares' ? row.share_id : row.record_id);
   const virtual = useVirtualizer({count:rows.length,getScrollElement:()=>scroll.current,estimateSize:()=>76,overscan:8});
   const picked = rows.filter(row => selected.has(key(row)));
+  const targets=single ? [single] : picked;
   async function refresh() {
     const id = ++generation.current;setLoading(true);setReady(false);setError('');
     try {
@@ -41,10 +43,10 @@ export function CatalogPanel({mode,busy,onStatus,expiryMode}: {mode:'shares'|'re
   async function submit() {
     setLoading(true);setError('');
     const id=crypto.randomUUID();
-    setStage(`正在核验 ${picked.length} 个选中项目…`);
+    setStage(`正在核验 ${targets.length} 个选中项目…`);
     const off=window.quark.onEvent(event => {if(event.id === id && ['recycle.progress','share.progress'].includes(event.event)) setStage(String(event.data));});
     try {
-      const response = await window.quark.call(confirm === 'revoke' ? 'share.revoke' : confirm === 'restore' ? 'recycle.restore' : 'recycle.remove',{entries:picked},id);
+      const response = await window.quark.call(confirm === 'revoke' ? 'share.revoke' : confirm === 'restore' ? 'recycle.restore' : 'recycle.remove',{entries:targets},id);
       setResults(response);
       const done=new Set<string>(response.filter((row:{state:string}) => row.state === 'done').map((row:Row) => key(row)));
       setRows(old => old.filter(row => !done.has(key(row))));
@@ -63,8 +65,8 @@ export function CatalogPanel({mode,busy,onStatus,expiryMode}: {mode:'shares'|'re
     finally {setLoading(false);}
   }
   const disabled = busy || loading || !ready || !picked.length;
-  function open(operation:'revoke'|'restore'|'remove') {setConfirm(operation);setResults(null);setConfirmed(false);}
-  const title = confirm === 'revoke' ? '取消选中分享' : confirm === 'restore' ? '恢复选中记录' : '永久删除选中记录';
+  function open(operation:'revoke'|'restore'|'remove',row:Row|null=null) {setSingle(row);setConfirm(operation);setResults(null);setConfirmed(false);}
+  const title = confirm === 'revoke' ? single ? '取消此分享' : '取消选中分享' : confirm === 'restore' ? '恢复选中记录' : '永久删除选中记录';
   return <><div className="toolbar"><button disabled={loading} onClick={() => void refresh()}>刷新</button>
     {mode === 'shares' ? <button disabled={disabled} onClick={() => open('revoke')}>取消选中分享</button> : <><button disabled={disabled} onClick={() => open('restore')}>恢复选中记录</button><button disabled={disabled} onClick={() => open('remove')}>永久删除选中记录</button></>}
     <span className="catalog-count">{rows.length} 项 · 已选 {picked.length} 项</span></div>
@@ -74,10 +76,10 @@ export function CatalogPanel({mode,busy,onStatus,expiryMode}: {mode:'shares'|'re
       <input type="checkbox" disabled={loading || !ready} aria-label={`选择记录 ${row.title || row.name}`} checked={selected.has(key(row))} onChange={() => setSelected(old => {const next = new Set(old);next.has(key(row)) ? next.delete(key(row)) : next.add(key(row));return next;})}/>
       <div><strong>{row.title || row.name || row.share_id}</strong><p title={row.share_url || row.parent}>{mode === 'shares' ? row.share_url || '复制时读取链接' : row.parent ? `原目录 FID：${row.parent}` : '原目录信息不可用'}</p></div>
       <span title={mode === 'shares' ? shareExpiry(row,now,expiryMode).title : undefined}>{mode === 'shares' ? shareExpiry(row,now,expiryMode).text : row.directory ? '目录' : `${row.size ?? '—'} B`}</span>
-      {mode === 'shares' ? <button disabled={loading} onClick={() => void copy(row)}>复制分享文案</button> : <span>已删除</span>}</div>;})}</div></div>
+      {mode === 'shares' ? <div className="share-row-actions"><button disabled={loading} onClick={() => void copy(row)}>复制分享文案</button><button className="share-trash" disabled={busy || loading || !ready} aria-label="取消此分享" title={`取消分享：${row.title || row.name || row.share_id}`} onClick={() => open('revoke',row)}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 10v7M14 10v7"/></svg></button></div> : <span>已删除</span>}</div>;})}</div></div>
     {confirm && <div className="modal-backdrop"><section className="modal file-modal" role="dialog" aria-modal="true" aria-label={title}><h2>{title}</h2>
       {loading && stage && <p className="catalog-progress" aria-live="polite">{stage}</p>}
-      {!results && <><p>已选择 {picked.length} 项：{picked.map(row => row.title || row.name).join('、')}</p><p>{confirm === 'remove' ? '这些记录将永久删除，无法从回收站恢复。' : confirm === 'restore' ? '恢复到原目录，同名冲突不覆盖。' : '选中链接将失效，网盘文件保留。'}</p>
+      {!results && <><p>已选择 {targets.length} 项：{targets.map(row => row.title || row.name).join('、')}</p><p>{confirm === 'remove' ? '这些记录将永久删除，无法从回收站恢复。' : confirm === 'restore' ? '恢复到原目录，同名冲突不覆盖。' : '选中链接将失效，网盘文件保留。'}</p>
         {confirm === 'remove' && <label className="confirm-checkbox"><input type="checkbox" disabled={loading} checked={confirmed} onChange={event => setConfirmed(event.target.checked)}/>我确认永久删除这些记录</label>}</>}
       {results && <div className="operation-results">{results.map((row,index) => <p className={row.state !== 'done' ? 'error' : ''} key={index}>{row.name}：{row.detail}</p>)}</div>}
       {error && <p className="error" role="alert">{error}</p>}

@@ -130,6 +130,9 @@ function App() {
   const [accountRevision,setAccountRevision] = useState(0);
   const [context,setContext] = useState<{ row:Entry|null; x:number; y:number } | null>(null);
   const view = useRef(0);
+  const [directoryChanges,setDirectoryChanges]=useState(0);
+  const directoryDirty=useRef(false);
+  function refreshDirectory() {directoryDirty.current=true;setDirectoryChanges(value=>value+1);}
   const searchId = useRef<string | null>(null);
   const loginId = useRef<string | null>(null);
   const profileGeneration = useRef(0);
@@ -195,7 +198,7 @@ function App() {
     void action(() => call('search.cancel'));
   }
   async function browse(chain: [string, string][] = trail) {
-    cancelSearch(); const generation = ++view.current; setLoading(true); setSearchView(false); setChecked(new Set());
+    directoryDirty.current=false;cancelSearch(); const generation = ++view.current; setLoading(true); setSearchView(false); setChecked(new Set());
     const result = await action<Entry[]>(() => call('browse', { fid: chain.at(-1)![0] }));
     if (generation === view.current) {
       setLoading(false);
@@ -275,6 +278,7 @@ function App() {
       if(event.event === 'appearance') acceptAppearance(event.data as Appearance);
       else if(event.event === 'desktop.quitting') {cancelDrop();setQuitting(true);}
       else if(event.event === 'navigate' && event.data === 'tasks') {if(textEditorOpen.current) {notify('请先关闭文本编辑器，再查看传输任务');return;}if(!dropSubmitting.current) cancelDrop();cancelSearch();setPage('tasks');}
+      else if(event.event === 'files.changed') refreshDirectory();
       else if(event.event === 'tasks.changed') acceptTasks(event.data as Task[]);
       else if(event.event === 'batch.started') setTransferring(true);
       else if(event.event === 'feedback') notify(event.data as string);
@@ -301,6 +305,21 @@ function App() {
     });
     return off;
   }, []);
+  useEffect(() => {
+    if(!directoryDirty.current || page !== 'drive' || share || searchView || loading || searching || !signedIn) return;
+    const generation=view.current,account=profileGeneration.current;
+    let disposed=false,settled=false,started=false;
+    const timer=window.setTimeout(() => {
+      if(!directoryDirty.current) {settled=true;return;}
+      started=true;directoryDirty.current=false;
+      void call('browse',{fid:trail.at(-1)![0]}).then((next:Entry[]) => {
+        if(disposed || generation !== view.current || account !== profileGeneration.current) return;
+        const ids=new Set(next.map(row=>row.fid));
+        setRows(next);setChecked(old=>new Set([...old].filter(fid=>ids.has(fid))));
+      }).catch(error=>{if(!disposed) notify(`目录自动刷新失败：${error instanceof Error ? error.message : '请手动刷新'}`,'warning');}).finally(()=>{settled=true;});
+    },100);
+    return () => {disposed=true;window.clearTimeout(timer);if(started && !settled && generation === view.current) directoryDirty.current=true;};
+  },[directoryChanges,page,share,searchView,loading,searching,signedIn,trail]);
   useEffect(() => {window.addEventListener('blur',clearDrag);return () => window.removeEventListener('blur',clearDrag);},[]);
   const filtered = useMemo(() => {
     let result = rows.filter(row => (!query || row.name.toLocaleLowerCase().includes(query.toLocaleLowerCase())) &&
@@ -577,7 +596,7 @@ function App() {
       </>}
       {!context.row && <><button role="menuitem" disabled={loading || searching} onClick={() => {setContext(null);void (share ? openShare() : browse());}}>刷新</button>{!share && <><button role="menuitem" disabled={!canModify} onClick={() => fileAction('mkdir',[])}>新建目录</button><button role="menuitem" disabled={!canPaste} onClick={paste}>粘贴<kbd>Ctrl+V</kbd></button></>}</>}
     </div></>}
-    {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} cutId={fileDialog.cutId} copying={fileDialog.copying} onCut={setCut} parent={trail} close={() => setFileDialog(null)} done={() => { void (searchView ? runSearch() : browse()); }} onStatus={notify}/ >}
+    {fileDialog && <FileDialog action={fileDialog.action} entries={fileDialog.entries} cutId={fileDialog.cutId} copying={fileDialog.copying} onCut={setCut} parent={trail} close={() => setFileDialog(null)} done={() => {refreshDirectory();if(searchView) void runSearch();}} onStatus={notify}/ >}
     {preview && <ImagePreview entries={preview.entries} start={preview.start} handle={preview.handle} close={() => setPreview(null)}/>}
     {textPreview && <TextPreview entry={textPreview} close={() => setTextPreview(null)} onSaved={(fid,next) => {setRows(old => old.map(row => row.fid===fid ? next : row));setChecked(old => {if(!old.has(fid)) return old;const nextIds=new Set(old);nextIds.delete(fid);nextIds.add(next.fid);return nextIds;});}}/>}
     {sharingDialog && <SharingDialog mode={sharingDialog} entries={selected} handle={share} path={sharePath} close={() => setSharingDialog(null)} onStatus={notify}/>}

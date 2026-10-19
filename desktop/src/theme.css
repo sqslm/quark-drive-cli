@@ -135,3 +135,5 @@ aside{padding-top:28px}.brand{padding-bottom:30px;letter-spacing:.2px}.brand sma
 aside{overflow:hidden}aside>.brand,aside>nav{flex-shrink:0}
 
 @media(max-height:700px){aside{padding-top:16px;padding-bottom:12px}.brand{padding-bottom:16px}.nav{padding-top:9px;padding-bottom:9px}.favorites{margin-top:12px;padding-top:12px}.account-area{padding-top:10px}.capacity-meter{padding-bottom:8px}}
+
+.share-row-actions{display:flex;align-items:center;gap:6px}.share-row-actions .share-trash{display:grid;place-items:center;width:28px;height:28px;padding:4px;flex-shrink:0;color:var(--secondary)}.share-trash:hover:not(:disabled){color:var(--error)}
