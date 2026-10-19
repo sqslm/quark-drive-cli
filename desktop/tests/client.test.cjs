@@ -52,7 +52,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
         officialLogin:async mode => {window.testCalls.push({method:'officialLogin',params:{mode}});return window.testWebCancel ? {cancelled:true} : {nickname:'新账号',logged_in:true};},
         call: async (method, params = {}, id) => {
           window.testCalls.push({ method, params });
-          if(method === 'hello') return { protocol: 1,client_version:'0.5.25',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
+          if(method === 'hello') return { protocol: 1,client_version:'0.5.26',signed_in:true, preferences, extension_groups:{视频:['mp4','mkv'],音频:['mp3'],文档:['txt']} };
           if(method === 'account') return { nickname: loggedIn ? '测试账号' : '未登录',logged_in:loggedIn };
           if(method === 'account.capacity') {
             const data={...(window.testCapacity || {used_bytes:50*1073741824,total_bytes:100*1073741824})};
@@ -717,7 +717,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
       {id:'uw',name:'上传等待.txt',direction:'upload',state:'waiting'},
       {id:'uf',name:'上传失败.txt',direction:'upload',state:'failed'},
       {id:'us',name:'上传暂停.txt',direction:'upload',state:'stopped'},
-      {id:'ud',name:'上传成功.txt',direction:'upload',state:'done',target:'/资料/上传成功.txt',created_at:Date.UTC(2026,9,16,6,10),started_at:Date.UTC(2026,9,16,6,12),finished_at:Date.UTC(2026,9,16,7,42),elapsed_seconds:3661},
+      {id:'ud',name:'上传成功.txt',direction:'upload',state:'done',detail:'已上传 上传成功.txt：1.6 MiB',target:'/资料/上传成功.txt',created_at:Date.UTC(2026,9,16,6,10),started_at:Date.UTC(2026,9,16,6,12),finished_at:Date.UTC(2026,9,16,7,42),elapsed_seconds:3661},
       {id:'uc',name:'上传取消.txt',direction:'upload',state:'cancelled'},
     ].map(task => ({valid:true,revision:1,detail:'',target:'C:/Downloads/'+task.name,...task}))));
     await page.getByRole('button',{name:/^传输任务/}).click();
@@ -731,7 +731,7 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await page.getByText('下载成功.txt',{exact:true}).count(),0);
     assert.equal(await page.locator('.task-row').first().locator('.task-controls button').count(),3);
     assert.ok(await page.locator('.task-row').filter({hasText:'旧账号下载.txt'}).getByRole('button',{name:'开始',exact:true}).isDisabled());
-    await page.locator('.task-row').filter({hasText:'旧账号下载.txt'}).getByText('失败时间：未记录',{exact:true}).waitFor();
+    await page.locator('.task-row').filter({hasText:'旧账号下载.txt'}).getByLabel('失败时间：未记录',{exact:true}).waitFor();
     await page.getByRole('button',{name:'开始全部',exact:true}).click();
     assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.retry').at(-1).params.ids),['df','ds','uw','uf','us']);
     await page.getByRole('button',{name:'暂停全部',exact:true}).click();
@@ -745,21 +745,43 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await completion.getByRole('button',{name:/^已完成/}).click();
     assert.equal(await page.locator('.task-row').count(),2);
     const uploadedRecord=page.locator('.task-row').filter({hasText:'上传成功.txt'});
-    await uploadedRecord.getByText('完成时间：2026-10-16 15:42',{exact:true}).waitFor();
-    await uploadedRecord.getByText('累计耗时：1 小时 1 分 1 秒',{exact:true}).waitFor();
-    await uploadedRecord.getByText('上传到：/资料/上传成功.txt',{exact:true}).waitFor();
+    assert.equal(await uploadedRecord.locator('.task-total').textContent(),'1.6 MiB');
+    assert.equal(await uploadedRecord.locator('.task-name').textContent(),'上传成功.txt');
+    await uploadedRecord.getByLabel('完成时间：2026-10-16 15:42',{exact:true}).waitFor();
+    await uploadedRecord.getByLabel('累计耗时：1 小时 1 分 1 秒',{exact:true}).waitFor();
+    await uploadedRecord.getByLabel('上传到：/资料/上传成功.txt',{exact:true}).waitFor();
     assert.match(await uploadedRecord.locator('.task-record-line').getAttribute('title'),/加入：2026-10-16 14:10\n首次开始：2026-10-16 14:12/);
     await page.locator('.task-row').filter({hasText:'上传成功.txt'}).getByRole('button',{name:'打开文件夹',exact:true}).click();
     await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-groups-light.png')});
     await page.evaluate(() => window.quark.setAppearance('dark'));
     await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-groups-dark.png')});
+    await page.setViewportSize({width:1920,height:1032});
+    const transferTable=page.getByRole('table',{name:'上传任务',exact:true});
+    assert.equal(await transferTable.getByRole('columnheader').count(),12);
+    assert.equal(await uploadedRecord.getByRole('cell').count(),12);
+    assert.equal((await uploadedRecord.boundingBox()).height,60);
+    const transferColumns=await uploadedRecord.getByRole('cell').evaluateAll(cells=>cells.map(cell=>({x:cell.getBoundingClientRect().x,right:cell.getBoundingClientRect().right})));
+    const headings=await transferTable.getByRole('columnheader').evaluateAll(cells=>cells.map(cell=>cell.getBoundingClientRect().x));
+    transferColumns.forEach((cell,index)=>{assert.ok(Math.abs(cell.x-headings[index])<1);if(index)assert.ok(cell.x>=transferColumns[index-1].right);});
+    assert.ok(await page.locator('.task-list').evaluate(element=>element.scrollWidth<=element.clientWidth));
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-columns-dark.png')});
     await page.setViewportSize({width:860,height:600});
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true);
     assert.equal(await uploadedRecord.evaluate(row => row.querySelector('.task-record-target').getBoundingClientRect().bottom <= row.getBoundingClientRect().bottom),true);
+    const narrowScroll=await page.locator('.task-list').boundingBox();
+    const nameBefore=await uploadedRecord.locator('.task-name').boundingBox();
+    const controlsBefore=await uploadedRecord.locator('.task-controls').boundingBox();
+    assert.ok(controlsBefore.x>=narrowScroll.x && controlsBefore.x+controlsBefore.width<=narrowScroll.x+narrowScroll.width+1);
+    assert.ok(await page.locator('.task-list').evaluate(element=>element.scrollWidth>element.clientWidth));
+    await page.locator('.task-list').evaluate(element=>{element.scrollLeft=element.scrollWidth;});
+    assert.ok(Math.abs((await uploadedRecord.locator('.task-name').boundingBox()).x-nameBefore.x)<1);
+    assert.ok(Math.abs((await uploadedRecord.locator('.task-controls').boundingBox()).x-controlsBefore.x)<1);
+    await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-columns-narrow.png')});
+    await page.locator('.task-list').evaluate(element=>{element.scrollLeft=0;});
     await page.setViewportSize({width:1180,height:780});
     await directions.getByRole('button',{name:/^下载/}).click();
     await page.getByText('下载成功.txt',{exact:true}).waitFor();
-    await page.locator('.task-row').filter({hasText:'下载成功.txt'}).getByText('完成时间：2026-01-01 00:02',{exact:true}).waitFor();
+    await page.locator('.task-row').filter({hasText:'下载成功.txt'}).getByLabel('完成时间：2026-01-01 00:02',{exact:true}).waitFor();
     await page.getByRole('button',{name:'清理已完成记录',exact:true}).click();
     assert.deepEqual(await page.evaluate(() => window.testCalls.filter(row => row.method === 'tasks.clear').at(-1).params.ids),['dd']);
     await page.getByText('暂无已完成的下载任务',{exact:true}).waitFor();
@@ -780,6 +802,14 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await directions.getByRole('button',{name:/^上传/}).click();await completion.getByRole('button',{name:/^已完成/}).click();
     assert.equal(await completion.getByRole('button',{name:/^已完成/}).locator('span').textContent(),'1000');
     assert.ok(await page.locator('.task-row').count() < 60);
+    const taskHeaderTop=(await page.locator('.task-header').boundingBox()).y;
+    await page.locator('.task-list').evaluate(element=>{element.scrollTop=element.scrollHeight;});
+    const lastTransfer=page.locator('.task-row').filter({hasText:'批量完成999'});
+    await lastTransfer.waitFor();
+    assert.equal(await lastTransfer.getAttribute('aria-rowindex'),'1001');
+    assert.equal((await lastTransfer.boundingBox()).height,60);
+    assert.ok(Math.abs((await page.locator('.task-header').boundingBox()).y-taskHeaderTop)<1);
+    await page.locator('.task-list').evaluate(element=>{element.scrollTop=0;});
     const beforeProgressCalls=await page.evaluate(() => window.testCalls.length);
     await page.evaluate(() => {
       const MB=1048576;
@@ -801,17 +831,18 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     const progressRow=name => page.locator('.task-row').filter({hasText:name});
     const activeProgress=progressRow('大文件.bin');
     assert.equal(await activeProgress.getByRole('progressbar').getAttribute('aria-valuenow'),'50');
-    await activeProgress.getByText('已传输 50.0 MB / 100.0 MB',{exact:true}).waitFor();
-    await activeProgress.getByText('速度 10.0 MB/s',{exact:true}).waitFor();
-    await activeProgress.getByText('连接 4',{exact:true}).waitFor();
-    await activeProgress.getByText('预计剩余 约 5 秒',{exact:true}).waitFor();
+    await activeProgress.getByLabel('已传输 50.0 MB',{exact:true}).waitFor();
+    assert.equal(await activeProgress.locator('.task-total').textContent(),'100.0 MB');
+    await activeProgress.getByLabel('速度 10.0 MB/s',{exact:true}).waitFor();
+    await activeProgress.getByLabel('连接 4',{exact:true}).waitFor();
+    await activeProgress.getByLabel('预计剩余 约 5 秒',{exact:true}).waitFor();
     const treeProgress=progressRow('测试目录');
     await treeProgress.getByText('目录总进度 · 当前文件：子目录/视频.mkv',{exact:true}).waitFor();
     assert.equal(await treeProgress.getByRole('progressbar').getAttribute('aria-valuenow'),'40');
     assert.equal(await progressRow('未知大小.bin').getByRole('progressbar').getAttribute('aria-valuenow'),null);
-    await progressRow('未知大小.bin').getByText('预计剩余 —',{exact:true}).waitFor();
+    await progressRow('未知大小.bin').getByLabel('预计剩余 —',{exact:true}).waitFor();
     await progressRow('转存文件.bin').getByText('正在临时转存',{exact:true}).waitFor();
-    assert.equal(await progressRow('转存文件.bin').getByText('连接 1',{exact:true}).count(),0);
+    assert.equal(await progressRow('转存文件.bin').getByLabel('连接 1',{exact:true}).count(),0);
     await progressRow('清理文件.bin').getByText('正在清理临时目录',{exact:true}).waitFor();
     assert.equal(await progressRow('旧任务').getByRole('progressbar').count(),0);
     await page.screenshot({path:path.resolve(__dirname,'../test-results/transfer-progress-dark.png')});
@@ -828,8 +859,9 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     await page.evaluate(() => {const task=window.testGetTasks().find(task => task.id === 'pd');window.testEmit({id:null,event:'task',data:{...task,state:'stopped',revision:2}});});
     await activeProgress.locator('.task-state').getByText('已暂停',{exact:true}).waitFor();
     assert.equal(await activeProgress.getByRole('progressbar').getAttribute('aria-valuenow'),'40');
-    await activeProgress.getByText('已确认 40.0 MB / 100.0 MB',{exact:true}).waitFor();
-    await activeProgress.getByText('速度 —',{exact:true}).waitFor();await activeProgress.getByText('预计剩余 —',{exact:true}).waitFor();
+    await activeProgress.getByLabel('已确认 40.0 MB',{exact:true}).waitFor();
+    assert.equal(await activeProgress.locator('.task-total').textContent(),'100.0 MB');
+    await activeProgress.getByLabel('速度 —',{exact:true}).waitFor();await activeProgress.getByLabel('预计剩余 —',{exact:true}).waitFor();
     await page.evaluate(() => window.testEmit({id:null,event:'task',data:window.testGetTasks().find(task => task.id === 'pd')}));
     assert.equal(await activeProgress.getByRole('progressbar').getAttribute('aria-valuenow'),'40');
     await directions.getByRole('button',{name:/^上传/}).click();
@@ -837,37 +869,38 @@ test('renderer virtualizes files, streams searches, cancels, preserves manual co
     assert.equal(await progressRow('准备上传.bin').getByRole('progressbar').getAttribute('aria-valuetext'),'正在计算文件哈希');
     assert.ok(await progressRow('准备上传.bin').getByRole('button',{name:'暂停',exact:true}).isEnabled());
     assert.equal(await progressRow('授权下一段.bin').getByRole('progressbar').getAttribute('aria-valuenow'),'25');
-    await progressRow('授权下一段.bin').getByText('速度 5.0 MB/s',{exact:true}).waitFor();
+    await progressRow('授权下一段.bin').getByLabel('速度 5.0 MB/s',{exact:true}).waitFor();
     await progressRow('授权下一段.bin').locator('.progress-phase').getByText('正在上传',{exact:true}).waitFor();
-    await progressRow('准备上传.bin').getByText('速度 —',{exact:true}).waitFor();
+    await progressRow('准备上传.bin').getByLabel('速度 —',{exact:true}).waitFor();
     await page.screenshot({path:path.resolve(__dirname,'../test-results/upload-progress-light.png')});
     for(const [index,phase] of ['hashing_context','transferring','part_confirmed','authorizing'].entries()) {
       await page.evaluate(({phase,index}) => {const task=window.testGetTasks().find(task => task.id === 'px');window.testEmit({id:null,event:'task',data:{...task,revision:index+2,progress:{...task.progress,phase}}});},{phase,index});
       await progressRow('授权下一段.bin').locator('.progress-phase').getByText('正在上传',{exact:true}).waitFor();
-      await progressRow('授权下一段.bin').getByText('速度 5.0 MB/s',{exact:true}).waitFor();
-      await progressRow('授权下一段.bin').getByText('预计剩余 约 6 秒',{exact:true}).waitFor();
+      await progressRow('授权下一段.bin').getByLabel('速度 5.0 MB/s',{exact:true}).waitFor();
+      await progressRow('授权下一段.bin').getByLabel('预计剩余 约 6 秒',{exact:true}).waitFor();
     }
     for(const [index,phase] of ['verifying','merging','completed'].entries()) {
       await page.evaluate(({phase,index}) => {const task=window.testGetTasks().find(task => task.id === 'px');window.testEmit({id:null,event:'task',data:{...task,revision:index+6,progress:{...task.progress,phase,transferred:task.progress.total,confirmed:task.progress.total}}});},{phase,index});
       await progressRow('授权下一段.bin').locator('.progress-phase').getByText('正在完成上传…',{exact:true}).waitFor();
-      await progressRow('授权下一段.bin').getByText('速度 5.0 MB/s',{exact:true}).waitFor();
-      await progressRow('授权下一段.bin').getByText('预计剩余 —',{exact:true}).waitFor();
+      await progressRow('授权下一段.bin').getByLabel('速度 5.0 MB/s',{exact:true}).waitFor();
+      await progressRow('授权下一段.bin').getByLabel('预计剩余 —',{exact:true}).waitFor();
     }
     for(const [index,phase] of ['verifying','merging'].entries()) {
       await page.evaluate(({phase,index}) => {const task=window.testGetTasks().find(task => task.id === 'px');window.testEmit({id:null,event:'task',data:{...task,revision:index+9,progress:{...task.progress,phase,recursive:true}}});},{phase,index});
       await progressRow('授权下一段.bin').locator('.progress-phase').getByText('正在上传',{exact:true}).waitFor();
-      await progressRow('授权下一段.bin').getByText('速度 5.0 MB/s',{exact:true}).waitFor();
+      await progressRow('授权下一段.bin').getByLabel('速度 5.0 MB/s',{exact:true}).waitFor();
     }
     await page.evaluate(() => {const task=window.testGetTasks().find(task => task.id === 'px');window.testEmit({id:null,event:'task',data:{...task,revision:11,pausing:true}});});
     await progressRow('授权下一段.bin').locator('.progress-phase').getByText('正在安全停止…',{exact:true}).waitFor();
-    await progressRow('授权下一段.bin').getByText('速度 —',{exact:true}).waitFor();
-    await progressRow('授权下一段.bin').getByText('预计剩余 —',{exact:true}).waitFor();
-    await progressRow('上传文件.bin').getByText('速度 5.0 MB/s',{exact:true}).waitFor();
-    await progressRow('上传文件.bin').getByText('预计剩余 约 4 秒',{exact:true}).waitFor();
-    assert.equal(await progressRow('上传文件.bin').getByText('连接 1',{exact:true}).count(),0);
+    await progressRow('授权下一段.bin').getByLabel('速度 —',{exact:true}).waitFor();
+    await progressRow('授权下一段.bin').getByLabel('预计剩余 —',{exact:true}).waitFor();
+    await progressRow('上传文件.bin').getByLabel('速度 5.0 MB/s',{exact:true}).waitFor();
+    await progressRow('上传文件.bin').getByLabel('预计剩余 约 4 秒',{exact:true}).waitFor();
+    assert.equal(await progressRow('上传文件.bin').getByLabel('连接 1',{exact:true}).count(),0);
     await completion.getByRole('button',{name:/^已完成/}).click();
     assert.equal(await progressRow('空文件.bin').getByRole('progressbar').getAttribute('aria-valuenow'),'100');
-    await progressRow('空文件.bin').getByText('已传输 0.000 KB / 0.000 KB',{exact:true}).waitFor();
+    await progressRow('空文件.bin').getByLabel('已传输 0.000 KB',{exact:true}).waitFor();
+    assert.equal(await progressRow('空文件.bin').locator('.task-total').textContent(),'0.000 KB');
     assert.equal(await page.evaluate(() => window.testCalls.length),beforeProgressCalls);
     await page.evaluate(tasks => {window.testSetTasks(tasks);return window.quark.setAppearance('light');},originalTasks);
     await page.getByRole('button',{name:'我的文件',exact:true}).click();
@@ -1135,14 +1168,14 @@ test('bundled backend restores transfer dates and shows unknown legacy times wit
     assert.equal(records[0].finished_at,null);
     const session=await page.context().newCDPSession(page);await session.send('Emulation.setTimezoneOverride',{timezoneId:'Asia/Singapore'});
     await page.getByRole('button',{name:/^传输任务/}).click();
-    await page.getByText('完成时间：2026-10-16 15:42',{exact:true}).waitFor();
-    await page.getByText('累计耗时：1 分 30 秒',{exact:true}).waitFor();
-    await page.getByText('上传到：/资料/有日期.txt',{exact:true}).waitFor();
+    await page.getByLabel('完成时间：2026-10-16 15:42',{exact:true}).waitFor();
+    await page.getByLabel('累计耗时：1 分 30 秒',{exact:true}).waitFor();
+    await page.getByLabel('上传到：/资料/有日期.txt',{exact:true}).waitFor();
     await page.evaluate(() => window.quark.setAppearance('dark'));
     await page.screenshot({path:path.resolve(__dirname,'../test-results/task-dates-packaged.png')});
     await page.getByRole('group',{name:'传输方向'}).getByRole('button',{name:/^下载/}).click();
-    await page.getByText('完成时间：未记录',{exact:true}).waitFor();
-    await page.getByText('累计耗时：未记录',{exact:true}).waitFor();
+    await page.getByLabel('完成时间：未记录',{exact:true}).waitFor();
+    await page.getByLabel('累计耗时：未记录',{exact:true}).waitFor();
     await session.detach();
   } finally {await app.close();await rm(directory,{recursive:true,force:true});}
 });
