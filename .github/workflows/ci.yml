@@ -79,4 +79,6 @@ jobs:
           wheel-smoke/bin/quark --help
           wheel-smoke/bin/python -m quark_cli --help
       - name: Audit installed dependencies
-        run: python -m pip_audit --strict --skip-editable
+        run: |
+          python -m pip freeze --exclude quark-drive-cli > "${RUNNER_TEMP}/quark-audit-requirements.txt"
+          python -m pip_audit --strict --disable-pip --no-deps -r "${RUNNER_TEMP}/quark-audit-requirements.txt"

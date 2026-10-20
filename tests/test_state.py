@@ -75,6 +75,18 @@ class StateTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(list(self.root.glob(".data.json-*")), [])
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows directory ownership")
+    def test_new_directory_sets_current_user_owner_but_existing_directory_does_not(self):
+        path = self.root / 'new-directory'
+        with patch('quark_cli.state.restrict_windows_acl', wraps=state.restrict_windows_acl) as acl:
+            state.secure_directory(path)
+            self.assertTrue(acl.call_args.kwargs['set_owner'])
+            state.private_path(path, directory=True, read_only=True)
+            acl.reset_mock()
+            state.secure_directory(path)
+            self.assertFalse(acl.call_args.kwargs.get('set_owner', False))
+            state.private_path(path, directory=True, read_only=True)
+
     @unittest.skipUnless(sys.platform == "win32", "Windows default owner semantics")
     def test_new_json_and_cookie_set_current_user_owner_before_publication(self):
         # Elevated Windows tokens default to Administrators ownership. Verify
@@ -338,6 +350,9 @@ class StateTests(unittest.TestCase):
         directory = self.root / "parts"
         directory.mkdir()
         for target in (path, directory):
+            # This test concerns DACL-only repair of current-user-owned state.
+            # Elevated runners otherwise default these fixture owners to BA.
+            state.restrict_windows_acl(target, directory=target.is_dir(), set_owner=True)
             grant = subprocess.run(["icacls", str(target), "/inheritance:r", "/grant:r", f"*{sid}:(M)"], capture_output=True, check=False)
             self.assertEqual(grant.returncode, 0, "unable to inject a Modify-only current-user DACL")
             legacy_error = legacy_owner_acl_request(target, sid)

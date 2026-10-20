@@ -24,6 +24,8 @@ from navigation_assets import ENTRIES, stage_navigation
 
 
 def setUpModule():
+    if sys.platform != 'win32':
+        raise unittest.SkipTest('The PotPlayer installer requires Windows paths, processes and file locking.')
     # Upgrade recovery must never inspect/repair the real user's runtime.
     global _private_config, _config_env
     _private_config = tempfile.TemporaryDirectory(prefix='quark-installer-config-')
@@ -694,9 +696,14 @@ class UninstallTests(unittest.TestCase):
             self.assertFalse(core._same_path(root / "install", root / "other"))
             manifest_path = self.install_dir / core.MANIFEST_NAME
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
-            data["install_dir"] = os.path.relpath(self.install_dir)
-            manifest_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-            report = core.uninstall(install_dir=self.install_dir, registry=False)
+            previous_directory = Path.cwd()
+            try:
+                os.chdir(self.root)
+                data["install_dir"] = os.path.relpath(self.install_dir)
+                manifest_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                report = core.uninstall(install_dir=self.install_dir, registry=False)
+            finally:
+                os.chdir(previous_directory)
             self.assertFalse(self.install_dir.exists())
             self.assertTrue(report.removed)
 

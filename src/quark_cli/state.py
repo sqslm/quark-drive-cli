@@ -234,8 +234,17 @@ def secure_directory(path: Path) -> None:
         raise LocalIOError("私有状态目录必须是绝对路径")
     try:
         _not_link(path)
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        private_path(path, directory=True)
+        try:
+            path.mkdir(mode=0o700, parents=True)
+        except FileExistsError:
+            private_path(path, directory=True)
+        else:
+            if sys.platform == "win32":
+                # Elevated tokens can otherwise create Administrators-owned
+                # directories that fail strict read-only owner validation.
+                restrict_windows_acl(path, directory=True, set_owner=True)
+            else:
+                private_path(path, directory=True)
     except OSError:
         raise LocalIOError("无法创建私有状态目录") from None
 

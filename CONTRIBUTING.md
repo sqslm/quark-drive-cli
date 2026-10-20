@@ -25,7 +25,8 @@ CLI 版本由 `pyproject.toml` 和 `src/quark_cli/__init__.py` 声明，两处�
 ```sh
 python -m build
 python -m twine check dist/*.whl dist/*.tar.gz
-python -m pip_audit --strict --skip-editable
+python -m pip freeze --exclude quark-drive-cli > audit-requirements.txt
+python -m pip_audit --strict --disable-pip --no-deps -r audit-requirements.txt
 python -m pip install --force-reinstall dist/quark_drive_cli-VERSION-py3-none-any.whl
 quark --version
 quark --help
@@ -33,6 +34,8 @@ python -m pip check
 ```
 
 用实际版本替换 `VERSION`。在新虚拟环境中验证安装，从仓库以外的目录运行命令，确认无需源码或 `PYTHONPATH`。检查源码包与 wheel 不含 Cookie、用户状态、缓存、构建暂存或历史发布包；保留 LICENSE 和第三方声明。为选定交付文件生成 SHA-256 清单，发布说明应标记版本和对应提交。构建和 CI 不自动发布到 PyPI 或 GitHub Releases。
+
+依赖审计使用该虚拟环境中已解析的精确版本清单，仅排除本地项目本身，保留全部第三方依赖。这样可避免严格模式把 editable 项目视为解析失败；`--no-deps` 不再重复解析，因为清单已含传递依赖。`audit-requirements.txt` 是本机临时清单，审计后删除，不进入 Git。
 
 ## 提交与报告
 

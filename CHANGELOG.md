@@ -7,6 +7,7 @@
 - Add `quark --version` without requiring credentials.
 - Prepare MIT licensing, package metadata, contributor/security documentation, an agent workflow guide and Windows/Linux CI.
 - Isolate the test package to prevent unrelated installed `tests` packages from shadowing regression imports.
+- Assign the current user as owner of newly created private Windows directories, including under elevated tokens; existing directory ownership is not changed implicitly.
 
 Earlier CLI development builds used version 0.1.0. Desktop and PotPlayer releases maintain independent version numbers.
 
