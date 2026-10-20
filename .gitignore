@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
 .venv/
 build/
 dist/
@@ -13,6 +14,10 @@ dist/
 /*.md
 !/README.md
 !/THIRD_PARTY_NOTICES.md
+!/CONTRIBUTING.md
+!/SECURITY.md
+!/CHANGELOG.md
+/tmp/
 /docs/plans/
 /docs/research/
 /docs/validation/

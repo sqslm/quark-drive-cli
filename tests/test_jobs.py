@@ -12,7 +12,7 @@ import httpx
 
 from quark_cli.cli import main
 from quark_cli.client import QuarkClient
-from quark_cli.errors import LocalIOError, RemoteError, UsageError
+from quark_cli.errors import LocalIOError, RateLimitError, RemoteError, UsageError
 from quark_cli.jobs import Jobs
 from quark_cli.paths import Scope
 from quark_cli.shares import ShareSaver
@@ -72,6 +72,82 @@ class JobsTests(unittest.TestCase):
         with patch.object(self.saver, "_poll_task", side_effect=ProcessStopped), self.assertRaises(ProcessStopped):
             self.jobs.run("中文任务")
         self.assertIsNotNone(self.entry()["pending"]["task_id"])
+
+    def test_unchanged_twenty_episodes_reuse_parents_but_check_every_exact_fid(self):
+        self.fixture.share_directories["source-child"] = [
+            shared(f"ep-{index}", f"{index}.mkv", "source-child") for index in range(20)]
+        self.add(include=("*.mkv",))
+        first = self.run_ok()
+        self.assertEqual(len(first["saved_entries"]), 20)
+        self.assertEqual({record["source_fid"] for record in first["saved_entries"]},
+                         {f"ep-{index}" for index in range(20)})
+        self.fixture.calls.clear()
+        writes = len(self.fixture.writes)
+        with patch.object(self.saver.files, "info", wraps=self.saver.files.info) as info:
+            result = self.run_ok()
+        self.assertEqual(result["result"], "unchanged")
+        self.assertEqual(result["saved_entries"], [])
+        self.assertEqual(len(self.fixture.writes), writes)
+        self.assertLessEqual(len(self.fixture.calls), 50)
+        checked = {call.args[0] for call in info.call_args_list}
+        self.assertTrue({entry["target_fid"] for entry in first["saved_entries"]}.issubset(checked))
+        # No metadata survives the invocation: a moved target must still stop.
+        self.copied("ep-19")["pdir_fid"] = "child"
+        self.run_failed()
+        self.assertEqual(len(self.fixture.writes), writes)
+
+    def test_cooldown_and_unknown_write_have_actionable_safe_output(self):
+        self.add()
+        with patch.object(self.saver, "select", side_effect=RateLimitError("冷却中", retry_after=42)):
+            result = self.run_failed()
+        self.assertEqual((result["next_action"], result["retry_after_seconds"]), ("wait", 42))
+        with patch.object(self.saver, "_submit_selection", side_effect=RemoteError("受理未知")):
+            result = self.run_failed()
+        self.assertTrue(result["pending"])
+        self.assertEqual(result["next_action"], "manual_review")
+        self.assertEqual(result["message"], "受理未知")
+        with patch.object(self.saver, "_submit_selection") as submit:
+            self.assertEqual(self.run_failed()["next_action"], "manual_review")
+        submit.assert_not_called()
+
+    def test_known_task_failure_reports_original_task_recovery(self):
+        self.add()
+        with patch.object(self.saver, "_poll_task", side_effect=RateLimitError("冷却中", retry_after=9)):
+            result = self.run_failed()
+        self.assertEqual(result["next_action"], "query_original_task")
+        self.assertEqual(result["task_id"], "selection-task")
+        self.assertEqual(result["retry_after_seconds"], 9)
+        recovered = self.run_ok()
+        self.assertEqual(len(recovered["saved_entries"]), 1)
+        self.assertEqual(len(self.fixture.saves), 1)
+
+    def test_partial_job_reports_confirmed_entries_before_later_group_failure(self):
+        self.add(include=("*",))
+        self.run_ok()
+        self.fixture.share_directories["source-child"].append(shared("fresh-root", "fresh.txt", "source-child"))
+        self.fixture.share_directories["folder"].append(shared("fresh-child", "fresh-child.txt", "folder"))
+        original = self.saver._submit_selection
+        def submit(selection, *args, **kwargs):
+            if selection.source_fid == "folder":
+                raise RemoteError("第二组受理未知")
+            return original(selection, *args, **kwargs)
+        with patch.object(self.saver, "_submit_selection", side_effect=submit):
+            result = self.run_failed()
+        self.assertEqual(result["saved_items"], 1)
+        self.assertEqual(result["saved_entries"][0]["source_fid"], "fresh-root")
+        self.assertTrue(result["pending"])
+        self.assertEqual(result["next_action"], "manual_review")
+
+    def test_failed_preview_never_reports_recovered_entries_as_saved(self):
+        self.add()
+        self.crash_after_submit()
+        self.fixture.share_directories["source-child"].append(shared("fresh", "fresh.txt", "source-child"))
+        self.fixture.items.append(item("conflicting", "fresh.txt", "target", size=4, updated_at=123))
+        snapshot = self.jobs.ledger_path.read_bytes()
+        result = self.run_failed(dry_run=True)
+        self.assertEqual((result["saved_items"], result["saved_entries"]), (0, []))
+        self.assertEqual(self.jobs.ledger_path.read_bytes(), snapshot)
+        self.assertEqual(len(self.fixture.saves), 1)
 
     def test_normalized_private_configuration_and_safe_public_whitelist(self):
         created = self.jobs.add("任务", SHARE_URL + "?pwd=private-passcode", "/范围/目标", source=SOURCE_PATH,

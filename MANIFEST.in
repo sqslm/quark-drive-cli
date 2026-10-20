@@ -1,12 +1,15 @@
 include README.md
 include THIRD_PARTY_NOTICES.md
+include LICENSE CONTRIBUTING.md SECURITY.md CHANGELOG.md
 recursive-include docs *.md
 recursive-include tests *.py
 recursive-include packaging *.py
 recursive-include potplayer *.as *.ico *.cmd
+recursive-include potplayer/icons *.svg *.txt *.md
 global-exclude __pycache__ *.py[cod]
 prune build
 prune dist
+prune tmp
 prune docs/plans
 prune docs/research
 prune docs/validation

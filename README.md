@@ -6,6 +6,8 @@ Watch the [33-second project introduction video](video/quark-drive-intro.mp4) or
 
 The Quark web API is undocumented and may change. The commands below are implemented against the request shapes summarized in [Implementation notes](#implementation-notes). Offline tests cover the HTTP flows.
 
+For AI agents, start with the [agent workflow guide](docs/AGENT_GUIDE.md). Project code is licensed under [MIT](LICENSE); dependency and asset licenses remain as documented in [third-party notices](THIRD_PARTY_NOTICES.md). See [Contributing](CONTRIBUTING.md), [Security](SECURITY.md) and the [Changelog](CHANGELOG.md). This is an unofficial client, unaffiliated with Quark or PotPlayer.
+
 See the [中文 CLI 使用手册](docs/CLI使用手册.md) for installation, every command and option, examples, scope behavior, exit codes and troubleshooting.
 
 On Windows 10/11 x64 you can also browse and play your own Quark Drive inside PotPlayer with the companion plugin (`QuarkPotPlayer-Setup.exe`). See the [使用指南](docs/PotPlayer使用指南.md) and the [安装说明](docs/PotPlayer安装说明.md). The plugin keeps its own login and never touches the CLI Cookie.
@@ -15,7 +17,7 @@ On Windows 10/11 x64 you can also browse and play your own Quark Drive inside Po
 The build produces a platform-independent wheel, a source archive and `SHA256SUMS.txt` in `dist/`. Copy these files to the Windows or Linux host. Compare the artifact SHA-256 with the checksum file before installing:
 
 ```powershell
-Get-FileHash .\quark_drive_cli-0.1.0-py3-none-any.whl -Algorithm SHA256
+Get-FileHash .\quark_drive_cli-0.2.0-py3-none-any.whl -Algorithm SHA256
 Get-Content .\SHA256SUMS.txt
 ```
 
@@ -26,14 +28,14 @@ sha256sum -c SHA256SUMS.txt
 In an activated Python 3.10+ virtual environment, install the wheel and check the installed dependencies and command entry point:
 
 ```sh
-python -m pip install ./quark_drive_cli-0.1.0-py3-none-any.whl
+python -m pip install ./quark_drive_cli-0.2.0-py3-none-any.whl
 python -m pip check
 quark --help
 ```
 
-To replace an existing `0.1.0` installation, use `python -m pip install --upgrade --force-reinstall ./quark_drive_cli-0.1.0-py3-none-any.whl` so pip installs this build even when the version number matches.
+To upgrade, use `python -m pip install --upgrade ./quark_drive_cli-0.2.0-py3-none-any.whl`. CLI, desktop and PotPlayer versions are independent.
 
-The wheel works on both Windows and Linux. Installing it does not require copying the source tree or setting `PYTHONPATH`. For a source build, use `python -m pip install ./quark_drive_cli-0.1.0.tar.gz`; the archive includes the documentation, third-party notices and offline tests. Runtime dependencies are installed by pip.
+The wheel works on both Windows and Linux. Installing it does not require copying the source tree or setting `PYTHONPATH`. For a source build, use `python -m pip install ./quark_drive_cli-0.2.0.tar.gz`; the archive includes the documentation, third-party notices and offline tests. Runtime dependencies are installed by pip.
 
 Create and activate a virtual environment, then install from this directory:
 
@@ -285,7 +287,7 @@ Before each remote mkdir or save, an unknown intent is durably recorded. A retur
 
 For a directory transfer, `confirmation_started` is persisted before validating the copied subtree. That initial attempt makes bounded read-only retries for briefly missing directory-index entries. If mapping then fails or the process exits, later runs require manual verification and do not fill the mapping from later same-name files. File-only transfers can recover through their original task and exact new-FID confirmation. Mapping updates are committed together; an incomplete subtree does not create partial mappings. Corrupt/missing required state stops without resetting the ledger, and a state write failure stops further remote writes in that run.
 
-`job run` without a name runs tasks serially and reports each result. Independent task failures allow other tasks to proceed unless local state cannot be safely persisted; failed tasks produce a nonzero exit code. JSON uses safe task fields, counts, target/task IDs and error categories, without extraction codes, tokens or raw remote errors. `job remove` deletes only the local task configuration, preserves its ledger and unknown intents, and does not cancel an accepted server task. Preserved unknown intents prevent a replacement local task from writing into their unconfirmed destination. Do not delete ledger files to retry uncertain operations.
+`job run` without a name runs tasks serially and reports each result. Independent task failures allow other tasks to proceed unless local state cannot be safely persisted; failed tasks produce a nonzero exit code. JSON uses safe task fields, counts, target/task IDs and sanitized errors, without extraction codes, tokens or raw HTTP responses. Successful reports include `saved_entries` (source/target FIDs, name and type, including directories); failed reports include `message` and `next_action`. Cooldowns expose `retry_after_seconds`. A pending original task is marked `query_original_task` when it can be queried again; uncertain writes without an ID or interrupted directory confirmations require `manual_review`. Parse per-job stdout even on nonzero exit; command-level errors are JSON on stderr. During historical mapping preflight, parent verification is reused only within that check, each exact target FID is still inspected, and write guards always read fresh metadata. `job remove` deletes only the local task configuration, preserves its ledger and unknown intents, and does not cancel an accepted server task. Preserved unknown intents prevent a replacement local task from writing into their unconfirmed destination. Do not delete ledger files to retry uncertain operations.
 
 ### System scheduling examples
 
@@ -785,7 +787,7 @@ MD/Markdown 提供「原格式 / 渲染格式」切换；渲染格式同时显�
 
 ### Windows 单文件向导安装包（0.5.29）
 
-当前安装交付为单个 [QuarkDriveClient-0.5.29-Windows-x64-Setup.exe](desktop/out/v0.5.29-installer/wizard/QuarkDriveClient-0.5.29-Windows-x64-Setup.exe)，约 126.33 MiB。只需复制这个 EXE 到目标 Windows 10/11 x64 电脑运行，程序、Python 后端和运行依赖全部内置，无需配套文件或另外安装 Python。
+当前安装交付为单个 [QuarkDriveClient-0.5.29-Windows-x64-Setup.exe](https://github.com/sqslm/quark-drive-cli/releases)，约 126.33 MiB。只需复制这个 EXE 到目标 Windows 10/11 x64 电脑运行，程序、Python 后端和运行依赖全部内置，无需配套文件或另外安装 Python。
 
 中文向导包含欢迎、安装目录选择、桌面快捷方式选项、确认安装和完成页；完成页可选择启动程序。默认安装到当前用户的 `%LOCALAPPDATA%/Programs/QuarkDriveClient`，可修改路径，不要求管理员权限；开始菜单和 Windows 应用列表提供入口及卸载。升级前从托盘退出旧客户端，卸载保留用户配置目录。
 
@@ -805,4 +807,4 @@ npm run make:installer
 
 输出为上述目录的 `wizard/`，版本读取 `package.json`，不复制额外运行目录。旧 Squirrel 构建文件属于之前的打包方案，本次交付使用新的向导 EXE。
 
-PotPlayer 0.12: `..` follows the actual parent FID. Verified native progress over 90% automatically persists watched status. Highlight titles walk past 4K/1080P version folders and show series/version/file, with a separate category column. Missing ancestors are fetched once and cached per account. Transfer look-ahead follows the playback clock (about 30 seconds by average bitrate, 4–32 MiB); paused playback stops incremental fetching. Unknown clocks share an 8 MiB burst plus conservative 1 MiB/s pacing. Installation defaults to the selected PotPlayer's Plugin/QuarkPotPlayer directory; 安装管理 in the root manager uses an installed lightweight uninstaller, so the downloaded installer can be deleted.
+PotPlayer 0.12: `..` follows the actual parent FID. Verified native progress over 90% automatically persists watched status. Highlight titles walk past 4K/1080P version folders and show series/version/file, with a separate category column. Missing ancestors are fetched once and cached per account. Transfer read-ahead shares a budget across concurrent responses: it pauses at 20% of file size and resumes at or below 10%, using the native playback clock when available. It has no byte-rate limit or disk cache. Installation defaults to the selected PotPlayer's Plugin/QuarkPotPlayer directory; 安装管理 in the root manager uses an installed lightweight uninstaller, so the downloaded installer can be deleted.

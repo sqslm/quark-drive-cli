@@ -28,6 +28,28 @@ class CliTests(unittest.TestCase):
         self.environment.start()
         self.addCleanup(self.environment.stop)
 
+    def test_version_does_not_read_credentials_or_network(self):
+        from quark_cli import __version__
+        with patch("quark_cli.cli.get_cookie") as cookie, contextlib.redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit) as caught:
+                main(["--version"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), f"quark {__version__}")
+        cookie.assert_not_called()
+
+    def test_json_cooldown_exposes_wait_and_safe_delay(self):
+        from quark_cli.cli import _report_error
+        from quark_cli.errors import AccessRestrictedError, RateLimitError
+        for kind, action in ((RateLimitError, "wait"), (AccessRestrictedError, "review_access")):
+            with contextlib.redirect_stderr(io.StringIO()) as output:
+                self.assertEqual(_report_error(kind("冷却中", retry_after=12.5), True), 4)
+            result = json.loads(output.getvalue())["error"]
+            self.assertEqual((result["retry_after_seconds"], result["next_action"]), (12.5, action))
+        for delay in (None, float("nan"), float("inf"), -1):
+            with contextlib.redirect_stderr(io.StringIO()) as output:
+                _report_error(RateLimitError("冷却中", retry_after=delay), True)
+            self.assertNotIn("retry_after_seconds", json.loads(output.getvalue())["error"])
+
     def test_organize_du_and_duplicates_json_and_scope(self):
         from test_organize import OrganizeFixture
         drive = OrganizeFixture()

@@ -13,7 +13,8 @@ import httpx
 
 from .client import QuarkClient
 from .auth import QRLogin, get_cookie, logout as logout_cookie
-from .errors import AuthenticationError, LocalIOError, QuarkError, UsageError
+from .errors import AuthenticationError, LocalIOError, QuarkError, UsageError, error_details
+from . import __version__
 from .files import Files
 from .paths import RemotePaths, Scope, is_directory, validate_name
 from .shares import ShareSaver
@@ -88,6 +89,7 @@ def _add_transfer_options(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="quark", description="夸克网盘文件管理命令行工具")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     parser.add_argument("--scope", default=argparse.SUPPRESS, help="限制文件读写范围；默认读取 QUARK_SCOPE")
     commands = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
@@ -809,7 +811,7 @@ def _report_error(error: QuarkError, json_mode: bool) -> int:
         from .backup import safe_operation_result as safe_backup_result
         evidence = safe_backup_result(error.backup_evidence)
     if json_mode:
-        document = {"type": error.label, "message": str(error), "exit_code": error.exit_code}
+        document = error_details(error)
         if evidence:
             document["operation"] = evidence
         print(

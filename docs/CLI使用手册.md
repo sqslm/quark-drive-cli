@@ -358,4 +358,8 @@ quark save 'https://pan.quark.cn/s/example' --source '/分享目录/剧集' --in
 | 分享转存失败或筛选结果为空 | 用 `share inspect URL --path ...` 确认分享路径和提取码；筛选只匹配来源目录的直接名称。 |
 | Windows/Linux 文件名冲突 | 目录传输使用两平台通用名称规则；不支持的设备名、大小写或 Unicode 规范化冲突会被拒绝。 |
 
-更多协议边界及实现验收记录见 [README](../README.md) 和 [扩展验证记录](validation/2026-10-01-cli-extensions.md)。
+更多协议边界及离线验证说明见 [README](../README.md)。
+
+## 13. AI agent 与开源开发
+
+`quark --version` 无需凭证即可查询当前 CLI 版本。追更结果的新增清单、冷却时间、退出码和未知任务恢复处理，参见 [AI agent 使用指南](AGENT_GUIDE.md)。开发、离线测试和发行验证见 [贡献说明](../CONTRIBUTING.md)，安全问题见 [安全说明](../SECURITY.md)。

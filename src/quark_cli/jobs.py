@@ -10,7 +10,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .errors import LocalIOError, QuarkError, RemoteError, UsageError
+from .errors import LocalIOError, QuarkError, RemoteError, UsageError, error_details
 from .paths import Scope, is_directory, path_components, valid_fid, validate_name
 from .shares import ShareSaver, ShareSelection, _optional_created_fid, _required_text, parse_share_url, validate_patterns
 from .state import StateLock, config_directory, read_json, write_json
@@ -159,6 +159,12 @@ class Jobs:
         return {"name": name, "job_id": job["id"], "share_id": job["share_id"], "destination_path": job["target"],
                 "source_path": job["source"], "scope_fid": job["scope_fid"], "include": job["include"], "exclude": job["exclude"]}
 
+    @staticmethod
+    def _saved_entries(entry, initial_fids) -> list[dict[str, Any]]:
+        return [{"source_fid": fid, "target_fid": mapping["target"]["fid"],
+                 "file_name": mapping["target"]["file_name"], "file_type": mapping["target"]["file_type"]}
+                for fid, mapping in entry["mappings"].items() if fid not in initial_fids]
+
     def list(self) -> dict[str, Any]:
         with StateLock(self.directory):
             config, ledger = self._load()
@@ -255,15 +261,19 @@ class Jobs:
             if node is None or node["identity"] != mapping["source"] or node["parent"] != mapping["source_parent"]:
                 raise UsageError("已记录来源消失或身份变化，增量冲突")
             parent = mapping["target_parent"]
-            scopes.check(parent, write=True)
-            self.saver.paths.ancestry(parent)
             if parent not in cached:
+                # Reuse only this preflight's verified parents. Each mapped
+                # object still needs exact info; mutation guards stay fresh.
+                scopes.check(parent, write=True)
+                chain = self.saver.paths.ancestry(parent)
+                if not is_directory(chain[0].item or {}):
+                    raise UsageError("目标父链包含非目录对象")
                 cached[parent] = self.saver._list_children(parent)
             matches = [item for item in cached[parent] if item.get("fid") == mapping["target"]["fid"]]
             if len(matches) != 1 or _identity(matches[0]) != mapping["target"] or mapping["target"]["fid"] in seen_targets:
                 raise UsageError("已记录目标丢失、移动或身份变化，禁止同名重新绑定")
             seen_targets.add(mapping["target"]["fid"])
-            actual = self.saver.paths.ancestry(mapping["target"]["fid"])[0].item or {}
+            actual = self.saver.files.info(mapping["target"]["fid"])
             if valid_fid(actual.get("pdir_fid")) != parent or _identity(actual) != mapping["target"]:
                 raise UsageError("目标精确详情与账本身份或父关系不一致")
             expected_parent = entry["binding"]["fid"] if node["parent"] not in entry["mappings"] else entry["mappings"][node["parent"]]["target"]["fid"]
@@ -364,7 +374,7 @@ class Jobs:
             self._persist(ledger, dry_run)
         self._target(entry, scopes)
         self._check_mappings(entry, nodes, scopes)
-        initial_count = len(entry["mappings"])
+        initial_fids = set(entry["mappings"])
         pending = entry["pending"]
         if pending is not None:
             scopes.check(pending["target_fid"], write=True)
@@ -396,7 +406,8 @@ class Jobs:
             groups.append((parent, target, fresh, before))
         new_items = sum(len(self._subtree(fresh, children)) for _, _, fresh, _ in groups)
         if dry_run:
-            return {"result": "preview", "new_items": new_items, "destination_fid": entry["binding"]["fid"]}
+            return {"result": "preview", "new_items": new_items, "saved_items": 0, "saved_entries": [],
+                    "destination_fid": entry["binding"]["fid"]}
         if new_items and entry["binding"]["fid"] is None:
             binding = entry["binding"]
             before = self.saver._list_children(binding["parent_fid"])
@@ -433,8 +444,9 @@ class Jobs:
             entry["mappings"].update(staged)
             entry["pending"] = None
             self._persist(ledger, False)
-        return {"result": "updated" if len(entry["mappings"]) > initial_count else "unchanged", "new_items": new_items,
-                "saved_items": len(entry["mappings"]) - initial_count, "destination_fid": entry["binding"]["fid"]}
+        saved = self._saved_entries(entry, initial_fids)
+        return {"result": "updated" if saved else "unchanged", "new_items": new_items,
+                "saved_items": len(saved), "saved_entries": saved, "destination_fid": entry["binding"]["fid"]}
 
     def run(self, name: str | None = None, *, scope: Scope | None = None, dry_run: bool = False) -> tuple[dict[str, Any], int]:
         if name is not None:
@@ -451,18 +463,29 @@ class Jobs:
                     continue
                 result = self._public(job_name, job)
                 if state_failed:
-                    result.update({"result": "failed", "error_type": "local_io_error", "exit_code": 5, "reason": "previous_state_failure"})
+                    result.update({"result": "failed", "error_type": "local_io_error", "exit_code": 5,
+                                   "reason": "previous_state_failure", "next_action": "check_local_state"})
                     results.append(result)
                     continue
+                initial_fids = set(ledger["jobs"][job["id"]]["mappings"])
                 try:
                     result.update(self._run_job(job, ledger, scope, dry_run))
                 except QuarkError as error:
-                    result.update({"result": "failed", "error_type": error.label, "exit_code": error.exit_code})
+                    details = error_details(error)
+                    result.update({"result": "failed", "error_type": details.pop("type"), **details})
+                    saved = [] if dry_run else self._saved_entries(ledger["jobs"][job["id"]], initial_fids)
+                    result.update({"saved_items": len(saved), "saved_entries": saved})
                     pending = ledger["jobs"][job["id"]]["pending"]
                     if pending is not None:
                         result["pending"] = True
                         if pending["task_id"] is not None:
                             result["task_id"] = pending["task_id"]
+                        if not isinstance(error, LocalIOError):
+                            result["next_action"] = (
+                                "query_original_task" if pending["task_id"] is not None
+                                and not pending["confirmation_started"] and not isinstance(error, UsageError)
+                                else "manual_review"
+                            )
                     exit_code = max(exit_code, error.exit_code)
                     state_failed = isinstance(error, LocalIOError)
                 results.append(result)

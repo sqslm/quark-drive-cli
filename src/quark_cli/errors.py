@@ -1,5 +1,7 @@
 """Public, sanitized errors and their command-line exit codes."""
 
+import math
+
 
 class QuarkError(Exception):
     exit_code = 4
@@ -54,6 +56,18 @@ class AccessRestrictedError(RemoteError):
 class LocalIOError(QuarkError):
     exit_code = 5
     label = "local_io_error"
+
+
+def error_details(error: QuarkError) -> dict:
+    """Stable public fields for CLI errors and per-job failures."""
+    result = {"type": error.label, "message": str(error), "exit_code": error.exit_code,
+              "next_action": {"authentication_error": "authenticate", "rate_limited": "wait",
+                              "access_restricted": "review_access", "local_io_error": "check_local_state"}
+                             .get(error.label, "manual_review")}
+    delay = getattr(error, "retry_after", None)
+    if isinstance(delay, (int, float)) and not isinstance(delay, bool) and math.isfinite(delay) and delay >= 0:
+        result["retry_after_seconds"] = delay
+    return result
 
 
 def contextual_error(error: BaseException, message: str) -> QuarkError:

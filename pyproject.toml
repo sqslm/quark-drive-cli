@@ -4,15 +4,30 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quark-drive-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cross-platform CLI for Quark Drive file management"
 readme = "README.md"
 requires-python = ">=3.10"
-license-files = ["THIRD_PARTY_NOTICES.md"]
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+keywords = ["quark", "cloud-drive", "cli", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
 dependencies = ["httpx>=0.27,<1", "qrcode[pil]>=7.4,<9"]
 
 [project.optional-dependencies]
 test = ["zxing-cpp>=2.2,<4"]
+dev = ["build>=1.2,<2", "twine>=6,<7", "pip-audit>=2.7,<3"]
+
+[project.urls]
+Repository = "https://github.com/sqslm/quark-drive-cli"
+Issues = "https://github.com/sqslm/quark-drive-cli/issues"
 
 [project.scripts]
 quark = "quark_cli.cli:main"

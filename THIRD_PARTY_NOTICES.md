@@ -34,7 +34,11 @@ SOFTWARE.
 
 ## Backup workflow references
 
-The MIT-licensed [rclone](https://github.com/rclone/rclone) documentation and copy/backup implementation were reviewed for non-deleting directory copies, changed-file conflicts, and retention of old versions. No rclone source is copied and no rclone runtime is required. Quark operations use this project's existing HTTP client, transfer implementation, FID checks, and private state. The detailed references and adaptation boundaries are recorded in [extension API research](docs/research/2026-10-01-extension-apis.md).
+The MIT-licensed [rclone](https://github.com/rclone/rclone) documentation and copy/backup implementation were reviewed for non-deleting directory copies, changed-file conflicts, and retention of old versions. No rclone source is copied and no rclone runtime is required. Quark operations use this project's existing HTTP client, transfer implementation, FID checks, and private state.
+
+## PotPlayer navigation icons
+
+Navigation icons derive from Lucide 0.468.0 (commit `f12b0de177fbc2a6795e99be065887e72b237123`). The source SVG files, adapted ICO files and ISC/MIT notices are retained under `potplayer/icons/`. See [icon provenance](potplayer/icons/README.md) and [full notices](potplayer/icons/LICENSE-lucide.txt). These resources retain their original licenses.
 
 ## Electron desktop client
 
