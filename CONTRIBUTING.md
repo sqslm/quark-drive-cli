@@ -20,6 +20,8 @@ quark --version
 
 CLI 版本由 `pyproject.toml` 和 `src/quark_cli/__init__.py` 声明，两处需保持一致。桌面端与插件分别维护版本，不要求同步编号。
 
+保持一个仓库，分别使用 `cli-vX.Y.Z`、`potplayer-vX.Y.Z`、`desktop-vX.Y.Z` 标签与 Release。源码进入 Git，二进制上传 Release assets；安装包不进入 Git 历史。每个 Release 说明产品、平台及构建来源，附 SHA-256 清单。本地交付目录为 `dist/<产品>/<版本>/`；清理历史产物时先校验并保留各产品最新交付。
+
 ```sh
 python -m build
 python -m twine check dist/*.whl dist/*.tar.gz

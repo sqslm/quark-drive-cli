@@ -10,17 +10,7 @@ dist/
 /.env
 /.env.*
 !/.env.example
-/*.py
-/*.md
-!/README.md
-!/THIRD_PARTY_NOTICES.md
-!/CONTRIBUTING.md
-!/SECURITY.md
-!/CHANGELOG.md
 /tmp/
-/docs/plans/
-/docs/research/
-/docs/validation/
 /video/node_modules/
 /video/.remotion/
 /video/stills/

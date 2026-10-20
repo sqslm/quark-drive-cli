@@ -6,7 +6,7 @@
 
 ## 1. 安装与升级
 
-从项目的 `dist/` 目录取得 wheel、源码包和 `SHA256SUMS.txt`。先在下载目录验证校验值，再在 Python 虚拟环境安装 wheel：
+从 [CLI Release](https://github.com/sqslm/quark-drive-cli/releases/tag/cli-v0.2.0) 或本地 `dist/cli/0.2.0/` 取得 wheel、源码包和 `SHA256SUMS.txt`。先在下载目录验证校验值，再在 Python 虚拟环境安装 wheel：
 
 Linux：
 
@@ -14,7 +14,7 @@ Linux：
 sha256sum -c SHA256SUMS.txt
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install ./quark_drive_cli-0.1.0-py3-none-any.whl
+python -m pip install ./quark_drive_cli-0.2.0-py3-none-any.whl
 python -m pip check
 quark --help
 ```
@@ -22,16 +22,16 @@ quark --help
 Windows PowerShell：
 
 ```powershell
-Get-FileHash .\quark_drive_cli-0.1.0-py3-none-any.whl -Algorithm SHA256
+Get-FileHash .\quark_drive_cli-0.2.0-py3-none-any.whl -Algorithm SHA256
 Get-Content .\SHA256SUMS.txt
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install .\quark_drive_cli-0.1.0-py3-none-any.whl
+python -m pip install .\quark_drive_cli-0.2.0-py3-none-any.whl
 python -m pip check
 quark --help
 ```
 
-如果虚拟环境中已有相同版本，使用 `python -m pip install --upgrade --force-reinstall ./quark_drive_cli-0.1.0-py3-none-any.whl` 安装这份 wheel。源码包可用 `python -m pip install ./quark_drive_cli-0.1.0.tar.gz` 安装；pip 会安装运行依赖。
+如果虚拟环境中已有相同版本，使用 `python -m pip install --upgrade --force-reinstall ./quark_drive_cli-0.2.0-py3-none-any.whl` 安装这份 wheel。源码包可用 `python -m pip install ./quark_drive_cli-0.2.0.tar.gz` 安装；pip 会安装运行依赖。
 
 ## 2. 登录和本地配置
 
